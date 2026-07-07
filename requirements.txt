@@ -1,15 +1,14 @@
-# These are the helper libraries our server needs. When Railway deploys the
-# project, it reads this file and installs each one automatically. You never
-# install these by hand.
+# Same as Phase 0, plus the official Anthropic (Claude) library so our server
+# can call Claude. Railway reads this file and installs each one automatically.
 #
 #   fastapi            - the web-server framework our code is built on
 #   uvicorn            - the program that actually *runs* a FastAPI server
 #   twilio             - Twilio's official library (gives us MessagingResponse)
 #   python-multipart   - lets FastAPI read the form data Twilio sends us
-#
-# The numbers pin known-good versions so a future install behaves identically.
+#   anthropic          - the official Claude library (NEW in Phase 1)
 
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 twilio==9.4.1
 python-multipart==0.0.20
+anthropic==0.69.0

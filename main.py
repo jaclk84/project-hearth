@@ -1,96 +1,133 @@
 # =============================================================================
-#  PROJECT HEARTH  —  PHASE 0: "The Plumbing"
+#  PROJECT HEARTH  —  PHASE 1: "The Brain"
 # =============================================================================
 #
-#  WHAT THIS FILE IS
-#  -----------------
-#  This is the entire server for Phase 0. Its only job: when someone texts our
-#  Twilio phone number, text back an echo of what they said. No AI yet. This
-#  proves the "pipe" works end to end before we make anything smart.
+#  WHAT CHANGED FROM PHASE 0
+#  -------------------------
+#  Phase 0 echoed your text back ("You said: hello"). Phase 1 replaces that
+#  single echo line with a real call to Claude. Now when someone texts the
+#  number, their message is sent to Claude along with a "system prompt" (the
+#  assistant's personality + family context), and Claude's reply is texted back.
 #
-#  HOW TO READ THIS FILE
-#  ---------------------
-#  You do NOT need to understand every line to deploy it. But it's written so a
-#  curious non-programmer CAN follow it. Comments (lines starting with #) are
-#  notes for humans — the computer ignores them.
+#  Still NO calendar, email, memory, or proactive briefing yet — this phase is
+#  just "a smart texter that knows your family from its instructions." Those
+#  other capabilities come in later phases.
 #
-#  THE FLOW, IN ONE BREATH
-#  -----------------------
-#  Phone -> Twilio -> [this server's /sms address] -> we build a reply
-#        -> hand the reply back to Twilio -> Twilio texts it to the phone.
+#  THE FLOW NOW
+#  ------------
+#  Phone -> Twilio -> [our /sms endpoint] -> ask Claude -> Claude's reply
+#        -> hand reply back to Twilio -> Twilio texts it to the phone.
 #
 # =============================================================================
 
 # --- Step 1: bring in the tools we need -------------------------------------
-# "import" means "load a helper library so we can use its features."
-# FastAPI is the framework that lets us build a web server quickly.
+import os                                    # lets us read the secret API key
 from fastapi import FastAPI, Request, Response
-
-# MessagingResponse is a helper from Twilio's library. It builds the little
-# TwiML (XML) reply that Twilio expects. We don't have to write raw XML by hand.
 from twilio.twiml.messaging_response import MessagingResponse
+from anthropic import Anthropic              # the official Claude library
 
 
 # --- Step 2: create the server ----------------------------------------------
-# This one line creates our web application. Everything below attaches to it.
 app = FastAPI()
 
 
-# --- Step 3: a simple "is it alive?" page -----------------------------------
-# When you visit the server's main web address in a browser, this responds.
-# It's just a health check so you can confirm the server is running at all,
-# separate from the texting feature. If you see this text in your browser,
-# the server is live.
+# --- Step 3: connect to Claude ----------------------------------------------
+# This creates our connection to Claude. It automatically reads the secret key
+# from the environment variable named ANTHROPIC_API_KEY — the one you added in
+# Railway. The key is NEVER written here in the code; the code just looks it up
+# by name. That's why we could safely make this repo public.
+claude = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+# Which Claude model to use. We start with Haiku — the fastest and cheapest —
+# which is perfect while we're testing. To upgrade the assistant's quality
+# later, change this ONE line to "claude-sonnet-4-6" and redeploy. Nothing else
+# needs to change.
+MODEL = "claude-haiku-4-5"
+
+
+# --- Step 4: the assistant's personality and rules --------------------------
+# This "system prompt" is the assistant's instructions. It's sent with every
+# message and shapes how Claude behaves. Think of it as the job description you
+# hand a new family assistant on day one. Edit this text to change the
+# personality, tone, or family facts. (Later phases will load real family data
+# here automatically; for now it's written by hand.)
+SYSTEM_PROMPT = """You are the family assistant for the household, reachable by text message.
+
+Your job is to help the family stay organized and answer questions in a warm, brief,
+practical way. You are texting, so keep replies short and to the point — usually one
+to three sentences, the way a helpful person would text. Avoid long paragraphs and
+avoid bullet points unless truly needed.
+
+Right now you do not yet have access to the family's calendar or email — those
+capabilities are coming soon. If someone asks you to check the calendar, add an
+event, or read email, kindly let them know that feature isn't connected yet, but
+you can still help them think it through or answer general questions.
+
+Be friendly and down-to-earth. If a child texts you, keep everything age-appropriate
+and kind. Never share anything unsafe or inappropriate."""
+
+
+# --- Step 5: a simple "is it alive?" page -----------------------------------
 @app.get("/")
 def home():
-    return {"status": "Project Hearth Phase 0 is running."}
+    return {"status": "Project Hearth Phase 1 (the brain) is running."}
 
 
-# --- Step 4: THE IMPORTANT PART — the text-message endpoint -----------------
-# This is the "mail slot" Twilio drops incoming texts into. We named it "/sms".
-# When we set up Twilio, we tell it: "for any incoming text, send the details to
-# https://our-server-address/sms". Twilio then POSTs the message here.
-#
-# "async def" and "await" below are just how modern Python waits for data to
-# arrive without freezing — you can safely ignore the keywords for now.
+# --- Step 6: THE TEXT-MESSAGE ENDPOINT --------------------------------------
+# Same "/sms" mail slot as Phase 0. The difference is what happens in the middle:
+# instead of echoing, we ask Claude for a real reply.
 @app.post("/sms")
 async def sms_reply(request: Request):
 
-    # Twilio sends us the text's details as form data. We read it out.
+    # Read the incoming text's details from Twilio (same as Phase 0).
     form_data = await request.form()
-
-    # "Body" is the actual text the person typed. "From" is their phone number.
-    # These field names ("Body", "From") are defined by Twilio, not by us — we
-    # have to use exactly these names because that's what Twilio sends.
     incoming_message = form_data.get("Body", "")
     sender_number = form_data.get("From", "unknown number")
-
-    # (Handy for debugging: this prints to the server's logs so we can watch
-    #  texts arrive in real time in the Railway dashboard.)
     print(f"Received a text from {sender_number}: {incoming_message}")
 
-    # --- Build the reply ----------------------------------------------------
-    # In Phase 0 the reply is dead simple: echo it back. Later phases replace
-    # this single line with a call to Claude.
-    reply_text = f"You said: {incoming_message}"
+    # --- Ask Claude for a reply ---------------------------------------------
+    # We send Claude the system prompt (its instructions) plus the person's
+    # message. "max_tokens" caps how long the reply can be — 300 is plenty for
+    # a text message and keeps costs down. We wrap this in try/except so that
+    # if the Claude call ever fails, the family still gets a friendly message
+    # instead of silence.
+    try:
+        response = claude.messages.create(
+            model=MODEL,
+            max_tokens=300,
+            system=SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": incoming_message}
+            ],
+        )
 
-    # Wrap our reply in the TwiML format Twilio expects.
+        # Claude's reply comes back as a list of "content blocks." For a normal
+        # text reply there's one block, and its .text is what we want. We loop
+        # through and collect any text blocks, just to be safe.
+        reply_text = ""
+        for block in response.content:
+            if block.type == "text":
+                reply_text += block.text
+
+        # Safety net: if for some reason the reply came back empty, say something.
+        if not reply_text.strip():
+            reply_text = "Sorry, I didn't catch that — can you say it another way?"
+
+    except Exception as error:
+        # If anything goes wrong talking to Claude, log it (visible in Railway
+        # logs) and send a graceful fallback so the person isn't left hanging.
+        print(f"Error calling Claude: {error}")
+        reply_text = "Sorry, I'm having a little trouble thinking right now. Try again in a moment!"
+
+    # --- Send the reply back via Twilio (same as Phase 0) -------------------
     twiml = MessagingResponse()
     twiml.message(reply_text)
-
-    # Hand the TwiML back to Twilio. Twilio reads it and sends the SMS for us.
-    # The "media_type" tells Twilio we're speaking XML.
     return Response(content=str(twiml), media_type="application/xml")
 
 
 # =============================================================================
-#  THAT'S THE WHOLE PHASE 0 SERVER.
-#
-#  Notice what is NOT here yet, on purpose:
-#    - No Claude / AI            (Phase 1)
-#    - No Google Calendar        (Phase 2)
-#    - No memory / database      (Phase 3)
-#    - No morning briefing       (Phase 4)
-#
-#  We are only proving the pipe. Keep it boring. Boring = debuggable.
+#  WHAT'S NEXT (not in this file yet):
+#    - Phase 2: Google Calendar + Gmail tools (so it can actually check/add things)
+#    - Phase 3: a database for memory, reminders, and shared lists
+#    - Phase 4: the proactive morning briefing + urgent email alerts
 # =============================================================================
