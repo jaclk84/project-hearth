@@ -60,8 +60,15 @@ BASE_URL = "https://web-production-5fa1fd.up.railway.app"
 REDIRECT_URI = f"{BASE_URL}/oauth/callback"
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
+
+# Which calendar Guppi reads and writes. "primary" is a person's OWN calendar —
+# wrong for a family assistant. Set FAMILY_CALENDAR_ID in Railway to the shared
+# family calendar's id (looks like ...@group.calendar.google.com). Use the
+# list_calendars tool to find it.
+FAMILY_CALENDAR_ID = os.environ.get("FAMILY_CALENDAR_ID", "primary")
 
 # ---- Known adults, loaded privately from Railway env vars -------------------
 # Set these in Railway (NOT in this code, NOT in GitHub):
@@ -100,8 +107,16 @@ PERMISSIONS = {
 def init_db():
     os.makedirs("/app/data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS google_token (
-        id INTEGER PRIMARY KEY CHECK (id = 1), token_json TEXT NOT NULL)""")
+    # One Google token PER PERSON (keyed by their name), not one global token.
+    # This is what lets Jason and Kim each connect their own account, and keeps
+    # each adult's inbox private to them.
+    conn.execute("""CREATE TABLE IF NOT EXISTS google_tokens (
+        person TEXT PRIMARY KEY,
+        token_json TEXT NOT NULL)""")
+    # Simple key/value settings, adjustable by text (e.g. the daily caps).
+    conn.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS people (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
@@ -182,19 +197,28 @@ def link_phone(name, phone, requester_role):
 
 
 # =============================================================================
-#  GOOGLE  (unchanged from Phase 2)
+#  GOOGLE  —  one token PER PERSON (new in Phase 3.5)
 # =============================================================================
-def save_google_token(creds):
+#  Why per-person: Jason and Kim each connect their own Google account. This is
+#  what keeps each adult's inbox PRIVATE to them. The family calendar is shared,
+#  so any connected adult's token can reach it — but email never falls back to
+#  someone else's account.
+# =============================================================================
+def save_google_token(person, creds):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO google_token (id, token_json) VALUES (1, ?)",
-                 (creds.to_json(),))
+    conn.execute("INSERT OR REPLACE INTO google_tokens (person, token_json) VALUES (?, ?)",
+                 (person, creds.to_json()))
     conn.commit()
     conn.close()
 
 
-def load_google_token():
+def load_google_token(person):
+    """Load one person's credentials, refreshing if expired. None if not connected."""
+    if not person:
+        return None
     conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT token_json FROM google_token WHERE id = 1").fetchone()
+    row = conn.execute("SELECT token_json FROM google_tokens WHERE person = ?",
+                       (person,)).fetchone()
     conn.close()
     if not row:
         return None
@@ -202,11 +226,23 @@ def load_google_token():
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(GoogleRequest())
-            save_google_token(creds)
+            save_google_token(person, creds)
         except Exception as e:
-            print(f"Token refresh failed: {e}")
+            print(f"Token refresh failed for {person}: {e}")
             return None
     return creds
+
+
+def any_connected_adult():
+    """Name of any adult with a working Google connection. Used ONLY for the shared
+    family calendar — never for email."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT person FROM google_tokens").fetchall()
+    conn.close()
+    for (person,) in rows:
+        if load_google_token(person):
+            return person
+    return None
 
 
 def make_flow():
@@ -219,46 +255,143 @@ def make_flow():
 
 
 @app.get("/connect")
-def connect():
+def connect(person: str = ""):
+    """Connect a Google account. Visit /connect?person=Jason  (or ?person=Kim).
+
+    The name rides along in Google's 'state' parameter and comes back at the
+    callback, so we know whose token we just received."""
+    if not person:
+        return HTMLResponse(
+            "<h2>Who is connecting?</h2>"
+            "<p>Add your name to the address, for example:</p>"
+            "<p><code>/connect?person=Jason</code> &nbsp; or &nbsp; "
+            "<code>/connect?person=Kim</code></p>")
     flow = make_flow()
     auth_url, _ = flow.authorization_url(
-        access_type="offline", prompt="consent", include_granted_scopes="true")
+        access_type="offline", prompt="consent", include_granted_scopes="true",
+        state=person)
     return RedirectResponse(auth_url)
 
 
 @app.get("/oauth/callback")
-def oauth_callback(request: Request):
+def oauth_callback(request: Request, state: str = ""):
     flow = make_flow()
     # Railway serves HTTPS at its edge but forwards internally as HTTP; the OAuth
     # library refuses non-HTTPS. Rebuild as https (it IS secure end to end).
     callback_url = str(request.url).replace("http://", "https://", 1)
     flow.fetch_token(authorization_response=callback_url)
-    save_google_token(flow.credentials)
-    return HTMLResponse("<h2>Guppi is connected to your Google account.</h2>"
-                        "<p>You can close this window and text Guppi now.</p>")
+    person = state or "Unknown"
+    save_google_token(person, flow.credentials)
+    print(f"[oauth] saved Google token for {person}")
+    return HTMLResponse(f"<h2>Guppi is connected to {person}'s Google account.</h2>"
+                        "<p>You can close this window.</p>")
 
 
-def get_calendar_service():
-    creds = load_google_token()
+def get_calendar_service(person=None):
+    """Shared family calendar: prefer the requester's own token, else any adult's."""
+    creds = load_google_token(person) if person else None
+    if not creds:
+        creds = load_google_token(any_connected_adult())
     return build("calendar", "v3", credentials=creds) if creds else None
 
 
-def get_gmail_service():
-    creds = load_google_token()
+def get_gmail_service(person):
+    """Email ALWAYS uses the requesting person's own token. Never falls back to
+    someone else's account — one adult must never read another's inbox."""
+    creds = load_google_token(person)
     return build("gmail", "v1", credentials=creds) if creds else None
+
+
+
+
+# ---- Settings (adjustable by text, parents only) ----------------------------
+DEFAULT_SETTINGS = {
+    "daily_claude_calls_cap": "35",   # proactive Claude calls per day
+    "daily_texts_cap": "10",          # proactive outbound texts per day
+    "poll_minutes": "30",             # how often to check for urgent email
+    "quiet_start_hour": "22",         # 10pm — stop proactive activity
+    "quiet_end_hour": "6",            # 6am  — resume (briefing goes out at 6am)
+    "proactive_enabled": "true",      # master kill switch
+}
+
+
+def get_setting(key):
+    conn = db()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else DEFAULT_SETTINGS.get(key)
+
+
+def set_setting(key, value):
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                 (key, str(value)))
+    conn.commit()
+    conn.close()
+    return f"Set {key} to {value}."
+
+
+def tool_show_settings():
+    lines = []
+    for k in DEFAULT_SETTINGS:
+        lines.append(f"{k}: {get_setting(k)}")
+    return "\n".join(lines)
+
+
+def tool_update_setting(key, value, requester_role):
+    """Parents only. Guards against typos and nonsense values."""
+    if requester_role != "adult":
+        return "Only a parent can change Guppi's settings."
+    if key not in DEFAULT_SETTINGS:
+        return f"I don't have a setting called '{key}'. Known: {', '.join(DEFAULT_SETTINGS)}"
+    # Numeric settings must be sane positive numbers; caps have hard ceilings so a
+    # typo (or a persuasive request) can't remove the safety net entirely.
+    ceilings = {"daily_claude_calls_cap": 500, "daily_texts_cap": 50,
+                "poll_minutes": 1440, "quiet_start_hour": 23, "quiet_end_hour": 23}
+    if key in ceilings:
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return f"{key} needs to be a whole number."
+        if n < 0 or n > ceilings[key]:
+            return f"{key} must be between 0 and {ceilings[key]}."
+        value = n
+    elif key == "proactive_enabled":
+        if str(value).lower() not in ("true", "false"):
+            return "proactive_enabled must be true or false."
+        value = str(value).lower()
+    return set_setting(key, value)
 
 
 # =============================================================================
 #  TOOL IMPLEMENTATIONS
 # =============================================================================
-def tool_check_calendar(days_ahead=7):
-    service = get_calendar_service()
+def tool_list_calendars(person=None):
+    """List the calendars this account can see, with their IDs. Used once during
+    setup to find the shared family calendar's id."""
+    service = get_calendar_service(person)
+    if not service:
+        return "No Google account is connected yet."
+    result = service.calendarList().list().execute()
+    items = result.get("items", [])
+    if not items:
+        return "No calendars found."
+    lines = []
+    for c in items:
+        access = c.get("accessRole", "?")
+        primary = " (your primary)" if c.get("primary") else ""
+        lines.append(f"{c.get('summary','(untitled)')}{primary} — id: {c['id']} — access: {access}")
+    return "\n".join(lines)
+
+
+def tool_check_calendar(days_ahead=7, person=None):
+    service = get_calendar_service(person)
     if not service:
         return "The Google account isn't connected yet."
     now = datetime.datetime.now(tz=datetime.timezone.utc)
     later = now + datetime.timedelta(days=days_ahead)
     result = service.events().list(
-        calendarId="primary", timeMin=now.isoformat(), timeMax=later.isoformat(),
+        calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(), timeMax=later.isoformat(),
         singleEvents=True, orderBy="startTime", maxResults=20).execute()
     events = result.get("items", [])
     if not events:
@@ -268,22 +401,23 @@ def tool_check_calendar(days_ahead=7):
         for e in events)
 
 
-def tool_add_calendar_event(summary, start_iso, end_iso):
-    service = get_calendar_service()
+def tool_add_calendar_event(summary, start_iso, end_iso, person=None):
+    service = get_calendar_service(person)
     if not service:
         return "The Google account isn't connected yet."
-    service.events().insert(calendarId="primary", body={
+    service.events().insert(calendarId=FAMILY_CALENDAR_ID, body={
         "summary": summary,
         "start": {"dateTime": start_iso},
         "end": {"dateTime": end_iso}}).execute()
     return f"Added '{summary}' on {start_iso}."
 
 
-def tool_search_email(query, max_results=5):
-    """Auto-widens: narrow queries often return nothing. See BUILD_LOG Trap 17."""
-    service = get_gmail_service()
+def tool_search_email(query, person, max_results=5):
+    """Searches THIS PERSON'S inbox only. Auto-widens (see BUILD_LOG Trap 17)."""
+    service = get_gmail_service(person)
     if not service:
-        return "The Google account isn't connected yet."
+        return (f"{person} hasn't connected their Google account yet. "
+                f"Visit /connect?person={person} to connect it.")
     attempts = [query]
     no_date = re.sub(r"\b(newer_than|older_than|after|before):\S+", "", query).strip()
     if no_date and no_date != query:
@@ -484,6 +618,23 @@ def tools_for_role(role):
             "input_schema": {"type": "object", "properties": {
                 "name": {"type": "string"}, "phone": {"type": "string"}},
                 "required": ["name", "phone"]}})
+        tools.append({
+            "name": "list_calendars",
+            "description": ("List the Google calendars this account can see, with their "
+                            "IDs. Used during setup to find the shared family calendar."),
+            "input_schema": {"type": "object", "properties": {}}})
+        tools.append({
+            "name": "show_settings",
+            "description": "Show Guppi's current settings (caps, polling, quiet hours).",
+            "input_schema": {"type": "object", "properties": {}}})
+        tools.append({
+            "name": "update_setting",
+            "description": ("Change one of Guppi's settings. Parents only. Valid keys: "
+                            "daily_claude_calls_cap, daily_texts_cap, poll_minutes, "
+                            "quiet_start_hour, quiet_end_hour, proactive_enabled."),
+            "input_schema": {"type": "object", "properties": {
+                "key": {"type": "string"}, "value": {"type": "string"}},
+                "required": ["key", "value"]}})
     return tools
 
 
@@ -501,18 +652,30 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_phone):
     if name == "check_calendar":
         if not perms["calendar_read"]:
             return "You don't have calendar access."
-        return tool_check_calendar(tool_input.get("days_ahead", 7))
+        return tool_check_calendar(tool_input.get("days_ahead", 7), sender_name)
 
     if name == "add_calendar_event":
         if not perms["calendar_write"]:
             return "Only a parent or caregiver can add calendar events."
         return tool_add_calendar_event(tool_input["summary"], tool_input["start_iso"],
-                                       tool_input["end_iso"])
+                                       tool_input["end_iso"], sender_name)
 
     if name == "search_email":
         if not perms["email"]:
             return "You don't have email access."
-        return tool_search_email(tool_input["query"])
+        # Searches ONLY this person's own inbox — never anyone else's.
+        return tool_search_email(tool_input["query"], sender_name)
+
+    if name == "list_calendars":
+        if not perms["calendar_read"]:
+            return "You don't have calendar access."
+        return tool_list_calendars(sender_name)
+
+    if name == "show_settings":
+        return tool_show_settings()
+
+    if name == "update_setting":
+        return tool_update_setting(tool_input["key"], tool_input["value"], sender_role)
 
     if name == "remember":
         return tool_remember(tool_input["fact"], tool_input.get("about"), sender_name)
@@ -667,7 +830,7 @@ def ask_guppi(user_message, sender_phone):
 
 @app.get("/")
 def home():
-    return {"status": "Project Hearth Phase 3 (Guppi: memory, reminders, lists) is running."}
+    return {"status": "Project Hearth Phase 3.5 (Guppi: per-person Google, shared calendar) is running."}
 
 
 @app.post("/sms")
