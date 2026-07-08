@@ -34,6 +34,7 @@ import re
 import json
 import sqlite3
 import datetime
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import RedirectResponse, HTMLResponse
 from twilio.twiml.messaging_response import MessagingResponse
@@ -63,6 +64,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
+
+# The family's local timezone. Railway servers run on UTC, so without this Guppi
+# thinks it is already "tomorrow" during your evening — every reminder, every
+# "tomorrow", and the morning briefing would be off by a day. Set TIMEZONE in
+# Railway (e.g. America/New_York) to override.
+TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "America/New_York"))
+
+
+def now_local():
+    """Current time in the family's timezone — always use this, never datetime.now()."""
+    return datetime.datetime.now(TIMEZONE)
+
 
 # Which calendar Guppi reads and writes. "primary" is a person's OWN calendar —
 # wrong for a family assistant. Set FAMILY_CALENDAR_ID in Railway to the shared
@@ -388,7 +401,7 @@ def tool_check_calendar(days_ahead=7, person=None):
     service = get_calendar_service(person)
     if not service:
         return "The Google account isn't connected yet."
-    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    now = now_local()
     later = now + datetime.timedelta(days=days_ahead)
     result = service.events().list(
         calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(), timeMax=later.isoformat(),
@@ -405,10 +418,11 @@ def tool_add_calendar_event(summary, start_iso, end_iso, person=None):
     service = get_calendar_service(person)
     if not service:
         return "The Google account isn't connected yet."
+    tzname = str(TIMEZONE)
     service.events().insert(calendarId=FAMILY_CALENDAR_ID, body={
         "summary": summary,
-        "start": {"dateTime": start_iso},
-        "end": {"dateTime": end_iso}}).execute()
+        "start": {"dateTime": start_iso, "timeZone": tzname},
+        "end": {"dateTime": end_iso, "timeZone": tzname}}).execute()
     return f"Added '{summary}' on {start_iso}."
 
 
@@ -449,7 +463,7 @@ def tool_search_email(query, person, max_results=5):
 def tool_remember(fact, about, added_by):
     conn = db()
     conn.execute("INSERT INTO memories (fact, about, added_by, created_at) VALUES (?,?,?,?)",
-                 (fact, about, added_by, datetime.datetime.now().isoformat()))
+                 (fact, about, added_by, now_local().isoformat()))
     conn.commit()
     conn.close()
     return f"Saved: {fact}"
@@ -503,7 +517,7 @@ def tool_list_reminders():
 def tool_add_to_list(list_name, item, added_by):
     conn = db()
     conn.execute("INSERT INTO list_items (list_name, item, added_by, created_at) VALUES (?,?,?,?)",
-                 (list_name.lower(), item, added_by, datetime.datetime.now().isoformat()))
+                 (list_name.lower(), item, added_by, now_local().isoformat()))
     conn.commit()
     conn.close()
     return f"Added '{item}' to the {list_name} list."
@@ -762,8 +776,23 @@ their number, and that a parent can add them. You may answer harmless general qu
     return f"""You are Guppi, the family's household assistant, reachable by text message.
 
 Personality: calm and efficient. You are brief, clear, and competent - never chatty,
-bubbly, or wordy. You are texting, so keep replies short, usually one to three
-sentences. Do not use emoji. Avoid bullet points unless truly necessary.
+bubbly, or wordy.
+
+YOU ARE SENDING A TEXT MESSAGE. This shapes everything about how you write:
+- Plain text ONLY. Never use markdown. No asterisks for bold, no ## headers, no
+  bullet characters. A phone shows those as literal junk characters.
+- Keep it SHORT. Aim for under about 300 characters. Long texts split into several
+  messages, cost more, and are miserable to read on a phone.
+- If the honest answer is long (say, a whole week of calendar events), summarize and
+  offer more: "You've got 5 things Wednesday - want the details?" Do not dump it all.
+- No emoji.
+- Write the way a competent person texts: short lines, natural phrasing, no lists
+  unless a list is genuinely the clearest answer, and then keep it to a few lines.
+
+When adding a calendar event and the person didn't give an end time, assume one hour
+rather than asking. Only ask if the duration genuinely matters and you can't guess.
+
+Always interpret and state times in the family's local timezone.
 
 {who}
 
@@ -801,7 +830,7 @@ def ask_guppi(user_message, sender_phone):
     sender_name, sender_role = identify_sender(sender_phone)
     print(f"[guppi] message from {sender_name or 'UNKNOWN'} ({sender_role}) {sender_phone}")
 
-    today = datetime.datetime.now().strftime("%A, %B %d, %Y")
+    today = now_local().strftime("%A, %B %d, %Y")
     messages = [{"role": "user", "content": f"(Today is {today}.)\n\n{user_message}"}]
     tools = tools_for_role(sender_role)
     system = build_system_prompt(sender_name, sender_role)
