@@ -19,6 +19,7 @@
 # =============================================================================
 
 import os
+import re
 import json
 import sqlite3
 import datetime
@@ -79,9 +80,13 @@ clarifying question rather than guessing.
 When searching email, build broad, smart Gmail queries rather than overly literal
 ones. Senders rarely match a plain name — e.g. mail "from Google" actually comes from
 addresses like no-reply@accounts.google.com, so search by likely domain or subject
-keywords, not just the literal word. If a narrow search returns nothing, try again
-with a broader query (drop the date filter, search subject keywords, or search the
-sender's likely domain) before telling the family you found nothing."""
+keywords, not just the literal word.
+
+CRITICAL: never answer a question about the calendar or email from memory or
+assumption. You do not know what is on the calendar or in the inbox unless you call
+the tool and read the result. If someone asks about their schedule or their email,
+you MUST call the appropriate tool first, every time, before answering. Never say
+"you have no emails" or "nothing is scheduled" unless a tool actually returned that."""
 
 
 # =============================================================================
@@ -238,28 +243,52 @@ def tool_add_calendar_event(summary, start_iso, end_iso):
 
 
 def tool_search_email(query, max_results=5):
-    """Search Gmail and return short summaries of matching messages."""
+    """Search Gmail and return short summaries of matching messages.
+
+    IMPORTANT: if the first (often too-narrow) query finds nothing, we automatically
+    retry with broader versions before reporting 'nothing found'. Guppi tends to build
+    overly literal queries like 'from:google newer_than:7d', which misses mail actually
+    sent from no-reply@accounts.google.com. Enforcing the retry in CODE is reliable;
+    asking the model nicely in the prompt is not.
+    """
     service = get_gmail_service()
     if not service:
         return "The Google account isn't connected yet."
-    results = service.users().messages().list(
-        userId="me", q=query, maxResults=max_results
-    ).execute()
-    messages = results.get("messages", [])
-    if not messages:
-        return "No matching emails found."
-    summaries = []
-    for m in messages:
-        msg = service.users().messages().get(
-            userId="me", id=m["id"], format="metadata",
-            metadataHeaders=["From", "Subject", "Date"],
+
+    # Build a list of progressively broader queries to try in order.
+    attempts = [query]
+    # 1) Drop any date restriction (newer_than / older_than / after / before).
+    no_date = re.sub(r"\b(newer_than|older_than|after|before):\S+", "", query).strip()
+    if no_date and no_date != query:
+        attempts.append(no_date)
+    # 2) Turn a strict from: into a loose keyword search.
+    loose = re.sub(r"\bfrom:(\S+)", r"\1", no_date or query).strip()
+    if loose and loose not in attempts:
+        attempts.append(loose)
+
+    for attempt in attempts:
+        print(f"[search_email] trying query: {attempt!r}")
+        results = service.users().messages().list(
+            userId="me", q=attempt, maxResults=max_results
         ).execute()
-        headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-        snippet = msg.get("snippet", "")
-        summaries.append(
-            f"From {headers.get('From','?')} | {headers.get('Subject','(no subject)')}: {snippet[:120]}"
-        )
-    return "\n".join(summaries)
+        messages = results.get("messages", [])
+        if messages:
+            summaries = []
+            for m in messages:
+                msg = service.users().messages().get(
+                    userId="me", id=m["id"], format="metadata",
+                    metadataHeaders=["From", "Subject", "Date"],
+                ).execute()
+                headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+                snippet = msg.get("snippet", "")
+                summaries.append(
+                    f"From {headers.get('From','?')} | {headers.get('Subject','(no subject)')}: {snippet[:120]}"
+                )
+            print(f"[search_email] found {len(summaries)} with query {attempt!r}")
+            return "\n".join(summaries)
+
+    print(f"[search_email] no results after trying: {attempts}")
+    return "No matching emails found (searched broadly)."
 
 
 # Tool definitions Claude sees. Claude decides when to call these.
@@ -307,6 +336,7 @@ TOOLS = [
 
 def run_tool(name, tool_input):
     """Execute a tool by name and return its text result."""
+    print(f"[tool] Claude called '{name}' with input: {tool_input}")
     if name == "check_calendar":
         return tool_check_calendar(tool_input.get("days_ahead", 7))
     if name == "add_calendar_event":
@@ -355,6 +385,8 @@ def ask_guppi(user_message):
                     })
             messages.append({"role": "user", "content": tool_results})
             continue
+
+        print(f"[guppi] answered without tools (stop_reason={response.stop_reason})")
 
         # Otherwise Claude is done — collect its text reply.
         reply = ""
