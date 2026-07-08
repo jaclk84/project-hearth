@@ -35,6 +35,9 @@ import json
 import sqlite3
 import datetime
 from zoneinfo import ZoneInfo
+import urllib.request
+from apscheduler.schedulers.background import BackgroundScheduler
+from twilio.rest import Client as TwilioClient
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import RedirectResponse, HTMLResponse
 from twilio.twiml.messaging_response import MessagingResponse
@@ -70,6 +73,17 @@ SCOPES = [
 # "tomorrow", and the morning briefing would be off by a day. Set TIMEZONE in
 # Railway (e.g. America/New_York) to override.
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "America/New_York"))
+
+# Outbound SMS (NEW in Phase 4). Until now Guppi only REPLIED to Twilio's webhook;
+# now it must INITIATE texts, which needs the Twilio REST credentials + the number.
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")
+
+# Where to get weather for the briefing (open-meteo needs no API key). Defaults to
+# the Philadelphia area; override with LATITUDE / LONGITUDE env vars.
+WEATHER_LAT = os.environ.get("LATITUDE", "39.95")
+WEATHER_LON = os.environ.get("LONGITUDE", "-75.16")
 
 
 def now_local():
@@ -823,6 +837,134 @@ If someone asks for something they are not permitted to do, say so briefly and k
 and do not explain how to get around it."""
 
 
+
+# =============================================================================
+#  PROACTIVE MACHINERY  (new in Phase 4)  —  outbound SMS, caps, quiet hours
+# =============================================================================
+#  This is the first time Guppi acts WITHOUT being texted first. Everything here
+#  is wrapped in safety limits so a bug can't burn money or spam the family:
+#    - daily cap on proactive Claude calls   (default 35)
+#    - daily cap on proactive outbound texts (default 10)
+#    - quiet hours (no proactive activity overnight)
+#    - a master kill switch (proactive_enabled)
+#    - Guppi texts ONCE when a cap is hit, then goes silent (silent failure is
+#      worse than a bug: you'd trust a system that had quietly stopped working)
+# =============================================================================
+
+_twilio_client = None
+def twilio_client():
+    global _twilio_client
+    if _twilio_client is None and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    return _twilio_client
+
+
+# ---- daily counters (reset each local day), stored in settings table ---------
+def _today_key():
+    return now_local().strftime("%Y-%m-%d")
+
+def _counter(name):
+    # e.g. "count_claude_2026-07-08". Resets naturally when the date rolls over.
+    return f"count_{name}_{_today_key()}"
+
+def get_count(name):
+    v = get_setting(_counter(name))
+    return int(v) if v and v.isdigit() else 0
+
+def bump_count(name):
+    n = get_count(name) + 1
+    set_setting(_counter(name), str(n))
+    return n
+
+def cap(name):
+    return int(get_setting(name) or DEFAULT_SETTINGS.get(name, "0"))
+
+def proactive_on():
+    return (get_setting("proactive_enabled") or "true").lower() == "true"
+
+def in_quiet_hours():
+    h = now_local().hour
+    start = int(get_setting("quiet_start_hour") or 22)
+    end = int(get_setting("quiet_end_hour") or 6)
+    # quiet window wraps midnight (e.g. 22 -> 6)
+    if start > end:
+        return h >= start or h < end
+    return start <= h < end
+
+
+def send_sms(to_number, body):
+    """Send a text, respecting the daily text cap. Returns True if sent.
+
+    When the cap is hit we send ONE 'hit my limit' notice to the first parent and
+    then refuse further sends until tomorrow. The cap check itself never blocks
+    that single notice (it uses a separate flag)."""
+    client = twilio_client()
+    if not client or not TWILIO_FROM_NUMBER:
+        print("[sms] outbound not configured (missing Twilio creds / from number)")
+        return False
+
+    if get_count("texts") >= cap("daily_texts_cap"):
+        # Have we already warned today? If not, send exactly one warning.
+        if not get_setting(_counter("cap_warned")):
+            set_setting(_counter("cap_warned"), "1")
+            parent = _first_parent_phone()
+            if parent:
+                try:
+                    client.messages.create(to=parent, from_=TWILIO_FROM_NUMBER,
+                        body="Guppi hit its daily message limit, so I'll stay quiet "
+                             "until tomorrow. Text me to change the cap if needed.")
+                except Exception as e:
+                    print(f"[sms] cap-warning failed: {e}")
+        print("[sms] daily text cap reached; not sending")
+        return False
+
+    try:
+        client.messages.create(to=to_number, from_=TWILIO_FROM_NUMBER, body=body)
+        bump_count("texts")
+        print(f"[sms] sent to {to_number}: {body[:60]}")
+        return True
+    except Exception as e:
+        print(f"[sms] send failed to {to_number}: {e}")
+        return False
+
+
+def _first_parent_phone():
+    conn = db()
+    row = conn.execute(
+        "SELECT phone FROM people WHERE role='adult' AND phone IS NOT NULL LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return row["phone"] if row else (next(iter(ADULT_PHONES), None) if ADULT_PHONES else None)
+
+
+def claude_call_allowed():
+    """True if we're under the daily proactive Claude-call cap. Bumps on True."""
+    if get_count("claude") >= cap("daily_claude_calls_cap"):
+        print("[proactive] daily Claude-call cap reached")
+        return False
+    bump_count("claude")
+    return True
+
+
+def get_weather_line():
+    """One-line forecast from open-meteo (no API key). Best-effort; never fatal."""
+    try:
+        url = (f"https://api.open-meteo.com/v1/forecast?latitude={WEATHER_LAT}"
+               f"&longitude={WEATHER_LON}&daily=temperature_2m_max,temperature_2m_min,"
+               f"precipitation_probability_max&temperature_unit=fahrenheit"
+               f"&timezone=auto&forecast_days=1")
+        with urllib.request.urlopen(url, timeout=8) as r:
+            data = json.loads(r.read())
+        d = data["daily"]
+        hi = round(d["temperature_2m_max"][0])
+        lo = round(d["temperature_2m_min"][0])
+        rain = d["precipitation_probability_max"][0]
+        return f"Weather: high {hi}, low {lo}, {rain}% chance of rain."
+    except Exception as e:
+        print(f"[weather] failed: {e}")
+        return None
+
+
 # =============================================================================
 #  THE MESSAGE LOOP
 # =============================================================================
@@ -859,7 +1001,7 @@ def ask_guppi(user_message, sender_phone):
 
 @app.get("/")
 def home():
-    return {"status": "Project Hearth Phase 3.5 (Guppi: per-person Google, shared calendar) is running."}
+    return {"status": "Project Hearth Phase 4 (Guppi: scheduler, briefing, reminders, urgent alerts) is running."}
 
 
 @app.post("/sms")
@@ -878,4 +1020,142 @@ async def sms_reply(request: Request):
     return Response(content=str(twiml), media_type="application/xml")
 
 
+
+
+# =============================================================================
+#  THE SCHEDULED JOBS  (new in Phase 4)
+# =============================================================================
+def _adults_with_phones():
+    conn = db()
+    rows = conn.execute(
+        "SELECT name, phone FROM people WHERE role='adult' AND phone IS NOT NULL"
+    ).fetchall()
+    conn.close()
+    return [(r["name"], r["phone"]) for r in rows]
+
+
+def job_reminders():
+    """Every minute: send any reminders now due. No Claude call — just sends the
+    stored text. Cheap, so it isn't gated by the Claude cap (but still respects the
+    text cap and quiet hours)."""
+    if not proactive_on():
+        return
+    now_iso = now_local().isoformat()
+    conn = db()
+    due = conn.execute(
+        "SELECT id, text, for_phone FROM reminders WHERE fired = 0 AND due_at <= ?",
+        (now_iso,)).fetchall()
+    conn.close()
+    for r in due:
+        target = r["for_phone"] or _first_parent_phone()
+        if target and send_sms(target, f"Reminder: {r['text']}"):
+            conn = db()
+            conn.execute("UPDATE reminders SET fired = 1 WHERE id = ?", (r["id"],))
+            conn.commit(); conn.close()
+
+
+def job_morning_briefing():
+    """6am: one short briefing to each parent — calendar + due reminders + weather."""
+    if not proactive_on() or in_quiet_hours():
+        return
+    calendar = tool_check_calendar(days_ahead=1)
+    reminders = tool_list_reminders()
+    weather = get_weather_line()
+
+    if not claude_call_allowed():
+        return
+    context = (f"Today's calendar:\n{calendar}\n\nUpcoming reminders:\n{reminders}\n\n"
+               f"{weather or ''}")
+    try:
+        resp = claude.messages.create(
+            model=MODEL, max_tokens=300,
+            system=("You are Guppi. Write ONE short, plain-text good-morning briefing for "
+                    "a parent, summarizing today's schedule, any reminders, and the weather. "
+                    "No markdown, no emoji, under 300 characters. Warm but efficient."),
+            messages=[{"role": "user", "content": context}])
+        text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    except Exception as e:
+        print(f"[briefing] Claude failed: {e}")
+        return
+    for name, phone in _adults_with_phones():
+        send_sms(phone, text)
+
+
+def job_urgent_email_poll():
+    """Every N minutes (6am-10pm): for each connected adult, check for NEW mail since
+    last check. Only calls Claude if there IS new mail. Alerts ONLY that inbox's owner
+    (privacy)."""
+    if not proactive_on() or in_quiet_hours():
+        return
+    for name, phone in _adults_with_phones():
+        service = get_gmail_service(name)
+        if not service:
+            continue
+        # Free Google call: unread primary-inbox mail since the last check id.
+        last_id = get_setting(f"last_email_id_{name}")
+        try:
+            res = service.users().messages().list(
+                userId="me", q="is:unread category:primary", maxResults=5).execute()
+        except Exception as e:
+            print(f"[poll] gmail list failed for {name}: {e}")
+            continue
+        msgs = res.get("messages", [])
+        if not msgs:
+            continue
+        newest = msgs[0]["id"]
+        if newest == last_id:
+            continue  # nothing new since last check -> no Claude call, no cost
+        set_setting(f"last_email_id_{name}", newest)
+
+        # There IS new mail. Summarize headers, ask Haiku if any is urgent.
+        summaries = []
+        for m in msgs:
+            if m["id"] == last_id:
+                break
+            md = service.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["From", "Subject"]).execute()
+            h = {x["name"]: x["value"] for x in md["payload"]["headers"]}
+            summaries.append(f"From {h.get('From','?')}: {h.get('Subject','(no subject)')} "
+                             f"- {md.get('snippet','')[:120]}")
+        if not summaries:
+            continue
+        if not claude_call_allowed():
+            return
+        try:
+            resp = claude.messages.create(
+                model=MODEL, max_tokens=200,
+                system=("You are Guppi. Below are new unread emails. Decide if ANY is "
+                        "genuinely urgent or time-sensitive enough to interrupt someone by "
+                        "text right now (e.g. school closure, urgent appointment change, "
+                        "safety issue). If yes, reply with ONE short plain-text alert under "
+                        "300 chars, no markdown. If nothing is truly urgent, reply with "
+                        "exactly: NONE"),
+                messages=[{"role": "user", "content": "\n\n".join(summaries)}])
+            verdict = "".join(b.text for b in resp.content if b.type == "text").strip()
+        except Exception as e:
+            print(f"[poll] Claude failed for {name}: {e}")
+            continue
+        if verdict and verdict.upper() != "NONE":
+            send_sms(phone, verdict)
+
+
+# =============================================================================
+#  SCHEDULER STARTUP
+# =============================================================================
+scheduler = BackgroundScheduler(timezone=str(TIMEZONE))
+
+def start_scheduler():
+    poll_min = int(get_setting("poll_minutes") or 30)
+    scheduler.add_job(job_reminders, "interval", minutes=1, id="reminders",
+                      replace_existing=True, max_instances=1)
+    scheduler.add_job(job_morning_briefing, "cron", hour=6, minute=0, id="briefing",
+                      replace_existing=True, max_instances=1)
+    scheduler.add_job(job_urgent_email_poll, "interval", minutes=poll_min,
+                      id="email_poll", replace_existing=True, max_instances=1)
+    scheduler.start()
+    print(f"[scheduler] started: reminders/min, briefing 6am, email poll/{poll_min}min")
+
+
 init_db()
+start_scheduler()
