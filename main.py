@@ -160,8 +160,12 @@ def oauth_callback(request: Request):
     """Step 2: Google sends the user back here with an approval code. We exchange
     it for a token and save it to the database."""
     flow = make_flow()
-    # Rebuild the full URL Google redirected to (it carries the approval code).
-    flow.fetch_token(authorization_response=str(request.url))
+    # Railway terminates HTTPS at its edge and forwards to us as HTTP internally,
+    # so request.url starts with "http://". The OAuth library refuses non-HTTPS
+    # URLs, so we rebuild the full URL forcing the https scheme. It's genuinely
+    # secure end-to-end; this just tells the library what it can't see from here.
+    callback_url = str(request.url).replace("http://", "https://", 1)
+    flow.fetch_token(authorization_response=callback_url)
     creds = flow.credentials
     save_google_token(creds)
     return HTMLResponse(
