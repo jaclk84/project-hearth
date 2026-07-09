@@ -1,9 +1,9 @@
-# Phase 1 libraries plus the Google API client libraries for Calendar + Gmail.
+# Phase 3.5 libraries plus APScheduler for the background jobs (reminders,
+# morning briefing, urgent-email poll). No new external services — APScheduler
+# runs inside the FastAPI process.
 #
-#   fastapi, uvicorn, twilio, python-multipart, anthropic  — as before
-#   google-api-python-client   - the main Google API client (Calendar, Gmail)
-#   google-auth-oauthlib       - handles the OAuth "connect your account" flow
-#   google-auth-httplib2       - networking glue the Google client needs
+#   ...as before...
+#   apscheduler  - runs jobs on a clock (intervals + fixed times), in-process
 
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
@@ -13,3 +13,4 @@ anthropic==0.69.0
 google-api-python-client==2.156.0
 google-auth-oauthlib==1.2.1
 google-auth-httplib2==0.2.0
+apscheduler==3.11.0
