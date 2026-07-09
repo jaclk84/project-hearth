@@ -168,6 +168,10 @@ def init_db():
         item TEXT NOT NULL,
         added_by TEXT,
         created_at TEXT NOT NULL)""")
+    # Saved list templates, e.g. a reusable "travel" packing list.
+    conn.execute("""CREATE TABLE IF NOT EXISTS list_templates (
+        name TEXT PRIMARY KEY,
+        items_json TEXT NOT NULL)""")
     conn.commit()
     for name, role in SEEDED_PEOPLE:
         conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
@@ -537,6 +541,25 @@ def tool_add_to_list(list_name, item, added_by):
     return f"Added '{item}' to the {list_name} list."
 
 
+def tool_add_items_to_list(list_name, items, added_by):
+    """Add several items to a list in one operation. `items` is a list of strings.
+    Used for 'build me a grocery list' or 'here's my packing list: a, b, c'."""
+    if not items:
+        return "No items to add."
+    conn = db()
+    now = now_local().isoformat()
+    for it in items:
+        it = str(it).strip()
+        if it:
+            conn.execute(
+                "INSERT INTO list_items (list_name, item, added_by, created_at) VALUES (?,?,?,?)",
+                (list_name.lower(), it, added_by, now))
+    conn.commit()
+    conn.close()
+    n = len([i for i in items if str(i).strip()])
+    return f"Added {n} items to the {list_name} list."
+
+
 def tool_show_list(list_name):
     conn = db()
     rows = conn.execute(
@@ -549,6 +572,32 @@ def tool_show_list(list_name):
                      (f" (added by {r['added_by']})" if r["added_by"] else "") for r in rows)
 
 
+def tool_clear_list(list_name):
+    """Empty an entire list (e.g. after the grocery run)."""
+    conn = db()
+    cur = conn.execute("DELETE FROM list_items WHERE list_name = ?", (list_name.lower(),))
+    conn.commit(); n = cur.rowcount; conn.close()
+    return f"Cleared the {list_name} list ({n} items removed)." if n else f"The {list_name} list was already empty."
+
+
+def tool_check_off_item(list_name, item_text):
+    """Remove an item from a list by matching its text (case-insensitive, partial).
+    Lets someone say 'check off milk' without needing the item's id number."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, item FROM list_items WHERE list_name = ?", (list_name.lower(),)).fetchall()
+    match = None
+    for r in rows:
+        if item_text.strip().lower() in r["item"].lower():
+            match = r; break
+    if not match:
+        conn.close()
+        return f"I couldn't find '{item_text}' on the {list_name} list."
+    conn.execute("DELETE FROM list_items WHERE id = ?", (match["id"],))
+    conn.commit(); conn.close()
+    return f"Checked off {match['item']}."
+
+
 def tool_remove_from_list(item_id):
     conn = db()
     cur = conn.execute("DELETE FROM list_items WHERE id = ?", (item_id,))
@@ -556,6 +605,53 @@ def tool_remove_from_list(item_id):
     deleted = cur.rowcount
     conn.close()
     return "Removed." if deleted else "I couldn't find that item."
+
+
+
+
+def tool_save_template(template_name, from_list=None, items=None):
+    """Save a reusable template. Either from an existing list (from_list) or from an
+    explicit set of items."""
+    if from_list:
+        conn = db()
+        rows = conn.execute("SELECT item FROM list_items WHERE list_name = ?",
+                            (from_list.lower(),)).fetchall()
+        conn.close()
+        items = [r["item"] for r in rows]
+    items = [str(i).strip() for i in (items or []) if str(i).strip()]
+    if not items:
+        return "There's nothing to save as a template."
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO list_templates (name, items_json) VALUES (?, ?)",
+                 (template_name.lower(), json.dumps(items)))
+    conn.commit(); conn.close()
+    return f"Saved '{template_name}' template with {len(items)} items."
+
+
+def tool_start_from_template(template_name, list_name, added_by):
+    """Populate a list from a saved template."""
+    conn = db()
+    row = conn.execute("SELECT items_json FROM list_templates WHERE name = ?",
+                       (template_name.lower(),)).fetchone()
+    if not row:
+        conn.close()
+        return f"I don't have a template called '{template_name}'."
+    items = json.loads(row["items_json"])
+    now = now_local().isoformat()
+    for it in items:
+        conn.execute("INSERT INTO list_items (list_name, item, added_by, created_at) VALUES (?,?,?,?)",
+                     (list_name.lower(), it, added_by, now))
+    conn.commit(); conn.close()
+    return f"Started the {list_name} list from '{template_name}' ({len(items)} items)."
+
+
+def tool_list_templates():
+    conn = db()
+    rows = conn.execute("SELECT name FROM list_templates ORDER BY name").fetchall()
+    conn.close()
+    if not rows:
+        return "No saved templates yet."
+    return "Templates: " + ", ".join(r["name"] for r in rows)
 
 
 # =============================================================================
@@ -627,6 +723,16 @@ def tools_for_role(role):
          "input_schema": {"type": "object", "properties": {
              "list_name": {"type": "string"}, "item": {"type": "string"}},
              "required": ["list_name", "item"]}},
+        {"name": "add_items_to_list",
+         "description": ("Add MANY items to a list at once. Use this for 'build me a "
+                         "grocery list for tacos' (you generate the items, then save "
+                         "them all) or 'here's my packing list: a, b, c'. Prefer this "
+                         "over calling add_to_list repeatedly."),
+         "input_schema": {"type": "object", "properties": {
+             "list_name": {"type": "string"},
+             "items": {"type": "array", "items": {"type": "string"},
+                       "description": "The items to add."}},
+             "required": ["list_name", "items"]}},
         {"name": "show_list",
          "description": "Show a shared list.",
          "input_schema": {"type": "object", "properties": {
@@ -635,6 +741,31 @@ def tools_for_role(role):
          "description": "Remove an item from a list by its id (ids come from show_list).",
          "input_schema": {"type": "object", "properties": {
              "item_id": {"type": "integer"}}, "required": ["item_id"]}},
+        {"name": "clear_list",
+         "description": "Empty an entire list, e.g. after the grocery run.",
+         "input_schema": {"type": "object", "properties": {
+             "list_name": {"type": "string"}}, "required": ["list_name"]}},
+        {"name": "check_off_item",
+         "description": "Remove one item from a list by its name (e.g. 'check off milk'). No id needed.",
+         "input_schema": {"type": "object", "properties": {
+             "list_name": {"type": "string"}, "item_text": {"type": "string"}},
+             "required": ["list_name", "item_text"]}},
+        {"name": "save_template",
+         "description": ("Save a reusable list template, either from an existing list "
+                         "(from_list) or from explicit items. E.g. 'save this as my travel list'."),
+         "input_schema": {"type": "object", "properties": {
+             "template_name": {"type": "string"},
+             "from_list": {"type": "string"},
+             "items": {"type": "array", "items": {"type": "string"}}},
+             "required": ["template_name"]}},
+        {"name": "start_from_template",
+         "description": "Populate a list from a saved template, e.g. 'start my travel packing list'.",
+         "input_schema": {"type": "object", "properties": {
+             "template_name": {"type": "string"}, "list_name": {"type": "string"}},
+             "required": ["template_name", "list_name"]}},
+        {"name": "list_templates",
+         "description": "Show the names of saved list templates.",
+         "input_schema": {"type": "object", "properties": {}}},
         {"type": "web_search_20250305", "name": "web_search"},
     ]
 
@@ -720,10 +851,24 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_phone):
 
     if name == "add_to_list":
         return tool_add_to_list(tool_input["list_name"], tool_input["item"], sender_name)
+    if name == "add_items_to_list":
+        return tool_add_items_to_list(tool_input["list_name"], tool_input["items"], sender_name)
     if name == "show_list":
         return tool_show_list(tool_input["list_name"])
     if name == "remove_from_list":
         return tool_remove_from_list(tool_input["item_id"])
+    if name == "clear_list":
+        return tool_clear_list(tool_input["list_name"])
+    if name == "check_off_item":
+        return tool_check_off_item(tool_input["list_name"], tool_input["item_text"])
+    if name == "save_template":
+        return tool_save_template(tool_input["template_name"],
+                                  tool_input.get("from_list"), tool_input.get("items"))
+    if name == "start_from_template":
+        return tool_start_from_template(tool_input["template_name"],
+                                        tool_input["list_name"], sender_name)
+    if name == "list_templates":
+        return tool_list_templates()
 
     if name == "link_person_phone":
         return link_phone(tool_input["name"], tool_input["phone"], sender_role)
@@ -807,6 +952,12 @@ When adding a calendar event and the person didn't give an end time, assume one 
 rather than asking. Only ask if the duration genuinely matters and you can't guess.
 
 Always interpret and state times in the family's local timezone.
+
+You are given today's date and day of week with each message. Use it to resolve
+natural time references yourself: "tomorrow", "next Tuesday", "this weekend", "in an
+hour", "after school" (assume ~3pm on a weekday unless told otherwise), "tonight"
+(this evening), "first thing" (early morning). Convert these to concrete dates/times
+rather than asking, unless it's genuinely ambiguous.
 
 {who}
 
@@ -1081,6 +1232,52 @@ def job_morning_briefing():
         send_sms(phone, text)
 
 
+def _people_with_phones_by_role():
+    conn = db()
+    rows = conn.execute(
+        "SELECT name, phone, role FROM people WHERE phone IS NOT NULL").fetchall()
+    conn.close()
+    return [(r["name"], r["phone"], r["role"]) for r in rows]
+
+
+def job_weekly_digest():
+    """Sunday 6pm: a 'week ahead' summary. Parents get the full week; children and the
+    caregiver get a lighter version focused on what's relevant to them."""
+    if not proactive_on() or in_quiet_hours():
+        return
+    week = tool_check_calendar(days_ahead=7)
+
+    for name, phone, role in _people_with_phones_by_role():
+        if not claude_call_allowed():
+            return
+        if role in ("adult",):
+            instr = ("Write ONE short plain-text 'week ahead' summary for a parent: the "
+                     "key events across the next 7 days. No markdown, no emoji, keep it "
+                     "tight (a few lines).")
+        elif role == "caregiver":
+            instr = ("Write ONE short plain-text 'week ahead' note for the family's "
+                     "caregiver. Include only childcare-relevant logistics (drop-offs, "
+                     "pickups, activities, appointments they'd help with). Omit personal "
+                     "or medical details that don't affect childcare. No markdown/emoji.")
+        else:  # child
+            instr = (f"Write ONE short, friendly, age-appropriate plain-text 'week ahead' "
+                     f"note for {name}, a child. Include only THEIR activities and things "
+                     f"they need to know (their practices, events, school things). Do not "
+                     f"list other family members' private appointments. No markdown/emoji.")
+        try:
+            resp = claude.messages.create(
+                model=MODEL, max_tokens=300,
+                system="You are Guppi. " + instr,
+                messages=[{"role": "user",
+                           "content": f"The next 7 days on the family calendar:\n{week}"}])
+            text = "".join(b.text for b in resp.content if b.type == "text").strip()
+        except Exception as e:
+            print(f"[weekly] Claude failed for {name}: {e}")
+            continue
+        if text:
+            send_sms(phone, text)
+
+
 def job_urgent_email_poll():
     """Every N minutes (6am-10pm): for each connected adult, check for NEW mail since
     last check. Only calls Claude if there IS new mail. Alerts ONLY that inbox's owner
@@ -1153,8 +1350,10 @@ def start_scheduler():
                       replace_existing=True, max_instances=1)
     scheduler.add_job(job_urgent_email_poll, "interval", minutes=poll_min,
                       id="email_poll", replace_existing=True, max_instances=1)
+    scheduler.add_job(job_weekly_digest, "cron", day_of_week="sun", hour=18, minute=0,
+                      id="weekly_digest", replace_existing=True, max_instances=1)
     scheduler.start()
-    print(f"[scheduler] started: reminders/min, briefing 6am, email poll/{poll_min}min")
+    print(f"[scheduler] started: reminders/min, briefing 6am, weekly Sun 6pm, email poll/{poll_min}min")
 
 
 init_db()
