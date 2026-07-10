@@ -986,6 +986,52 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_phone):
 # =============================================================================
 #  GUPPI'S INSTRUCTIONS  (personality + memory rules, tailored to who is texting)
 # =============================================================================
+def capabilities_for_role(role):
+    """A concrete, accurate 'what I can do' rundown tailored to who's asking, so Guppi
+    can answer 'what can you do?' truthfully and never offer a feature this person can't
+    actually use. Written in plain text with example phrasings."""
+    common = [
+        "Calendar: ask what's coming up (\"what's on the calendar this week?\").",
+        "Reminders for yourself: \"remind me to call the dentist Thursday at 10am\". "
+        "Recurring works too: \"every Sunday at 7pm remind me to take out recycling\".",
+        "Shared lists: \"add milk to the grocery list\", \"what's on the grocery list?\", "
+        "\"build me a grocery list for taco night\", \"check off the milk\", "
+        "\"clear the grocery list\". Save a reusable one: \"save this as my travel list\", "
+        "then \"start my travel list\".",
+        "Send a photo (a flyer or a handwritten list) and I'll read it and offer to add "
+        "the event or save the list.",
+        "General questions and quick web lookups (\"what time does the library close?\").",
+        "Ask \"what do you remember?\" or say \"forget that\" any time.",
+    ]
+    adult = [
+        "Add or change calendar events: \"add Reese's game Saturday 10am\".",
+        "Email: \"any important emails today?\", \"did the school email about early "
+        "dismissal?\" (I only ever search your own inbox).",
+        "Remind other people: \"remind the girls about permission slips tomorrow 7:30am\".",
+        "I send a short summary each morning, and can flag urgent email.",
+        "Set me up: \"this is Breanna's number: +1...\". Adjust me: \"set the daily text "
+        "cap to 15\", or \"turn off proactive\".",
+    ]
+    caregiver = [
+        "Add or change calendar events for the kids' schedule.",
+        "You'll get childcare-relevant logistics; you don't have access to family email.",
+    ]
+    child = [
+        "You can check the calendar (read-only) and set reminders for yourself.",
+        "Keep it fun and simple - ask me anything, or send me a picture of a flyer.",
+    ]
+    if role not in ("adult", "caregiver", "child"):
+        # Unrecognized numbers get no feature tour — just the household-only message
+        # (handled by the memory_rules block). Keep this empty.
+        return ""
+    extra = {"adult": adult, "caregiver": caregiver, "child": child}.get(role, [])
+    lines = common + extra
+    return "When asked what you can do or for help, give a SHORT, friendly plain-text " \
+           "summary of the most relevant items below (don't dump the whole list unless " \
+           "asked for everything; offer to say more). Only mention things this person can " \
+           "actually do:\n- " + "\n- ".join(lines)
+
+
 def build_system_prompt(sender_name, sender_role):
     if sender_name:
         who = f"You are texting with {sender_name}."
@@ -1039,6 +1085,7 @@ Say plainly that you only help members of this household, that you do not recogn
 their number, and that a parent can add them. You may answer harmless general questions
 (like the weather or a fact lookup), nothing more."""
 
+    capabilities = capabilities_for_role(sender_role)
     return f"""You are Guppi, the family's household assistant, reachable by text message.
 
 Personality: calm and efficient. You are brief, clear, and competent - never chatty,
@@ -1095,6 +1142,8 @@ MEMORY RULES:
 {memory_rules}
 
 Anyone may ask what you remember, and may ask you to forget something. Always honor that.
+
+{capabilities}
 
 If someone asks for something they are not permitted to do, say so briefly and kindly,
 and do not explain how to get around it."""
