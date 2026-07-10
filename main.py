@@ -35,6 +35,7 @@ import json
 import sqlite3
 import datetime
 from zoneinfo import ZoneInfo
+import base64
 import urllib.request
 from apscheduler.schedulers.background import BackgroundScheduler
 from twilio.rest import Client as TwilioClient
@@ -1067,6 +1068,11 @@ only go by the number they're texting from, and move on.
 You help with the family's shared Google Calendar, their email, reminders, shared lists,
 remembering useful facts, and looking things up. Use your tools whenever they help.
 
+If someone sends a PHOTO (like a school flyer, invitation, or a handwritten list), read
+it and pull out what matters. If it shows an event, extract the title, date, and time and
+offer to add it to the calendar (confirm briefly if anything is unclear). If it's a list,
+offer to save it to a shared list. Don't invent details the image doesn't show.
+
 CRITICAL: never answer a question about the calendar, email, reminders, or lists from
 memory or assumption. You do not know what is there unless you call the tool and read the
 result. Always call the tool first. Never say "you have no emails" or "nothing is
@@ -1215,12 +1221,48 @@ def get_weather_line():
 # =============================================================================
 #  THE MESSAGE LOOP
 # =============================================================================
-def ask_guppi(user_message, sender_phone):
+def fetch_twilio_media(url):
+    """Download an MMS image from Twilio. Twilio media URLs require auth (our account
+    SID + auth token, which we already have). Returns (base64_data, media_type) or None."""
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
+        print("[mms] no Twilio creds to fetch media")
+        return None
+    try:
+        auth = base64.b64encode(
+            f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode()).decode()
+        req = urllib.request.Request(url, headers={"Authorization": f"Basic {auth}"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            media_type = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
+            data = r.read()
+        # Claude vision supports jpeg/png/gif/webp. Default odd types to jpeg.
+        if media_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+            media_type = "image/jpeg"
+        return base64.b64encode(data).decode(), media_type
+    except Exception as e:
+        print(f"[mms] media fetch failed: {e}")
+        return None
+
+
+def ask_guppi(user_message, sender_phone, image_data=None, image_media_type=None):
     sender_name, sender_role = identify_sender(sender_phone)
     print(f"[guppi] message from {sender_name or 'UNKNOWN'} ({sender_role}) {sender_phone}")
 
     today = now_local().strftime("%A, %B %d, %Y")
-    messages = [{"role": "user", "content": f"(Today is {today}.)\n\n{user_message}"}]
+    text_part = f"(Today is {today}.)\n\n{user_message}"
+    if image_data:
+        # A photo came in (MMS). Hand Claude the image alongside the text so it can
+        # read a flyer/whiteboard and pull out events or list items.
+        first_content = [
+            {"type": "image", "source": {"type": "base64",
+             "media_type": image_media_type or "image/jpeg", "data": image_data}},
+            {"type": "text", "text": text_part + ("\n\n(The user sent this image. If it "
+             "shows an event, offer to add it to the calendar with the right date/time. "
+             "If it's a list, offer to save it. Confirm details briefly before acting on "
+             "anything ambiguous.)")},
+        ]
+        messages = [{"role": "user", "content": first_content}]
+    else:
+        messages = [{"role": "user", "content": text_part}]
     tools = tools_for_role(sender_role)
     system = build_system_prompt(sender_name, sender_role)
 
@@ -1256,9 +1298,24 @@ async def sms_reply(request: Request):
     form = await request.form()
     incoming = form.get("Body", "")
     sender = form.get("From", "")
-    print(f"Received a text from {sender}: {incoming}")
+    num_media = int(form.get("NumMedia", "0") or "0")
+    print(f"Received a text from {sender}: {incoming!r} (media: {num_media})")
+
+    image_data = image_media_type = None
+    if num_media > 0:
+        media_url = form.get("MediaUrl0")  # handle the first image
+        ctype = form.get("MediaContentType0", "")
+        if media_url and ctype.startswith("image/"):
+            fetched = fetch_twilio_media(media_url)
+            if fetched:
+                image_data, image_media_type = fetched
+                print(f"[mms] fetched image ({image_media_type})")
+        if not image_data and not incoming:
+            incoming = "(the user sent an attachment I couldn't read)"
+
     try:
-        reply_text = ask_guppi(incoming, sender)
+        reply_text = ask_guppi(incoming or "(no text)", sender,
+                               image_data, image_media_type)
     except Exception as e:
         print(f"Error in ask_guppi: {e}")
         reply_text = "Sorry, I'm having a little trouble right now. Try again in a moment."
