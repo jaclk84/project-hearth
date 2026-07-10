@@ -517,6 +517,39 @@ def tool_forget(memory_id):
 
 
 # ---- Reminders (stored now; the Phase 4 scheduler will fire them) -----------
+# ---- Resolve a nudge target (a name, or a group like "the girls") -----------
+GROUP_ALIASES = {
+    "the girls": ["Lillian", "Charlotte"],
+    "the kids": ["Lillian", "Charlotte"],
+    "the children": ["Lillian", "Charlotte"],
+    "the parents": ["Jason", "Kim"],
+}
+
+def resolve_targets(target):
+    """Return a list of (name, phone) for a nudge target. Accepts a person's name or a
+    group alias. Skips anyone whose number isn't linked yet."""
+    if not target:
+        return []
+    key = target.strip().lower()
+    names = GROUP_ALIASES.get(key)
+    conn = db()
+    out = []
+    if names:
+        for n in names:
+            row = conn.execute("SELECT name, phone FROM people WHERE name = ? AND phone IS NOT NULL",
+                               (n,)).fetchone()
+            if row:
+                out.append((row["name"], row["phone"]))
+    else:
+        # match a single person by name (case-insensitive)
+        row = conn.execute("SELECT name, phone FROM people WHERE LOWER(name) = ? AND phone IS NOT NULL",
+                           (key,)).fetchone()
+        if row:
+            out.append((row["name"], row["phone"]))
+    conn.close()
+    return out
+
+
 def tool_add_reminder(text, due_iso, for_phone, created_by, repeat="none"):
     repeat = (repeat or "none").lower()
     valid = {"none", "daily", "weekly", "monthly",
@@ -532,6 +565,27 @@ def tool_add_reminder(text, due_iso, for_phone, created_by, repeat="none"):
     conn.close()
     tail = "" if repeat == "none" else f" (repeats {repeat.replace(':',' ')})"
     return f"Reminder set: '{text}' for {due_iso}{tail}."
+
+
+def tool_nudge(target, text, due_iso, created_by, sender_role, repeat="none"):
+    """Set a reminder FOR someone else (or a group). Parents only for others; anyone
+    can effectively remind themselves via the normal add_reminder path."""
+    if sender_role != "adult":
+        return "Only a parent can set a reminder for someone else."
+    people = resolve_targets(target)
+    if not people:
+        return (f"I couldn't find a linked number for '{target}'. A parent can link "
+                f"their number first.")
+    repeat = (repeat or "none").lower()
+    conn = db()
+    for name, phone in people:
+        conn.execute(
+            "INSERT INTO reminders (text, due_at, for_phone, created_by, repeat) "
+            "VALUES (?,?,?,?,?)", (text, due_iso, phone, created_by, repeat))
+    conn.commit(); conn.close()
+    who = ", ".join(n for n, _ in people)
+    tail = "" if repeat == "none" else f" (repeats {repeat.replace(':',' ')})"
+    return f"Reminder set for {who}: '{text}' at {due_iso}{tail}."
 
 
 def tool_list_reminders():
@@ -794,6 +848,20 @@ def tools_for_role(role):
 
     if role == "adult":
         tools.append({
+            "name": "nudge",
+            "description": ("Set a reminder FOR someone else or a group (parents only). "
+                            "target is a person's name (e.g. 'Lillian') or a group: "
+                            "'the girls', 'the kids', 'the parents'. Use this when a parent "
+                            "says 'remind the girls...' or 'remind Breanna...'. For a "
+                            "reminder for the SENDER themselves, use add_reminder instead."),
+            "input_schema": {"type": "object", "properties": {
+                "target": {"type": "string"},
+                "text": {"type": "string"},
+                "due_iso": {"type": "string"},
+                "repeat": {"type": "string",
+                           "description": "none|daily|weekly|monthly|weekly:<day>"}},
+                "required": ["target", "text", "due_iso"]}})
+        tools.append({
             "name": "link_person_phone",
             "description": ("Link a phone number to a family member during setup. "
                             "Parents only. Cannot be used for parents themselves."),
@@ -893,6 +961,10 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_phone):
                                         tool_input["list_name"], sender_name)
     if name == "list_templates":
         return tool_list_templates()
+
+    if name == "nudge":
+        return tool_nudge(tool_input["target"], tool_input["text"], tool_input["due_iso"],
+                          sender_name, sender_role, tool_input.get("repeat", "none"))
 
     if name == "link_person_phone":
         return link_phone(tool_input["name"], tool_input["phone"], sender_role)
