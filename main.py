@@ -161,7 +161,12 @@ def init_db():
         due_at TEXT NOT NULL,
         for_phone TEXT,
         created_by TEXT,
-        fired INTEGER NOT NULL DEFAULT 0)""")
+        fired INTEGER NOT NULL DEFAULT 0,
+        repeat TEXT DEFAULT 'none')""")
+    # Migration: older DBs created before Phase 4 Batch 2 lack the 'repeat' column.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(reminders)").fetchall()]
+    if "repeat" not in cols:
+        conn.execute("ALTER TABLE reminders ADD COLUMN repeat TEXT DEFAULT 'none'")
     conn.execute("""CREATE TABLE IF NOT EXISTS list_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         list_name TEXT NOT NULL,
@@ -512,23 +517,36 @@ def tool_forget(memory_id):
 
 
 # ---- Reminders (stored now; the Phase 4 scheduler will fire them) -----------
-def tool_add_reminder(text, due_iso, for_phone, created_by):
+def tool_add_reminder(text, due_iso, for_phone, created_by, repeat="none"):
+    repeat = (repeat or "none").lower()
+    valid = {"none", "daily", "weekly", "monthly",
+             "weekly:mon","weekly:tue","weekly:wed","weekly:thu",
+             "weekly:fri","weekly:sat","weekly:sun"}
+    if repeat not in valid:
+        repeat = "none"
     conn = db()
-    conn.execute("INSERT INTO reminders (text, due_at, for_phone, created_by) VALUES (?,?,?,?)",
-                 (text, due_iso, for_phone, created_by))
+    conn.execute(
+        "INSERT INTO reminders (text, due_at, for_phone, created_by, repeat) VALUES (?,?,?,?,?)",
+        (text, due_iso, for_phone, created_by, repeat))
     conn.commit()
     conn.close()
-    return f"Reminder set: '{text}' for {due_iso}."
+    tail = "" if repeat == "none" else f" (repeats {repeat.replace(':',' ')})"
+    return f"Reminder set: '{text}' for {due_iso}{tail}."
 
 
 def tool_list_reminders():
     conn = db()
     rows = conn.execute(
-        "SELECT id, text, due_at FROM reminders WHERE fired = 0 ORDER BY due_at").fetchall()
+        "SELECT id, text, due_at, repeat FROM reminders WHERE fired = 0 ORDER BY due_at"
+    ).fetchall()
     conn.close()
     if not rows:
         return "No upcoming reminders."
-    return "\n".join(f"[{r['id']}] {r['due_at']}: {r['text']}" for r in rows)
+    out = []
+    for r in rows:
+        rep = "" if (r["repeat"] or "none") == "none" else f" (repeats {r['repeat'].replace(':',' ')})"
+        out.append(f"[{r['id']}] {r['due_at']}: {r['text']}{rep}")
+    return "\n".join(out)
 
 
 # ---- Shared lists -----------------------------------------------------------
@@ -711,9 +729,14 @@ def tools_for_role(role):
          "input_schema": {"type": "object", "properties": {
              "memory_id": {"type": "integer"}}, "required": ["memory_id"]}},
         {"name": "add_reminder",
-         "description": "Store a reminder. due_iso is ISO 8601 with timezone offset.",
+         "description": ("Store a reminder. due_iso is ISO 8601 with timezone offset. "
+                         "For a recurring reminder, set repeat to one of: daily, weekly, "
+                         "monthly, or weekly:mon/tue/wed/thu/fri/sat/sun (e.g. "
+                         "'every Sunday' -> weekly:sun). Omit repeat for a one-time reminder."),
          "input_schema": {"type": "object", "properties": {
-             "text": {"type": "string"}, "due_iso": {"type": "string"}},
+             "text": {"type": "string"}, "due_iso": {"type": "string"},
+             "repeat": {"type": "string",
+                        "description": "none|daily|weekly|monthly|weekly:<day>"}},
              "required": ["text", "due_iso"]}},
         {"name": "list_reminders",
          "description": "Show upcoming reminders.",
@@ -845,7 +868,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_phone):
 
     if name == "add_reminder":
         return tool_add_reminder(tool_input["text"], tool_input["due_iso"],
-                                 sender_phone, sender_name)
+                                 sender_phone, sender_name,
+                                 tool_input.get("repeat", "none"))
     if name == "list_reminders":
         return tool_list_reminders()
 
@@ -1185,24 +1209,69 @@ def _adults_with_phones():
     return [(r["name"], r["phone"]) for r in rows]
 
 
+def _next_occurrence(due_dt, repeat):
+    """Given a fired reminder's time and its repeat rule, return the next datetime it
+    should fire, or None for a one-time reminder."""
+    repeat = (repeat or "none").lower()
+    if repeat == "none":
+        return None
+    if repeat == "daily":
+        return due_dt + datetime.timedelta(days=1)
+    if repeat == "monthly":
+        # same day next month (clamp to end of month handled loosely by adding ~30d
+        # then snapping to the same day-of-month when possible)
+        month = due_dt.month + 1
+        year = due_dt.year + (1 if month > 12 else 0)
+        month = 1 if month > 12 else month
+        day = due_dt.day
+        # step back until valid (handles 31st -> shorter months)
+        while day > 28:
+            try:
+                return due_dt.replace(year=year, month=month, day=day)
+            except ValueError:
+                day -= 1
+        return due_dt.replace(year=year, month=month, day=day)
+    # weekly, optionally pinned to a weekday: weekly or weekly:wed
+    weekdays = {"mon":0,"tue":1,"wed":2,"thu":3,"fri":4,"sat":5,"sun":6}
+    if repeat == "weekly":
+        return due_dt + datetime.timedelta(days=7)
+    if repeat.startswith("weekly:"):
+        target = weekdays.get(repeat.split(":")[1], due_dt.weekday())
+        days_ahead = (target - due_dt.weekday()) % 7
+        days_ahead = 7 if days_ahead == 0 else days_ahead
+        return due_dt + datetime.timedelta(days=days_ahead)
+    return None
+
+
 def job_reminders():
-    """Every minute: send any reminders now due. No Claude call — just sends the
-    stored text. Cheap, so it isn't gated by the Claude cap (but still respects the
-    text cap and quiet hours)."""
+    """Every minute: send any reminders now due. Recurring ones reschedule to their
+    next occurrence instead of being marked permanently done. No Claude call, so it's
+    cheap; still respects the text cap and quiet hours."""
     if not proactive_on():
         return
     now_iso = now_local().isoformat()
     conn = db()
     due = conn.execute(
-        "SELECT id, text, for_phone FROM reminders WHERE fired = 0 AND due_at <= ?",
-        (now_iso,)).fetchall()
+        "SELECT id, text, for_phone, due_at, repeat FROM reminders "
+        "WHERE fired = 0 AND due_at <= ?", (now_iso,)).fetchall()
     conn.close()
     for r in due:
         target = r["for_phone"] or _first_parent_phone()
-        if target and send_sms(target, f"Reminder: {r['text']}"):
-            conn = db()
+        if not (target and send_sms(target, f"Reminder: {r['text']}")):
+            continue
+        # Sent. If recurring, reschedule to the next occurrence; else mark fired.
+        try:
+            due_dt = datetime.datetime.fromisoformat(r["due_at"])
+        except ValueError:
+            due_dt = now_local()
+        nxt = _next_occurrence(due_dt, r["repeat"])
+        conn = db()
+        if nxt:
+            conn.execute("UPDATE reminders SET due_at = ? WHERE id = ?",
+                         (nxt.isoformat(), r["id"]))
+        else:
             conn.execute("UPDATE reminders SET fired = 1 WHERE id = ?", (r["id"],))
-            conn.commit(); conn.close()
+        conn.commit(); conn.close()
 
 
 def job_morning_briefing():
