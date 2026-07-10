@@ -443,8 +443,18 @@ def tool_add_calendar_event(summary, start_iso, end_iso, person=None):
     if not service:
         return "The Google account isn't connected yet."
     tzname = str(TIMEZONE)
+    # Mark every event Guppi creates so it's easy to spot (and later filter) which
+    # events came from the assistant vs. ones a person added by hand. The note goes in
+    # the event's description/detail field, tagged with who requested it and when.
+    stamp = now_local().strftime("%b %d, %Y at %I:%M %p")
+    who = person or "a family member"
+    marker = f"Added by Guppi (requested by {who} on {stamp})."
     service.events().insert(calendarId=FAMILY_CALENDAR_ID, body={
         "summary": summary,
+        "description": marker,
+        # A private extended property gives a machine-readable tag too, so a future
+        # feature could reliably find/clean up Guppi-created events programmatically.
+        "extendedProperties": {"private": {"created_by": "guppi"}},
         "start": {"dateTime": start_iso, "timeZone": tzname},
         "end": {"dateTime": end_iso, "timeZone": tzname}}).execute()
     return f"Added '{summary}' on {start_iso}."
