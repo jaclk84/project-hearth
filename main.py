@@ -669,6 +669,22 @@ def resolve_targets(target):
 
 
 def tool_add_reminder(text, due_iso, for_chat, created_by, repeat="none"):
+    # Guard: a one-time reminder set in the past fires instantly, which looks broken.
+    # It almost always means the model mis-computed the time. Reject it rather than
+    # silently misbehave, and tell the model what "now" actually is so it can retry.
+    # (Prompts are suggestions; code is a guarantee — same principle as Trap 17.)
+    if (repeat or "none").lower() == "none":
+        try:
+            due_dt = datetime.datetime.fromisoformat(due_iso)
+            if due_dt.tzinfo is None:
+                due_dt = due_dt.replace(tzinfo=TIMEZONE)
+            if due_dt <= now_local():
+                return (f"That time ({due_iso}) is in the past. Right now it is "
+                        f"{now_local().isoformat(timespec='seconds')}. Recompute the "
+                        f"time from that and try again.")
+        except ValueError:
+            return f"I couldn't read '{due_iso}' as a date and time. Use ISO 8601."
+
     repeat = (repeat or "none").lower()
     valid = {"none", "daily", "weekly", "monthly",
              "weekly:mon","weekly:tue","weekly:wed","weekly:thu",
@@ -1270,10 +1286,16 @@ scheduled" unless a tool actually returned that.
 When searching email, build broad queries. Senders rarely match a plain name - mail
 "from Google" comes from addresses like no-reply@accounts.google.com.
 
-You are given today's date with each message. Use it to resolve "tomorrow", "next
-Tuesday", "this weekend", "after school" (about 3pm on a weekday), "tonight". Convert
-these to concrete dates yourself rather than asking. When adding an event with no end
-time given, assume one hour. Always use the family's local timezone.
+You are given the CURRENT DATE AND TIME with each message. Use it to resolve every
+relative time yourself, precisely: "in 2 minutes", "in an hour", "tonight", "tomorrow",
+"next Tuesday", "this weekend", "after school" (about 3pm on a weekday), "first thing"
+(early morning). Do the arithmetic from the clock you were given - never guess a time.
+
+A reminder or event must be in the FUTURE. If your computed time is already past, you
+have made an arithmetic error - recompute it from the current time given to you.
+
+Always include the timezone offset in due_iso/start_iso (e.g. 2026-07-14T17:12:00-04:00).
+When adding an event with no end time given, assume one hour.
 
 MEMORY RULES:
 {memory_rules}
@@ -1443,8 +1465,17 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     print(f"[guppi] {'GROUP' if is_group else 'private'} msg from "
           f"{sender_name or 'UNKNOWN'} ({sender_role}) chat={who_id}")
 
-    today = now_local().strftime("%A, %B %d, %Y")
-    text_part = f"(Today is {today}.)\n\n{user_message}"
+    # Give Claude the current DATE AND TIME, with the timezone offset. Date alone is
+    # not enough: "in 2 minutes", "in an hour", "tonight" all need a clock to anchor
+    # to. Without this the model invents a plausible-looking time, which lands in the
+    # past and fires the reminder immediately.
+    n = now_local()
+    today = n.strftime("%A, %B %d, %Y")
+    clock = n.strftime("%-I:%M %p")
+    iso_now = n.isoformat(timespec="seconds")
+    text_part = (f"(Right now it is {clock} on {today}. In ISO 8601 that is {iso_now}. "
+                 f"Use this to work out any relative time such as 'in 2 minutes', "
+                 f"'in an hour', 'tonight', or 'tomorrow morning'.)\n\n{user_message}")
     if image_data:
         first_content = [
             {"type": "image", "source": {"type": "base64",
