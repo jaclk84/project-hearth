@@ -194,6 +194,35 @@ def init_db():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(reminders)").fetchall()]
     if "repeat" not in cols:
         conn.execute("ALTER TABLE reminders ADD COLUMN repeat TEXT DEFAULT 'none'")
+
+    # -------------------------------------------------------------------------
+    # MIGRATION: SMS -> Telegram.
+    #
+    # A database that already exists is NOT reshaped by "CREATE TABLE IF NOT
+    # EXISTS" — that statement is skipped entirely, so an old table keeps its old
+    # columns. The SMS-era DB has people.phone and reminders.for_phone; the
+    # Telegram code needs people.chat_id and reminders.for_chat.
+    #
+    # Rename the columns in place. The old phone values are meaningless now (a
+    # phone number is not a Telegram chat id), so we clear them: everyone simply
+    # re-binds with /start. Names, roles, reminders, lists, and memories all
+    # survive untouched.
+    # -------------------------------------------------------------------------
+    pcols = [r[1] for r in conn.execute("PRAGMA table_info(people)").fetchall()]
+    if "phone" in pcols and "chat_id" not in pcols:
+        print("[migration] people.phone -> people.chat_id (SMS -> Telegram)")
+        conn.execute("ALTER TABLE people RENAME COLUMN phone TO chat_id")
+        # Old phone numbers can't identify a Telegram chat. Clear them so nobody is
+        # left half-bound; everyone re-registers with /start.
+        conn.execute("UPDATE people SET chat_id = NULL")
+
+    rcols = [r[1] for r in conn.execute("PRAGMA table_info(reminders)").fetchall()]
+    if "for_phone" in rcols and "for_chat" not in rcols:
+        print("[migration] reminders.for_phone -> reminders.for_chat (SMS -> Telegram)")
+        conn.execute("ALTER TABLE reminders RENAME COLUMN for_phone TO for_chat")
+        # Any reminder targeted at a phone number can no longer be delivered. Clear
+        # the target so it falls back to a parent rather than failing forever.
+        conn.execute("UPDATE reminders SET for_chat = NULL")
     conn.execute("""CREATE TABLE IF NOT EXISTS list_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         list_name TEXT NOT NULL,
