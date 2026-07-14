@@ -61,6 +61,9 @@ import sqlite3
 import datetime
 from zoneinfo import ZoneInfo
 import base64
+import imaplib
+import email as emaillib
+from email.header import decode_header
 import urllib.request
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request, Response
@@ -162,6 +165,16 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS google_tokens (
         person TEXT PRIMARY KEY,
         token_json TEXT NOT NULL)""")
+    # IMAP email accounts (live.com/outlook, and any IMAP provider). Stores the
+    # address + an APP PASSWORD (never the real account password). This is a stored
+    # credential, so it lives only in the DB on the private Railway volume — never in
+    # code or GitHub. A person may have this AND a Google token; both get searched.
+    conn.execute("""CREATE TABLE IF NOT EXISTS imap_accounts (
+        person TEXT PRIMARY KEY,
+        email_addr TEXT NOT NULL,
+        app_password TEXT NOT NULL,
+        imap_host TEXT NOT NULL,
+        imap_port INTEGER NOT NULL DEFAULT 993)""")
     # Simple key/value settings, adjustable by text (e.g. the daily caps).
     conn.execute("""CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -565,14 +578,255 @@ def tool_add_calendar_event(summary, start_iso, end_iso, person=None):
     return f"Added '{summary}' on {start_iso}."
 
 
-def tool_search_email(query, person, max_results=5):
-    """Searches THIS PERSON'S inbox only. Auto-widens (see BUILD_LOG Trap 17)."""
+# =============================================================================
+#  IMAP EMAIL  (live.com / outlook, and any IMAP provider)
+# =============================================================================
+#  Chosen over Microsoft Graph because a personal live.com account can no longer
+#  register an Azure app without a paid directory. IMAP + an app password needs no
+#  Azure, no OAuth, no credit card. Works the same for live.com, Gmail, AOL, etc.
+#
+#  Each person's credentials are their OWN. Email only ever searches the requesting
+#  person's mailbox — Kim's search never reaches Jason's inbox.
+# =============================================================================
+
+# Known IMAP hosts, so the person only has to give an email + app password.
+IMAP_PRESETS = {
+    "outlook.com": ("outlook.office365.com", 993),
+    "hotmail.com": ("outlook.office365.com", 993),
+    "live.com":    ("outlook.office365.com", 993),
+    "msn.com":     ("outlook.office365.com", 993),
+    "gmail.com":   ("imap.gmail.com", 993),
+    "googlemail.com": ("imap.gmail.com", 993),
+    "yahoo.com":   ("imap.mail.yahoo.com", 993),
+    "aol.com":     ("imap.aol.com", 993),
+    "icloud.com":  ("imap.mail.me.com", 993),
+    "me.com":      ("imap.mail.me.com", 993),
+}
+
+
+def imap_host_for(email_addr):
+    """Pick the IMAP host/port from the address domain. Returns (host, port) or None."""
+    domain = email_addr.split("@")[-1].strip().lower()
+    return IMAP_PRESETS.get(domain)
+
+
+def save_imap_account(person, email_addr, app_password):
+    """Store a person's IMAP creds. Verifies the login works before saving, so we never
+    store a credential that silently fails later. Returns a status message."""
+    hostinfo = imap_host_for(email_addr)
+    if not hostinfo:
+        domain = email_addr.split("@")[-1]
+        return (f"I don't know the IMAP settings for {domain}. This works with "
+                f"outlook/live/hotmail, gmail, yahoo, aol, and icloud.")
+    host, port = hostinfo
+    # Verify before saving.
+    try:
+        M = imaplib.IMAP4_SSL(host, port, timeout=20)
+        M.login(email_addr, app_password)
+        M.logout()
+    except Exception as e:
+        print(f"[imap] login test failed for {person}: {e}")
+        return ("That didn't log in. Make sure you used an APP PASSWORD (not your normal "
+                "password), and that IMAP is enabled on the account. For Outlook/live.com "
+                "you generate an app password in your Microsoft account security settings.")
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO imap_accounts "
+                 "(person, email_addr, app_password, imap_host, imap_port) "
+                 "VALUES (?,?,?,?,?)", (person, email_addr, app_password, host, port))
+    conn.commit()
+    conn.close()
+    print(f"[imap] saved account for {person}: {email_addr}")
+    return f"Your email ({email_addr}) is connected. I can check it for you now."
+
+
+def get_imap_account(person):
+    conn = db()
+    row = conn.execute("SELECT email_addr, app_password, imap_host, imap_port "
+                       "FROM imap_accounts WHERE person = ?", (person,)).fetchone()
+    conn.close()
+    return row
+
+
+def _decode(s):
+    """Decode an email header (handles =?utf-8?...?= encoded words)."""
+    if not s:
+        return ""
+    out = []
+    for text, enc in decode_header(s):
+        if isinstance(text, bytes):
+            try:
+                out.append(text.decode(enc or "utf-8", errors="replace"))
+            except (LookupError, TypeError):
+                out.append(text.decode("utf-8", errors="replace"))
+        else:
+            out.append(text)
+    return "".join(out)
+
+
+def _imap_connect(person):
+    row = get_imap_account(person)
+    if not row:
+        return None
+    try:
+        M = imaplib.IMAP4_SSL(row["imap_host"], row["imap_port"], timeout=20)
+        M.login(row["email_addr"], row["app_password"])
+        return M
+    except Exception as e:
+        print(f"[imap] connect failed for {person}: {e}")
+        return None
+
+
+def _imap_snippet(msg, limit=120):
+    """Best-effort short preview of the plain-text body."""
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        return payload.decode(errors="replace").strip().replace("\n", " ")[:limit]
+            return ""
+        payload = msg.get_payload(decode=True)
+        return payload.decode(errors="replace").strip().replace("\n", " ")[:limit] if payload else ""
+    except Exception:
+        return ""
+
+
+def imap_search(person, keywords, max_results=5):
+    """Search a person's IMAP inbox. `keywords` is plain words (Gmail-style operators are
+    stripped upstream). Returns normalized dicts, newest first."""
+    M = _imap_connect(person)
+    if not M:
+        return []
+    out = []
+    try:
+        M.select("INBOX")
+        # Build an IMAP search. Plain words -> TEXT search (matches body/headers).
+        kw = keywords.strip()
+        if kw:
+            # IMAP TEXT search, one term (multiple words -> AND them).
+            terms = kw.split()
+            crit = []
+            for t in terms:
+                crit += ["TEXT", t]
+            typ, data = M.search(None, *crit) if crit else M.search(None, "ALL")
+        else:
+            typ, data = M.search(None, "ALL")
+        if typ != "OK":
+            return []
+        ids = data[0].split()
+        for mid in reversed(ids[-max_results:]):  # newest first
+            typ, md = M.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)] BODY.PEEK[TEXT])")
+            if typ != "OK":
+                continue
+            header_bytes = md[0][1]
+            body_msg = emaillib.message_from_bytes(md[1][1]) if len(md) > 1 and md[1] else None
+            hmsg = emaillib.message_from_bytes(header_bytes)
+            out.append({
+                "from": _decode(hmsg.get("From", "?")),
+                "subject": _decode(hmsg.get("Subject", "(no subject)")),
+                "snippet": _imap_snippet(body_msg) if body_msg else "",
+                "id": mid.decode(), "provider": "imap"})
+    except Exception as e:
+        print(f"[imap] search failed for {person}: {e}")
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    return out
+
+
+def imap_unread(person, max_results=5):
+    """Newest UNSEEN messages, normalized. Used by the urgent-email poll."""
+    M = _imap_connect(person)
+    if not M:
+        return []
+    out = []
+    try:
+        M.select("INBOX")
+        typ, data = M.search(None, "UNSEEN")
+        if typ != "OK":
+            return []
+        ids = data[0].split()
+        for mid in reversed(ids[-max_results:]):
+            # PEEK so we don't mark the mail as read just by checking it.
+            typ, md = M.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+            if typ != "OK":
+                continue
+            hmsg = emaillib.message_from_bytes(md[0][1])
+            out.append({
+                "id": f"i:{mid.decode()}",
+                "from": _decode(hmsg.get("From", "?")),
+                "subject": _decode(hmsg.get("Subject", "(no subject)")),
+                "snippet": ""})
+    except Exception as e:
+        print(f"[imap] unread failed for {person}: {e}")
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    return out
+
+
+# =============================================================================
+#  PROVIDER-AGNOSTIC EMAIL  (Gmail token AND/OR IMAP, per person)
+# =============================================================================
+def connected_providers(person):
+    """Which email sources this person has. e.g. ['google', 'imap']"""
+    if not person:
+        return []
+    out = []
+    conn = db()
+    if conn.execute("SELECT 1 FROM google_tokens WHERE person = ?", (person,)).fetchone():
+        out.append("google")
+    if conn.execute("SELECT 1 FROM imap_accounts WHERE person = ?", (person,)).fetchone():
+        out.append("imap")
+    conn.close()
+    return out
+
+
+def _gmail_search(person, query, max_results):
     service = get_gmail_service(person)
     if not service:
-        return (f"{person} hasn't connected their Google account yet. "
-                f"Visit /connect?person={person} to connect it.")
+        return []
+    try:
+        res = service.users().messages().list(
+            userId="me", q=query, maxResults=max_results).execute()
+    except Exception as e:
+        print(f"[email:google] search failed for {person}: {e}")
+        return []
+    out = []
+    for m in res.get("messages", []):
+        try:
+            msg = service.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["From", "Subject", "Date"]).execute()
+            h = {x["name"]: x["value"] for x in msg["payload"]["headers"]}
+            out.append({"from": h.get("From", "?"),
+                        "subject": h.get("Subject", "(no subject)"),
+                        "snippet": msg.get("snippet", "")[:120],
+                        "id": m["id"], "provider": "google"})
+        except Exception as e:
+            print(f"[email:google] fetch failed: {e}")
+    return out
+
+
+def tool_search_email(query, person, max_results=5):
+    """Searches THIS PERSON'S own inbox(es) — Gmail, IMAP (live.com), or both.
+
+    Auto-widens the query (Trap 17): a too-narrow search returning nothing, reported as
+    'you have no emails', is worse than useless. Enforced in CODE, not the prompt."""
+    providers = connected_providers(person)
+    if not providers:
+        return (f"{person} hasn't connected an email account yet. To connect an "
+                f"Outlook/live.com or other email address, say: connect my email. "
+                f"To connect Gmail, visit /connect?person={person}.")
+
+    # Strip Gmail-style operators progressively; IMAP wants plain words.
     attempts = [query]
-    no_date = re.sub(r"\b(newer_than|older_than|after|before):\S+", "", query).strip()
+    no_date = re.sub(r"\b(newer_than|older_than|after|before|category|is|in):\S+", "", query).strip()
     if no_date and no_date != query:
         attempts.append(no_date)
     loose = re.sub(r"\bfrom:(\S+)", r"\1", no_date or query).strip()
@@ -580,21 +834,21 @@ def tool_search_email(query, person, max_results=5):
         attempts.append(loose)
 
     for attempt in attempts:
-        print(f"[search_email] trying query: {attempt!r}")
-        res = service.users().messages().list(
-            userId="me", q=attempt, maxResults=max_results).execute()
-        messages = res.get("messages", [])
-        if messages:
-            out = []
-            for m in messages:
-                msg = service.users().messages().get(
-                    userId="me", id=m["id"], format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"]).execute()
-                h = {x["name"]: x["value"] for x in msg["payload"]["headers"]}
-                out.append(f"From {h.get('From','?')} | {h.get('Subject','(no subject)')}: "
-                           f"{msg.get('snippet','')[:120]}")
-            print(f"[search_email] found {len(out)} with {attempt!r}")
-            return "\n".join(out)
+        print(f"[search_email] {person} ({'+'.join(providers)}) trying: {attempt!r}")
+        found = []
+        if "google" in providers:
+            found += _gmail_search(person, attempt, max_results)
+        if "imap" in providers:
+            # IMAP search wants plain words, so use the most-stripped form.
+            found += imap_search(person, loose or no_date or attempt, max_results)
+        if found:
+            print(f"[search_email] found {len(found)} with {attempt!r}")
+            lines = []
+            for m in found[:max_results * len(providers)]:
+                tag = "" if len(providers) < 2 else f"[{m['provider']}] "
+                snip = f": {m['snippet']}" if m['snippet'] else ""
+                lines.append(f"{tag}From {m['from']} | {m['subject']}{snip}")
+            return "\n".join(lines)
     return "No matching emails found (searched broadly)."
 
 
@@ -1155,7 +1409,9 @@ def capabilities_for_role(role, is_group=False):
 
     # Private-chat-only capabilities. In the group these would leak to everyone.
     private_only_adult = [
-        "Email: \"any important emails today?\" (I only ever search your own inbox).",
+        "Email: \"any important emails today?\" - I search only YOUR own inbox. To "
+        "connect your Outlook/live.com or Gmail, say \"connect my email\" and I'll walk "
+        "you through it.",
         "I send you a short briefing each morning and can flag urgent email.",
         "Memory: \"what do you remember?\" / \"forget that\".",
         "Settings: \"set the daily message cap to 15\", \"turn off proactive\".",
@@ -1285,6 +1541,14 @@ scheduled" unless a tool actually returned that.
 
 When searching email, build broad queries. Senders rarely match a plain name - mail
 "from Google" comes from addresses like no-reply@accounts.google.com.
+
+If someone wants to CONNECT their email (e.g. "connect my email", "add my inbox"), do
+NOT ask for their password in the open. Tell them to send it as a command so their
+password stays protected:
+  /connectemail their@email.com their-app-password
+Explain they must use an APP PASSWORD, not their normal password - for Outlook/live.com
+they create one at account.microsoft.com under Security. Never ask them to type a
+password into a normal message, and never repeat a password back to them.
 
 You are given the CURRENT DATE AND TIME with each message. Use it to resolve every
 relative time yourself, precisely: "in 2 minutes", "in an hour", "tonight", "tomorrow",
@@ -1571,6 +1835,42 @@ async def telegram_webhook(request: Request):
     sender_chat_id = (message.get("from") or {}).get("id")
     text = message.get("text") or message.get("caption") or ""
 
+    # ---- /connectemail: capture an app password SECURELY ------------------------
+    # An app password is a credential. It must NOT be logged, and must NOT be sent
+    # through Claude. So we handle it here directly, before the normal message path,
+    # and redact it from the log line. Private chat only.
+    if text.strip().lower().startswith("/connectemail"):
+        if is_group:
+            send_message(chat_id, "Let's do that privately - message me directly, not in the group.")
+            return {"ok": True}
+        name, role = identify_sender(sender_chat_id)
+        if role == "unknown":
+            send_message(chat_id, "I don't recognize you yet, so I can't connect an inbox.")
+            return {"ok": True}
+        if role not in ("adult", "caregiver"):
+            send_message(chat_id, "Email isn't available for your access level.")
+            return {"ok": True}
+        parts = text.strip().split()
+        if len(parts) != 3:
+            send_message(chat_id,
+                "To connect your email, send:\\n\\n"
+                "`/connectemail your@email.com your-app-password`\\n\\n"
+                "Use an APP PASSWORD, not your normal password. For Outlook/live.com, "
+                "make one at account.microsoft.com under Security > Advanced security "
+                "options > App passwords. I'll delete this message's password from my "
+                "logs automatically.")
+            return {"ok": True}
+        _, addr, app_pw = parts
+        print(f"[tg] {chat_type} chat={chat_id} from={sender_chat_id}: /connectemail {addr} <redacted>")
+        result = save_imap_account(name, addr, app_pw)
+        send_message(chat_id, result)
+        # Best-effort: delete the user's message so the password doesn't linger in the
+        # chat history either.
+        mid = message.get("message_id")
+        if mid:
+            telegram_api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+        return {"ok": True}
+
     print(f"[tg] {chat_type} chat={chat_id} from={sender_chat_id}: {text[:60]!r}")
 
     # ---- /start: the ONLY way to get bound --------------------------------------
@@ -1770,43 +2070,58 @@ def job_weekly_digest():
             send_message(chat, text, proactive=True)
 
 
+def _poll_unread(person):
+    """Newest unread across every inbox this person connected (Gmail + IMAP), normalized.
+    The 'anything new?' check is a free provider call — Claude only runs if there IS new
+    mail."""
+    out = []
+    provs = connected_providers(person)
+    if "google" in provs:
+        service = get_gmail_service(person)
+        if service:
+            try:
+                res = service.users().messages().list(
+                    userId="me", q="is:unread category:primary", maxResults=5).execute()
+                for m in res.get("messages", []):
+                    md = service.users().messages().get(
+                        userId="me", id=m["id"], format="metadata",
+                        metadataHeaders=["From", "Subject"]).execute()
+                    h = {x["name"]: x["value"] for x in md["payload"]["headers"]}
+                    out.append({"id": f"g:{m['id']}", "from": h.get("From", "?"),
+                                "subject": h.get("Subject", "(no subject)"),
+                                "snippet": md.get("snippet", "")[:120]})
+            except Exception as e:
+                print(f"[poll] gmail failed for {person}: {e}")
+    if "imap" in provs:
+        out += imap_unread(person, max_results=5)
+    return out
+
+
 def job_urgent_email_poll():
-    """Every N minutes (6am-10pm): for each connected adult, check for NEW mail since
-    last check. Only calls Claude if there IS new mail. Alerts ONLY that inbox's owner
-    (privacy)."""
+    """Every N minutes (6am-10pm): for each connected adult, check every inbox they've
+    connected (Gmail and/or live.com over IMAP) for new unread mail. Only calls Claude if
+    there IS something new. Alerts ONLY that inbox's owner — one adult never sees
+    another's mail."""
     if not proactive_on() or in_quiet_hours():
         return
     for name, chat in _adults_with_chats():
-        service = get_gmail_service(name)
-        if not service:
+        if not connected_providers(name):
             continue
-        # Free Google call: unread primary-inbox mail since the last check id.
-        last_id = get_setting(f"last_email_id_{name}")
-        try:
-            res = service.users().messages().list(
-                userId="me", q="is:unread category:primary", maxResults=5).execute()
-        except Exception as e:
-            print(f"[poll] gmail list failed for {name}: {e}")
-            continue
-        msgs = res.get("messages", [])
+        msgs = _poll_unread(name)
         if not msgs:
             continue
         newest = msgs[0]["id"]
+        last_id = get_setting(f"last_email_id_{name}")
         if newest == last_id:
-            continue  # nothing new since last check -> no Claude call, no cost
+            continue  # nothing new -> no Claude call, no cost
         set_setting(f"last_email_id_{name}", newest)
 
-        # There IS new mail. Summarize headers, ask Haiku if any is urgent.
         summaries = []
         for m in msgs:
             if m["id"] == last_id:
                 break
-            md = service.users().messages().get(
-                userId="me", id=m["id"], format="metadata",
-                metadataHeaders=["From", "Subject"]).execute()
-            h = {x["name"]: x["value"] for x in md["payload"]["headers"]}
-            summaries.append(f"From {h.get('From','?')}: {h.get('Subject','(no subject)')} "
-                             f"- {md.get('snippet','')[:120]}")
+            snip = f" - {m['snippet']}" if m.get("snippet") else ""
+            summaries.append(f"From {m['from']}: {m['subject']}{snip}")
         if not summaries:
             continue
         if not claude_call_allowed():
@@ -1817,9 +2132,10 @@ def job_urgent_email_poll():
                 system=("You are Guppi. Below are new unread emails. Decide if ANY is "
                         "genuinely urgent or time-sensitive enough to interrupt someone by "
                         "text right now (e.g. school closure, urgent appointment change, "
-                        "safety issue). If yes, reply with ONE short plain-text alert under "
-                        "300 chars, no markdown. If nothing is truly urgent, reply with "
-                        "exactly: NONE"),
+                        "safety issue). Marketing, newsletters, promotions, and routine "
+                        "notifications are NOT urgent. If something truly is, reply with "
+                        "ONE short plain-text alert under 300 chars, no markdown. If "
+                        "nothing is truly urgent, reply with exactly: NONE"),
                 messages=[{"role": "user", "content": "\n\n".join(summaries)}])
             verdict = "".join(b.text for b in resp.content if b.type == "text").strip()
         except Exception as e:
