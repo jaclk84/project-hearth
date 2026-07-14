@@ -1,13 +1,16 @@
-# Phase 3.5 libraries plus APScheduler for the background jobs (reminders,
-# morning briefing, urgent-email poll). No new external services — APScheduler
-# runs inside the FastAPI process.
+# Telegram edition. Twilio is GONE — Telegram's Bot API is plain HTTPS, so we call it
+# with the standard library (urllib) and need no SDK at all.
 #
-#   ...as before...
-#   apscheduler  - runs jobs on a clock (intervals + fixed times), in-process
+#   fastapi / uvicorn        - the web server
+#   python-multipart         - form parsing (kept; harmless)
+#   anthropic                - Claude
+#   google-api-python-client - Calendar + Gmail
+#   google-auth-oauthlib     - the Google "connect your account" flow
+#   google-auth-httplib2     - networking glue for the Google client
+#   apscheduler              - the background jobs (reminders, briefing, digest, poll)
 
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-twilio==9.4.1
 python-multipart==0.0.20
 anthropic==0.69.0
 google-api-python-client==2.156.0
