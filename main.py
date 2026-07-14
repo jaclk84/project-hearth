@@ -1360,22 +1360,32 @@ def in_quiet_hours():
     return start <= h < end
 
 
-def send_message(chat_id, body, markdown=True):
-    """Send a Telegram message. Telegram is free and has no 160-char limit, so the
-    daily message cap here is about NOT BEING ANNOYING, not about cost. When the cap
-    is hit we send exactly one notice to a parent, then go quiet until tomorrow."""
+def send_message(chat_id, body, markdown=True, proactive=False):
+    """Send a Telegram message.
+
+    proactive=False — a REPLY to something someone said. NEVER capped. The person
+    asked for it, it costs nothing on Telegram, and it can't be "annoying." Capping
+    replies created a deadlock: "raise the cap" couldn't be answered, because the cap
+    blocked the answer — the one command that fixes the problem was locked behind it.
+
+    proactive=True — Guppi speaking UNPROMPTED (morning briefing, a reminder firing,
+    an urgent-email alert, the weekly digest). These ARE capped, so Guppi never spams
+    the family. Limiting unprompted messages is the only thing the cap was ever for.
+    """
     if not chat_id:
         return False
-    if get_count("messages") >= cap("daily_messages_cap"):
+
+    if proactive and get_count("messages") >= cap("daily_messages_cap"):
         if not get_setting(_counter("cap_warned")):
             set_setting(_counter("cap_warned"), "1")
             parent = _first_parent_chat()
             if parent:
                 telegram_api("sendMessage", {
                     "chat_id": parent,
-                    "text": ("I've hit my daily message limit, so I'll stay quiet until "
-                             "tomorrow. Ask me to raise the cap if you need to.")})
-        print("[tg] daily message cap reached; not sending")
+                    "text": ("I've hit my daily limit for messages I send on my own, so "
+                             "I'll stay quiet until tomorrow. You can still talk to me "
+                             "any time — just ask me to raise the cap.")})
+        print("[tg] proactive cap reached; not sending")
         return False
 
     payload = {"chat_id": str(chat_id), "text": body}
@@ -1387,7 +1397,8 @@ def send_message(chat_id, body, markdown=True):
         # silently dropping the message.
         res = telegram_api("sendMessage", {"chat_id": str(chat_id), "text": body})
     if res is not None:
-        bump_count("messages")
+        if proactive:
+            bump_count("messages")   # only unprompted messages count toward the cap
         print(f"[tg] sent to {chat_id}: {body[:60]}")
         return True
     return False
@@ -1669,7 +1680,7 @@ def job_reminders():
     conn.close()
     for r in due:
         target = r["for_chat"] or _first_parent_chat()
-        if not (target and send_message(target, f"Reminder: {r['text']}")):
+        if not (target and send_message(target, f"Reminder: {r['text']}", proactive=True)):
             continue
         # Sent. If recurring, reschedule to the next occurrence; else mark fired.
         try:
@@ -1710,7 +1721,7 @@ def job_morning_briefing():
         print(f"[briefing] Claude failed: {e}")
         return
     for name, chat in _adults_with_chats():
-        send_message(chat, text)
+        send_message(chat, text, proactive=True)
 
 
 def _people_with_chats_by_role():
@@ -1756,7 +1767,7 @@ def job_weekly_digest():
             print(f"[weekly] Claude failed for {name}: {e}")
             continue
         if text:
-            send_message(chat, text)
+            send_message(chat, text, proactive=True)
 
 
 def job_urgent_email_poll():
@@ -1815,7 +1826,7 @@ def job_urgent_email_poll():
             print(f"[poll] Claude failed for {name}: {e}")
             continue
         if verdict and verdict.upper() != "NONE":
-            send_message(chat, verdict)
+            send_message(chat, verdict, proactive=True)
 
 
 # =============================================================================
