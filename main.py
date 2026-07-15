@@ -65,6 +65,7 @@ import imaplib
 import email as emaillib
 from email.header import decode_header
 import urllib.request
+import urllib.parse
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import RedirectResponse, HTMLResponse
@@ -115,6 +116,22 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # The bot's @username, used to detect being addressed in a group (e.g. "@GuppiBot").
 BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@").lower()
+
+# ---- Microsoft (live.com / outlook) email via OAuth2 over IMAP ---------------
+# Personal Microsoft accounts no longer allow password/app-password IMAP (basic auth
+# was retired Sept 2024). The only supported path is OAuth2: the person signs in on
+# Microsoft's page, we get a refresh token, and we authenticate IMAP with an access
+# token via SASL XOAUTH2. Requires an Entra app registration (multitenant + personal
+# accounts) with delegated scope IMAP.AccessAsUser.All + offline_access.
+MS_CLIENT_ID = os.environ.get("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET", "")
+MS_REDIRECT_URI = f"{BASE_URL}/oauth/microsoft/callback"
+MS_AUTHORITY = "https://login.microsoftonline.com/common"
+# offline_access -> refresh token; the IMAP resource scope -> mail access.
+MS_SCOPES = ("offline_access openid "
+             "https://outlook.office.com/IMAP.AccessAsUser.All")
+MS_IMAP_HOST = "outlook.office365.com"
+MS_IMAP_PORT = 993
 
 # Where to get weather for the briefing (open-meteo needs no API key). Defaults to
 # the Philadelphia area; override with LATITUDE / LONGITUDE env vars.
@@ -169,6 +186,13 @@ def init_db():
     # address + an APP PASSWORD (never the real account password). This is a stored
     # credential, so it lives only in the DB on the private Railway volume — never in
     # code or GitHub. A person may have this AND a Google token; both get searched.
+    # Microsoft OAuth tokens, one per person (live.com/outlook via IMAP-XOAUTH2).
+    conn.execute("""CREATE TABLE IF NOT EXISTS ms_tokens (
+        person TEXT PRIMARY KEY,
+        email_addr TEXT,
+        refresh_token TEXT NOT NULL,
+        access_token TEXT,
+        expires_at TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS imap_accounts (
         person TEXT PRIMARY KEY,
         email_addr TEXT NOT NULL,
@@ -663,7 +687,162 @@ def _decode(s):
     return "".join(out)
 
 
+# =============================================================================
+#  MICROSOFT OAUTH  (live.com / outlook — the only path that still works)
+# =============================================================================
+def _ms_token_request(fields):
+    try:
+        data = urllib.parse.urlencode(fields).encode()
+        req = urllib.request.Request(
+            f"{MS_AUTHORITY}/oauth2/v2.0/token", data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        body = ""
+        if hasattr(e, "read"):
+            try:
+                body = e.read().decode()[:300]
+            except Exception:
+                pass
+        print(f"[ms] token request failed: {e} {body}")
+        return None
+
+
+def save_ms_token(person, tok, email_addr=None):
+    conn = db()
+    old = conn.execute("SELECT refresh_token, email_addr FROM ms_tokens WHERE person = ?",
+                       (person,)).fetchone()
+    refresh = tok.get("refresh_token") or (old["refresh_token"] if old else None)
+    if not refresh:
+        conn.close()
+        print(f"[ms] no refresh token for {person}; not saving")
+        return
+    email_addr = email_addr or (old["email_addr"] if old else None)
+    expires_at = (now_local() + datetime.timedelta(
+        seconds=int(tok.get("expires_in", 3600)) - 120)).isoformat()
+    conn.execute("INSERT OR REPLACE INTO ms_tokens "
+                 "(person, email_addr, refresh_token, access_token, expires_at) "
+                 "VALUES (?,?,?,?,?)",
+                 (person, email_addr, refresh, tok.get("access_token"), expires_at))
+    conn.commit()
+    conn.close()
+
+
+def get_ms_access_token(person):
+    """A valid access token for this person, refreshing if needed. None if not connected."""
+    if not person or not MS_CLIENT_ID:
+        return None
+    conn = db()
+    row = conn.execute("SELECT refresh_token, access_token, expires_at FROM ms_tokens "
+                       "WHERE person = ?", (person,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        if row["access_token"] and row["expires_at"] and \
+                datetime.datetime.fromisoformat(row["expires_at"]) > now_local():
+            return row["access_token"]
+    except ValueError:
+        pass
+    tok = _ms_token_request({
+        "client_id": MS_CLIENT_ID, "client_secret": MS_CLIENT_SECRET,
+        "grant_type": "refresh_token", "refresh_token": row["refresh_token"],
+        "scope": MS_SCOPES, "redirect_uri": MS_REDIRECT_URI})
+    if not tok or "access_token" not in tok:
+        print(f"[ms] refresh failed for {person}; they need to reconnect")
+        return None
+    save_ms_token(person, tok)
+    return tok["access_token"]
+
+
+@app.get("/connect-microsoft")
+def connect_microsoft(person: str = ""):
+    """Connect a live.com/outlook account: /connect-microsoft?person=Jason"""
+    if not MS_CLIENT_ID:
+        return HTMLResponse("<h2>Microsoft isn't configured yet.</h2>"
+                            "<p>MS_CLIENT_ID and MS_CLIENT_SECRET need to be set in Railway.</p>")
+    if not person:
+        return HTMLResponse("<h2>Who is connecting?</h2>"
+                            "<p>For example: <code>/connect-microsoft?person=Jason</code></p>")
+    params = {"client_id": MS_CLIENT_ID, "response_type": "code",
+              "redirect_uri": MS_REDIRECT_URI, "response_mode": "query",
+              "scope": MS_SCOPES, "state": person, "prompt": "select_account"}
+    return RedirectResponse(
+        f"{MS_AUTHORITY}/oauth2/v2.0/authorize?" + urllib.parse.urlencode(params))
+
+
+@app.get("/oauth/microsoft/callback")
+def ms_callback(code: str = "", state: str = "", error: str = "",
+                error_description: str = ""):
+    if error:
+        return HTMLResponse(f"<h2>Microsoft sign-in failed</h2><p>{error}: {error_description}</p>")
+    if not code:
+        return HTMLResponse("<h2>No authorization code came back.</h2>")
+    person = state or "Unknown"
+    tok = _ms_token_request({
+        "client_id": MS_CLIENT_ID, "client_secret": MS_CLIENT_SECRET,
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": MS_REDIRECT_URI, "scope": MS_SCOPES})
+    if not tok or "access_token" not in tok:
+        return HTMLResponse("<h2>Couldn't complete the Microsoft sign-in.</h2>"
+                            "<p>Try again from /connect-microsoft?person=YourName</p>")
+    # Pull the account's email address from the id_token claims if present.
+    email_addr = None
+    idt = tok.get("id_token")
+    if idt:
+        try:
+            payload = idt.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            email_addr = claims.get("email") or claims.get("preferred_username")
+        except Exception:
+            pass
+    save_ms_token(person, tok, email_addr)
+    print(f"[ms] connected {person} ({email_addr or 'address unknown'})")
+    return HTMLResponse(f"<h2>Guppi is connected to {person}'s Microsoft email"
+                        f"{f' ({email_addr})' if email_addr else ''}.</h2>"
+                        "<p>You can close this window.</p>")
+
+
+def _xoauth2_string(user, token):
+    """Build the SASL XOAUTH2 auth string Microsoft's IMAP expects."""
+    return f"user={user}\x01auth=Bearer {token}\x01\x01"
+
+
+def _ms_imap_connect(person):
+    """Connect to Outlook IMAP using this person's OAuth access token (XOAUTH2)."""
+    token = get_ms_access_token(person)
+    if not token:
+        return None
+    conn = db()
+    row = conn.execute("SELECT email_addr FROM ms_tokens WHERE person = ?",
+                       (person,)).fetchone()
+    conn.close()
+    email_addr = row["email_addr"] if row else None
+    if not email_addr:
+        print(f"[ms] no email address on file for {person}; can't IMAP")
+        return None
+    try:
+        M = imaplib.IMAP4_SSL(MS_IMAP_HOST, MS_IMAP_PORT, timeout=20)
+        M.authenticate("XOAUTH2",
+                       lambda _=None: _xoauth2_string(email_addr, token).encode())
+        return M
+    except Exception as e:
+        print(f"[ms] IMAP XOAUTH2 connect failed for {person}: {e}")
+        return None
+
+
 def _imap_connect(person):
+    """Open an IMAP connection for this person. Prefers Microsoft OAuth (live.com); falls
+    back to a stored app-password account (Gmail and other providers that still allow it)."""
+    conn = db()
+    has_ms = conn.execute("SELECT 1 FROM ms_tokens WHERE person = ?", (person,)).fetchone()
+    conn.close()
+    if has_ms:
+        M = _ms_imap_connect(person)
+        if M:
+            return M
     row = get_imap_account(person)
     if not row:
         return None
@@ -781,8 +960,12 @@ def connected_providers(person):
     conn = db()
     if conn.execute("SELECT 1 FROM google_tokens WHERE person = ?", (person,)).fetchone():
         out.append("google")
-    if conn.execute("SELECT 1 FROM imap_accounts WHERE person = ?", (person,)).fetchone():
-        out.append("imap")
+    has_imap = conn.execute(
+        "SELECT 1 FROM imap_accounts WHERE person = ?", (person,)).fetchone()
+    has_ms = conn.execute(
+        "SELECT 1 FROM ms_tokens WHERE person = ?", (person,)).fetchone()
+    if has_imap or has_ms:
+        out.append("imap")   # both are served by _imap_connect() (app-pw or MS-OAuth)
     conn.close()
     return out
 
@@ -820,8 +1003,9 @@ def tool_search_email(query, person, max_results=5):
     'you have no emails', is worse than useless. Enforced in CODE, not the prompt."""
     providers = connected_providers(person)
     if not providers:
-        return (f"{person} hasn't connected an email account yet. To connect an "
-                f"Outlook/live.com or other email address, say: connect my email. "
+        return (f"{person} hasn't connected an email account yet. For Outlook/live.com, "
+                f"a parent opens {BASE_URL}/connect-microsoft?person={person} and signs "
+                f"in. For Gmail, say: connect my email. "
                 f"To connect Gmail, visit /connect?person={person}.")
 
     # Strip Gmail-style operators progressively; IMAP wants plain words.
@@ -1410,8 +1594,8 @@ def capabilities_for_role(role, is_group=False):
     # Private-chat-only capabilities. In the group these would leak to everyone.
     private_only_adult = [
         "Email: \"any important emails today?\" - I search only YOUR own inbox. To "
-        "connect your Outlook/live.com or Gmail, say \"connect my email\" and I'll walk "
-        "you through it.",
+        "connect your inbox, ask me how - Outlook/live.com uses a secure sign-in link, "
+        "Gmail uses an app password.",
         "I send you a short briefing each morning and can flag urgent email.",
         "Memory: \"what do you remember?\" / \"forget that\".",
         "Settings: \"set the daily message cap to 15\", \"turn off proactive\".",
@@ -1542,13 +1726,16 @@ scheduled" unless a tool actually returned that.
 When searching email, build broad queries. Senders rarely match a plain name - mail
 "from Google" comes from addresses like no-reply@accounts.google.com.
 
-If someone wants to CONNECT their email (e.g. "connect my email", "add my inbox"), do
-NOT ask for their password in the open. Tell them to send it as a command so their
-password stays protected:
-  /connectemail their@email.com their-app-password
-Explain they must use an APP PASSWORD, not their normal password - for Outlook/live.com
-they create one at account.microsoft.com under Security. Never ask them to type a
-password into a normal message, and never repeat a password back to them.
+If someone wants to CONNECT their email, the steps depend on the provider:
+- Outlook / live.com / hotmail: this needs a secure Microsoft sign-in. Tell them a parent
+  must open this link in a browser and sign in (replace NAME with their first name):
+  "{BASE}/connect-microsoft?person=NAME". Do NOT ask for a
+  Microsoft password in chat - personal Microsoft accounts no longer allow that.
+- Gmail: tell them to send it as a command so the password stays protected:
+  /connectemail their@gmail.com their-app-password
+  and to use an APP PASSWORD (from their Google account security page), not their normal
+  password. Never ask anyone to type a normal password into a chat message, and never
+  repeat a password back.
 
 You are given the CURRENT DATE AND TIME with each message. Use it to resolve every
 relative time yourself, precisely: "in 2 minutes", "in an hour", "tonight", "tomorrow",
