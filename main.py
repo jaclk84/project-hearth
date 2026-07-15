@@ -392,7 +392,12 @@ def save_google_token(person, creds):
 
 
 def load_google_token(person):
-    """Load one person's credentials, refreshing if expired. None if not connected."""
+    """Load one person's credentials, refreshing if expired. None if not connected.
+
+    If Google has permanently revoked the token (invalid_grant — happens when the OAuth
+    app is unpublished and Google expires tokens after 7 days, or the user revoked
+    access), we record that so Guppi can say 'reconnect' instead of the misleading
+    'you never connected'. A transient network error is NOT treated as revocation."""
     if not person:
         return None
     conn = sqlite3.connect(DB_PATH)
@@ -400,16 +405,35 @@ def load_google_token(person):
                        (person,)).fetchone()
     conn.close()
     if not row:
+        print(f"[gtoken] {person}: no row in google_tokens")
         return None
-    creds = Credentials.from_authorized_user_info(json.loads(row[0]), SCOPES)
-    if creds and creds.expired and creds.refresh_token:
+    try:
+        info = json.loads(row[0])
+        creds = Credentials.from_authorized_user_info(info, SCOPES)
+    except Exception as e:
+        print(f"[gtoken] {person}: could not build creds: {e}")
+        return None
+    print(f"[gtoken] {person}: valid={creds.valid} expired={creds.expired} "
+          f"has_refresh={bool(creds.refresh_token)} "
+          f"scopes_match={set(creds.scopes or []) == set(SCOPES)}")
+    if creds and not creds.valid and creds.refresh_token:
+        # Refresh whenever the creds aren't currently valid (covers 'expired' AND other
+        # not-valid states), not only when flagged expired.
         try:
             creds.refresh(GoogleRequest())
             save_google_token(person, creds)
+            set_setting(f"google_dead_{person}", "")   # healthy again
+            print(f"[gtoken] {person}: refreshed OK")
         except Exception as e:
             print(f"Token refresh failed for {person}: {e}")
+            if "invalid_grant" in str(e):
+                set_setting(f"google_dead_{person}", "1")
             return None
     return creds
+
+
+def google_needs_reconnect(person):
+    return get_setting(f"google_dead_{person}") == "1"
 
 
 def any_connected_adult():
@@ -470,8 +494,17 @@ def get_calendar_service(person=None):
     """Shared family calendar: prefer the requester's own token, else any adult's."""
     creds = load_google_token(person) if person else None
     if not creds:
-        creds = load_google_token(any_connected_adult())
-    return build("calendar", "v3", credentials=creds) if creds else None
+        fallback = any_connected_adult()
+        print(f"[cal] {person} had no creds; fallback adult = {fallback}")
+        creds = load_google_token(fallback) if fallback else None
+    if not creds:
+        print(f"[cal] no usable Google credentials at all")
+        return None
+    try:
+        return build("calendar", "v3", credentials=creds)
+    except Exception as e:
+        print(f"[cal] build() failed: {e}")
+        return None
 
 
 def get_gmail_service(person):
@@ -566,12 +599,20 @@ def tool_list_calendars(person=None):
 def tool_check_calendar(days_ahead=7, person=None):
     service = get_calendar_service(person)
     if not service:
+        if person and google_needs_reconnect(person):
+            return (f"{person}'s Google access expired and needs to be reconnected. A "
+                    f"parent should reopen the connect link and sign in again.")
         return "The Google account isn't connected yet."
     now = now_local()
     later = now + datetime.timedelta(days=days_ahead)
-    result = service.events().list(
-        calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(), timeMax=later.isoformat(),
-        singleEvents=True, orderBy="startTime", maxResults=20).execute()
+    try:
+        result = service.events().list(
+            calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(), timeMax=later.isoformat(),
+            singleEvents=True, orderBy="startTime", maxResults=20).execute()
+    except Exception as e:
+        print(f"[cal] events.list failed: {e}")
+        return (f"I reached your calendar but couldn't read it: {e}. This can mean the "
+                f"calendar ID is wrong or access wasn't granted for calendar.")
     events = result.get("items", [])
     if not events:
         return f"No events in the next {days_ahead} days."
@@ -580,26 +621,36 @@ def tool_check_calendar(days_ahead=7, person=None):
         for e in events)
 
 
-def tool_add_calendar_event(summary, start_iso, end_iso, person=None):
+def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
+                            location=None, details=None):
     service = get_calendar_service(person)
     if not service:
+        if person and google_needs_reconnect(person):
+            return (f"{person}'s Google access expired and needs reconnecting before I "
+                    f"can add events. A parent should sign in again via the connect link.")
         return "The Google account isn't connected yet."
     tzname = str(TIMEZONE)
-    # Mark every event Guppi creates so it's easy to spot (and later filter) which
-    # events came from the assistant vs. ones a person added by hand. The note goes in
-    # the event's description/detail field, tagged with who requested it and when.
+    # Mark every event Guppi creates so it's easy to spot which events came from the
+    # assistant vs. ones added by hand. The marker goes at the END of the description,
+    # after any real event details, tagged with who requested it and when.
     stamp = now_local().strftime("%b %d, %Y at %I:%M %p")
     who = person or "a family member"
-    marker = f"Added by Guppi (requested by {who} on {stamp})."
-    service.events().insert(calendarId=FAMILY_CALENDAR_ID, body={
+    marker = f"— Added by Guppi (requested by {who} on {stamp})."
+    description = f"{details}\n\n{marker}" if details else marker
+
+    body = {
         "summary": summary,
-        "description": marker,
-        # A private extended property gives a machine-readable tag too, so a future
-        # feature could reliably find/clean up Guppi-created events programmatically.
+        "description": description,
         "extendedProperties": {"private": {"created_by": "guppi"}},
         "start": {"dateTime": start_iso, "timeZone": tzname},
-        "end": {"dateTime": end_iso, "timeZone": tzname}}).execute()
-    return f"Added '{summary}' on {start_iso}."
+        "end": {"dateTime": end_iso, "timeZone": tzname},
+    }
+    if location:
+        body["location"] = location   # Google makes this tappable -> maps/directions
+
+    service.events().insert(calendarId=FAMILY_CALENDAR_ID, body=body).execute()
+    extra = f" at {location}" if location else ""
+    return f"Added '{summary}' on {start_iso}{extra}."
 
 
 # =============================================================================
@@ -1364,12 +1415,24 @@ def tools_for_role(role, is_group=False):
     if perms["calendar_write"]:
         tools.append({
             "name": "add_calendar_event",
-            "description": ("Add an event to the family's Google Calendar. Times are "
-                            "ISO 8601 with timezone offset, e.g. 2026-07-12T10:00:00-04:00."),
+            "description": ("Add an event to the family's Google Calendar. Capture ALL "
+                            "relevant details you know — don't drop information. Put the "
+                            "place in `location` (Google makes it tappable for "
+                            "directions), and put everything else useful in `details`: "
+                            "who's involved/attending, what to bring, cost, contact info, "
+                            "arrival instructions, dress code, links, notes from a flyer "
+                            "or email, etc. A calendar entry is only useful if it has the "
+                            "info someone needs when they open it. Times are ISO 8601 with "
+                            "timezone offset, e.g. 2026-07-12T10:00:00-04:00."),
             "input_schema": {"type": "object", "properties": {
-                "summary": {"type": "string"},
+                "summary": {"type": "string", "description": "Short event title."},
                 "start_iso": {"type": "string"},
-                "end_iso": {"type": "string"}},
+                "end_iso": {"type": "string"},
+                "location": {"type": "string",
+                             "description": "Address or place name, if known."},
+                "details": {"type": "string",
+                            "description": ("All other useful info: attendees, what to "
+                                            "bring, cost, contacts, instructions, notes.")}},
                 "required": ["summary", "start_iso", "end_iso"]}})
 
     if perms["email"]:
@@ -1535,8 +1598,9 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "add_calendar_event":
         if not perms["calendar_write"]:
             return "Only a parent or caregiver can add calendar events."
-        return tool_add_calendar_event(tool_input["summary"], tool_input["start_iso"],
-                                       tool_input["end_iso"], sender_name)
+        return tool_add_calendar_event(
+            tool_input["summary"], tool_input["start_iso"], tool_input["end_iso"],
+            sender_name, tool_input.get("location"), tool_input.get("details"))
 
     if name == "search_email":
         if not perms["email"]:
@@ -1746,9 +1810,15 @@ You help with the family's shared Google Calendar, their email, reminders, share
 remembering useful facts, and looking things up. Use your tools whenever they help.
 
 If someone sends a PHOTO (a school flyer, invitation, or handwritten list), read it and
-pull out what matters. If it shows an event, extract the title, date, and time and offer
-to add it to the calendar. If it's a list, offer to save it. Don't invent details the
-image doesn't show.
+pull out EVERYTHING useful. If it shows an event, capture the title, date, and time AND
+the location, who it's for or who's attending, what to bring, cost, contact info, arrival
+or parking instructions, dress code, and any other detail on the flyer — then offer to
+add it to the calendar with all of that included (title in the summary, place in the
+location, everything else in the details). A calendar entry is only worth having if it
+holds the information someone needs when they open it later, so never drop the location
+or supporting details. The same applies when adding an event from an email or from what
+someone tells you: include all the relevant specifics, not just the time. If it's a list,
+offer to save it. Don't invent details the source doesn't show.
 
 CRITICAL: never answer a question about the calendar, email, reminders, or lists from
 memory or assumption. You do not know what is there unless you call the tool and read the
