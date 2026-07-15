@@ -1030,25 +1030,35 @@ def tool_search_email(query, person, max_results=5):
                 f"in. For Gmail, say: connect my email. "
                 f"To connect Gmail, visit /connect?person={person}.")
 
-    # Strip Gmail-style operators progressively; IMAP wants plain words.
-    attempts = [query]
-    no_date = re.sub(r"\b(newer_than|older_than|after|before|category|is|in):\S+", "", query).strip()
+    # Build queries suited to each provider. Gmail understands its own operators
+    # (is:important, from:, after:); IMAP does not — to IMAP those are just literal
+    # words that would wrongly match message bodies. So we keep the raw query for Gmail
+    # and hand IMAP a cleaned, plain-words version.
+    gmail_attempts = [query]
+    no_date = re.sub(r"\b(newer_than|older_than|after|before):\S+", "", query).strip()
     if no_date and no_date != query:
-        attempts.append(no_date)
-    loose = re.sub(r"\bfrom:(\S+)", r"\1", no_date or query).strip()
-    if loose and loose not in attempts:
-        attempts.append(loose)
+        gmail_attempts.append(no_date)
 
-    for attempt in attempts:
-        print(f"[search_email] {person} ({'+'.join(providers)}) trying: {attempt!r}")
+    # For IMAP: drop ALL Gmail operators (is:x, in:x, category:x, label:x) entirely —
+    # they're filters, not words — and unwrap from:addr to just the name/word.
+    imap_q = re.sub(r"\b(is|in|category|label|has|filename):\S+", "", query)
+    imap_q = re.sub(r"\b(newer_than|older_than|after|before):\S+", "", imap_q)
+    imap_q = re.sub(r"\bfrom:(\S+)", r"\1", imap_q)
+    imap_q = re.sub(r"\s+", " ", imap_q).strip()
+
+    seen = set()
+    for attempt in gmail_attempts:
+        if attempt in seen:
+            continue
+        seen.add(attempt)
+        print(f"[search_email] {person} ({'+'.join(providers)}) trying: gmail={attempt!r} imap={imap_q!r}")
         found = []
         if "google" in providers:
             found += _gmail_search(person, attempt, max_results)
         if "imap" in providers:
-            # IMAP search wants plain words, so use the most-stripped form.
-            found += imap_search(person, loose or no_date or attempt, max_results)
+            found += imap_search(person, imap_q, max_results)
         if found:
-            print(f"[search_email] found {len(found)} with {attempt!r}")
+            print(f"[search_email] found {len(found)}")
             lines = []
             for m in found[:max_results * len(providers)]:
                 tag = "" if len(providers) < 2 else f"[{m['provider']}] "
@@ -1943,6 +1953,10 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     `sender_chat_id` identifies the PERSON (in a group, the individual who spoke).
     `chat_id` is where the reply goes (the group, or the person's private chat).
     `is_group` gates private information — see build_system_prompt and tools_for_role.
+
+    Conversation memory: the last few turns for this chat are prepended so short
+    follow-ups ("yes", "add that", "the second one") have something to refer to.
+    Without it, every message is treated as brand new and references break.
     """
     who_id = sender_chat_id or chat_id
     sender_name, sender_role = identify_sender(who_id)
@@ -1957,21 +1971,25 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     today = n.strftime("%A, %B %d, %Y")
     clock = n.strftime("%-I:%M %p")
     iso_now = n.isoformat(timespec="seconds")
-    text_part = (f"(Right now it is {clock} on {today}. In ISO 8601 that is {iso_now}. "
+    time_hint = (f"(Right now it is {clock} on {today}. In ISO 8601 that is {iso_now}. "
                  f"Use this to work out any relative time such as 'in 2 minutes', "
-                 f"'in an hour', 'tonight', or 'tomorrow morning'.)\n\n{user_message}")
+                 f"'in an hour', 'tonight', or 'tomorrow morning'.)")
+    text_part = f"{time_hint}\n\n{user_message}"
     if image_data:
-        first_content = [
+        this_turn = {"role": "user", "content": [
             {"type": "image", "source": {"type": "base64",
              "media_type": image_media_type or "image/jpeg", "data": image_data}},
             {"type": "text", "text": text_part + ("\n\n(The user sent this image. If it "
              "shows an event, offer to add it to the calendar with the right date/time. "
              "If it's a list, offer to save it. Confirm details briefly before acting on "
-             "anything ambiguous.)")},
-        ]
-        messages = [{"role": "user", "content": first_content}]
+             "anything ambiguous.)")}]}
     else:
-        messages = [{"role": "user", "content": text_part}]
+        this_turn = {"role": "user", "content": text_part}
+
+    # Prepend recent history (plain text turns only — no images or tool internals, to
+    # keep it clean). This is what lets "yes" refer to Guppi's last message.
+    history = get_history(who_id)
+    messages = history + [this_turn]
 
     tools = tools_for_role(sender_role, is_group)
     system = build_system_prompt(sender_name, sender_role, is_group)
@@ -1993,9 +2011,32 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
             continue
 
         reply = "".join(b.text for b in response.content if b.type == "text")
-        return reply.strip() or "Sorry, I didn't catch that - can you say it another way?"
+        reply = reply.strip() or "Sorry, I didn't catch that - can you say it another way?"
+        # Remember this exchange for next time (store the raw user text, not the
+        # time-hint wrapper, so history stays readable and doesn't pile up stale clocks).
+        save_history(who_id, user_message if not image_data else "(sent a photo)", reply)
+        return reply
 
     return "Sorry, that took too many steps. Can you rephrase?"
+
+
+# ---- Conversation memory (short, per-chat, in-memory) -----------------------
+# Keyed by chat id. Holds the last few user/assistant text turns so short follow-ups
+# resolve. In-memory only: it resets on redeploy, which is fine — it's for continuity
+# within a conversation, not long-term recall (that's what the memories table is for).
+_HISTORY = {}
+_HISTORY_TURNS = 6          # keep the last 6 exchanges (12 messages) per chat
+
+def get_history(chat_id):
+    return list(_HISTORY.get(str(chat_id), []))
+
+def save_history(chat_id, user_text, assistant_text):
+    key = str(chat_id)
+    hist = _HISTORY.get(key, [])
+    hist.append({"role": "user", "content": user_text})
+    hist.append({"role": "assistant", "content": assistant_text})
+    # Trim to the last N exchanges.
+    _HISTORY[key] = hist[-(_HISTORY_TURNS * 2):]
 
 
 @app.get("/")
