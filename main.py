@@ -789,6 +789,7 @@ def get_ms_access_token(person):
                        "WHERE person = ?", (person,)).fetchone()
     conn.close()
     if not row:
+        print(f"[ms] {person}: no ms_tokens row")
         return None
     try:
         if row["access_token"] and row["expires_at"] and \
@@ -801,9 +802,17 @@ def get_ms_access_token(person):
         "grant_type": "refresh_token", "refresh_token": row["refresh_token"],
         "scope": MS_SCOPES, "redirect_uri": MS_REDIRECT_URI})
     if not tok or "access_token" not in tok:
-        print(f"[ms] refresh failed for {person}; they need to reconnect")
+        print(f"[ms] {person}: refresh failed; needs reconnect")
+        set_setting(f"ms_dead_{person}", "1")
         return None
     save_ms_token(person, tok)
+    set_setting(f"ms_dead_{person}", "")
+    print(f"[ms] {person}: token refreshed OK")
+    return tok["access_token"]
+
+
+def ms_needs_reconnect(person):
+    return get_setting(f"ms_dead_{person}") == "1"
     return tok["access_token"]
 
 
@@ -900,9 +909,10 @@ def _ms_imap_connect(person):
         M = imaplib.IMAP4_SSL(MS_IMAP_HOST, MS_IMAP_PORT, timeout=20)
         M.authenticate("XOAUTH2",
                        lambda _=None: _xoauth2_string(email_addr, token).encode())
+        print(f"[ms] {person}: IMAP connected as {email_addr}")
         return M
     except Exception as e:
-        print(f"[ms] IMAP XOAUTH2 connect failed for {person}: {e}")
+        print(f"[ms] IMAP XOAUTH2 connect failed for {person} ({email_addr}): {e}")
         return None
 
 
