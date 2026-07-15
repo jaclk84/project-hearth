@@ -128,7 +128,7 @@ MS_CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET", "")
 MS_REDIRECT_URI = f"{BASE_URL}/oauth/microsoft/callback"
 MS_AUTHORITY = "https://login.microsoftonline.com/common"
 # offline_access -> refresh token; the IMAP resource scope -> mail access.
-MS_SCOPES = ("offline_access openid "
+MS_SCOPES = ("offline_access openid email profile "
              "https://outlook.office.com/IMAP.AccessAsUser.All")
 MS_IMAP_HOST = "outlook.office365.com"
 MS_IMAP_PORT = 993
@@ -798,8 +798,30 @@ def ms_callback(code: str = "", state: str = "", error: str = "",
             email_addr = claims.get("email") or claims.get("preferred_username")
         except Exception:
             pass
+    # Fallback: ask the OpenID userinfo endpoint directly. Some personal accounts don't
+    # put the address in the id_token, but userinfo returns it.
+    if not email_addr and tok.get("access_token"):
+        try:
+            req = urllib.request.Request(
+                "https://graph.microsoft.com/oidc/userinfo",
+                headers={"Authorization": f"Bearer {tok['access_token']}"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                info = json.loads(r.read())
+            email_addr = info.get("email") or info.get("preferred_username")
+        except Exception as e:
+            print(f"[ms] userinfo lookup failed: {e}")
+    if not email_addr:
+        # Last resort: we truly couldn't determine the address, so email won't work.
+        # Tell the user rather than silently saving a token we can't use.
+        print(f"[ms] WARNING: connected {person} but no email address resolved")
+        save_ms_token(person, tok, None)
+        return HTMLResponse(
+            "<h2>Almost there — but I couldn't read your email address.</h2>"
+            "<p>Your sign-in worked, but Microsoft didn't return your address, so I "
+            "can't check your mail yet. Please try connecting once more from "
+            f"/connect-microsoft?person={person}. If it keeps happening, tell Guppi.</p>")
     save_ms_token(person, tok, email_addr)
-    print(f"[ms] connected {person} ({email_addr or 'address unknown'})")
+    print(f"[ms] connected {person} ({email_addr})")
     return HTMLResponse(f"<h2>Guppi is connected to {person}'s Microsoft email"
                         f"{f' ({email_addr})' if email_addr else ''}.</h2>"
                         "<p>You can close this window.</p>")
@@ -1729,7 +1751,7 @@ When searching email, build broad queries. Senders rarely match a plain name - m
 If someone wants to CONNECT their email, the steps depend on the provider:
 - Outlook / live.com / hotmail: this needs a secure Microsoft sign-in. Tell them a parent
   must open this link in a browser and sign in (replace NAME with their first name):
-  "{BASE}/connect-microsoft?person=NAME". Do NOT ask for a
+  "https://web-production-5fa1fd.up.railway.app/connect-microsoft?person=NAME". Do NOT ask for a
   Microsoft password in chat - personal Microsoft accounts no longer allow that.
 - Gmail: tell them to send it as a command so the password stays protected:
   /connectemail their@gmail.com their-app-password
