@@ -332,8 +332,48 @@ def bind_adult(chat_id, supplied_secret):
     conn.commit()
     conn.close()
     print(f"[setup] bound adult {free['name']} to chat {chat_id}")
-    return (f"You're all set, {free['name']}. I'm Guppi - your family assistant. "
-            f"Ask me what I can do any time.")
+    return welcome_message(free["name"], "adult")
+
+
+def welcome_message(name, role):
+    """A warm, role-appropriate first message so a newly-connected person knows what
+    they can do right away — rather than a bare 'you're all set'. This is onboarding:
+    the first impression, and the thing that makes the feature discoverable."""
+    intro = f"You're all set, {name}! I'm Guppi, the family assistant. "
+    if role == "adult":
+        body = ("Here's what I can do for you:\n"
+                "• Calendar — \"what's on this week?\", \"add Reese's game Saturday 10am\", "
+                "\"move the dentist to 3pm\", \"cancel Friday's meeting\"\n"
+                "• Reminders — \"remind me to call the plumber tomorrow at 9\", including "
+                "recurring ones\n"
+                "• Lists — \"add milk to the grocery list\", \"what lists do I have?\"\n"
+                "• Email — connect your inbox and I'll search it and flag deadlines and "
+                "invoices for you\n"
+                "• Photos — send me a flyer and I'll offer to add it to the calendar\n\n"
+                "I'll also send a short briefing each morning. Say \"help\" anytime, or "
+                "just ask me something.")
+    elif role == "caregiver":
+        body = ("Here's what I can help with:\n"
+                "• Calendar — \"what's on the kids' schedule today?\", \"add gymnastics "
+                "Tuesday at 4\"\n"
+                "• Reminders — \"remind me to pack Lillian's cleats Friday morning\"\n"
+                "• Lists — \"add snacks to the shopping list\"\n"
+                "• Photos — send me a flyer and I'll offer to add it to the calendar\n\n"
+                "Say \"help\" anytime, or just ask.")
+    else:  # child
+        body = ("I can help you with the family calendar and reminders!\n"
+                "• \"What's on the calendar this weekend?\"\n"
+                "• \"Remind me about my science project Thursday\"\n"
+                "• You can ask me questions too.\n\n"
+                "Just say \"help\" if you forget what I can do.")
+    return intro + body
+
+
+def welcome_for(name):
+    conn = db()
+    row = conn.execute("SELECT role FROM people WHERE name = ?", (name,)).fetchone()
+    conn.close()
+    return welcome_message(name, row["role"] if row else "child")
 
 
 def claim_pending(chat_id):
@@ -355,7 +395,7 @@ def claim_pending(chat_id):
     conn.commit()
     conn.close()
     print(f"[setup] bound {name} to chat {chat_id} via pending invite")
-    return f"You're all set, {name}. I'm Guppi - the family assistant. Say hi any time."
+    return welcome_for(name)
 
 
 def link_person(name, requester_role):
@@ -1916,18 +1956,20 @@ def capabilities_for_role(role, is_group=False):
         return ""
 
     common = [
-        "Calendar: \"what's on the calendar this week?\"",
+        "Calendar: \"what's on the calendar this week?\", and I can change things too - "
+        "\"move the dentist to 3pm\", \"cancel Saturday's game\".",
         "Reminders for yourself: \"remind me to call the dentist Thursday at 10am\". "
         "Recurring works: \"every Sunday at 7pm remind me to take out recycling\".",
-        "Shared lists: \"add milk to the grocery list\", \"build me a grocery list for "
-        "taco night\", \"check off the milk\", \"clear the grocery list\". Save a reusable "
-        "one: \"save this as my travel list\", then \"start my travel list\".",
+        "Shared lists: \"add milk to the grocery list\", \"what lists do I have?\", "
+        "\"check off the milk\", \"clear the grocery list\". Save a reusable one: "
+        "\"save this as my travel list\", then \"start my travel list\".",
         "Send me a photo of a flyer or a handwritten list and I'll read it and offer to "
-        "add the event or save the list.",
+        "add the event (with location and details) or save the list.",
         "General questions and quick web lookups.",
     ]
     adult = [
-        "Add or change calendar events: \"add Reese's game Saturday 10am\".",
+        "Add or change calendar events: \"add Reese's game Saturday 10am\", \"move it to "
+        "11\", \"delete it\".",
         "Remind other people: \"remind the girls about permission slips tomorrow 7:30am\".",
         "Invite a family member: \"invite Breanna\" - then they send me /start.",
     ]
@@ -1936,11 +1978,13 @@ def capabilities_for_role(role, is_group=False):
 
     # Private-chat-only capabilities. In the group these would leak to everyone.
     private_only_adult = [
-        "Email: \"any important emails today?\" - I search only YOUR own inbox. To "
-        "connect your inbox, ask me how - Outlook/live.com uses a secure sign-in link, "
-        "Gmail uses an app password.",
+        "Email: \"any important emails today?\", \"find the invoice from Mark\" - I search "
+        "only YOUR own inbox(es), Gmail and/or Outlook/live.com.",
+        "I watch your email and proactively flag deadlines and invoices, offering to set "
+        "reminders or add them to the calendar.",
         "I send you a short briefing each morning and can flag urgent email.",
-        "Memory: \"what do you remember?\" / \"forget that\".",
+        "Check your setup: \"are my accounts connected?\"",
+        "Memory: \"remember that...\", \"what do you remember?\", \"forget that\".",
         "Settings: \"set the daily message cap to 15\", \"turn off proactive\".",
     ]
     private_only_all = ["Memory: \"what do you remember?\" / \"forget that\"."]
@@ -2454,6 +2498,21 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, claimed or (
                 "Hi - I'm Guppi. I only work for one family. If you're a parent, send "
                 "/start followed by your setup code. Otherwise ask a parent to add you."))
+        return {"ok": True}
+
+    # ---- /help: a reliable, model-free help message, tailored to the person -------
+    # The slash-command works anywhere. The bare words "help"/"menu" only count in a
+    # private chat, so a casual "help" in the group doesn't wake Guppi.
+    _t = text.strip().lower()
+    if _t in ("/help", "/menu") or (not is_group and _t in ("help", "menu")):
+        name, role = identify_sender(sender_chat_id)
+        if role == "unknown":
+            send_message(chat_id,
+                "Hi - I'm Guppi, a private family assistant. I don't recognize you yet. "
+                "If you're a parent, send /start followed by your setup code. Otherwise "
+                "ask a parent in the family to add you.")
+        else:
+            send_message(chat_id, welcome_message(name, role))
         return {"ok": True}
 
     # ---- In a group, stay quiet unless spoken to --------------------------------
