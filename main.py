@@ -1035,6 +1035,64 @@ def imap_unread(person, max_results=5):
 # =============================================================================
 #  PROVIDER-AGNOSTIC EMAIL  (Gmail token AND/OR IMAP, per person)
 # =============================================================================
+def tool_connection_health(person):
+    """A plain-language status of THIS person's connections, live-tested. Answers
+    'are my accounts working?' without anyone reading server logs. Actually attempts
+    each connection so it reports reality, not just whether a row exists."""
+    lines = []
+
+    # --- Google (calendar + Gmail share one token) ---
+    conn = db()
+    has_google = conn.execute("SELECT 1 FROM google_tokens WHERE person = ?",
+                              (person,)).fetchone()
+    conn.close()
+    if has_google:
+        creds = load_google_token(person)
+        if creds:
+            lines.append("Google (calendar + Gmail): connected and working.")
+        elif google_needs_reconnect(person):
+            lines.append("Google (calendar + Gmail): EXPIRED - needs reconnecting at "
+                         f"{BASE_URL}/connect?person={person}")
+        else:
+            lines.append("Google (calendar + Gmail): connected but not responding right "
+                         "now.")
+    else:
+        lines.append("Google (calendar + Gmail): not connected. Connect at "
+                     f"{BASE_URL}/connect?person={person}")
+
+    # --- Microsoft / live.com ---
+    conn = db()
+    has_ms = conn.execute("SELECT email_addr FROM ms_tokens WHERE person = ?",
+                          (person,)).fetchone()
+    conn.close()
+    if has_ms:
+        M = _ms_imap_connect(person)
+        if M:
+            try:
+                M.logout()
+            except Exception:
+                pass
+            addr = has_ms["email_addr"] or "your account"
+            lines.append(f"Microsoft ({addr}): connected and working.")
+        elif ms_needs_reconnect(person):
+            lines.append("Microsoft (live.com): EXPIRED - needs reconnecting at "
+                         f"{BASE_URL}/connect-microsoft?person={person}")
+        else:
+            lines.append("Microsoft (live.com): connected but not responding right now.")
+
+    # --- App-password IMAP (Gmail-over-IMAP etc.), if any ---
+    conn = db()
+    imap_row = conn.execute("SELECT email_addr FROM imap_accounts WHERE person = ?",
+                            (person,)).fetchone()
+    conn.close()
+    if imap_row:
+        lines.append(f"IMAP ({imap_row['email_addr']}): configured.")
+
+    if not lines:
+        lines.append("No accounts connected yet.")
+    return "Connection status:\n- " + "\n- ".join(lines)
+
+
 def connected_providers(person):
     """Which email sources this person has. e.g. ['google', 'imap']"""
     if not person:
@@ -1297,6 +1355,20 @@ def tool_add_items_to_list(list_name, items, added_by):
     return f"Added {n} items to the {list_name} list."
 
 
+def tool_show_all_lists():
+    """Show the names of every list that has items, with how many items each holds.
+    Answers 'what lists do I have?' — previously Guppi had no way to do this."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT list_name, COUNT(*) AS n FROM list_items GROUP BY list_name "
+        "ORDER BY list_name").fetchall()
+    conn.close()
+    if not rows:
+        return "There are no lists yet. Add something like 'add milk to the grocery list'."
+    lines = [f"{r['list_name']} ({r['n']} item{'s' if r['n'] != 1 else ''})" for r in rows]
+    return "Your lists:\n- " + "\n- ".join(lines)
+
+
 def tool_show_list(list_name):
     conn = db()
     rows = conn.execute(
@@ -1482,9 +1554,13 @@ def tools_for_role(role, is_group=False):
              "items": {"type": "array", "items": {"type": "string"}}},
              "required": ["list_name", "items"]}},
         {"name": "show_list",
-         "description": "Show a shared list.",
+         "description": "Show the items in ONE shared list by name.",
          "input_schema": {"type": "object", "properties": {
              "list_name": {"type": "string"}}, "required": ["list_name"]}},
+        {"name": "show_all_lists",
+         "description": ("Show the NAMES of all lists that exist, with item counts. Use "
+                         "when asked 'what lists do I have?' or 'what lists exist?'."),
+         "input_schema": {"type": "object", "properties": {}}},
         {"name": "clear_list",
          "description": "Empty an entire list, e.g. after the grocery run.",
          "input_schema": {"type": "object", "properties": {
@@ -1559,6 +1635,13 @@ def tools_for_role(role, is_group=False):
                 "name": {"type": "string"}}, "required": ["name"]}})
         if not is_group:
             tools.append({
+                "name": "connection_health",
+                "description": ("Check whether this person's accounts (Google calendar/"
+                                "Gmail, Microsoft/live.com email) are connected and "
+                                "working right now. Use for 'are my accounts connected?', "
+                                "'check my connections', 'is my email working?'."),
+                "input_schema": {"type": "object", "properties": {}}})
+            tools.append({
                 "name": "list_calendars",
                 "description": "List the Google calendars this account can see, with IDs.",
                 "input_schema": {"type": "object", "properties": {}}})
@@ -1591,7 +1674,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     # HARD GUARD 2: private things never happen in the group chat, where everyone can
     # read the answer. Belt-and-braces on top of not offering the tool at all.
     GROUP_FORBIDDEN = {"search_email", "recall", "remember", "forget",
-                       "show_settings", "update_setting", "list_calendars"}
+                       "show_settings", "update_setting", "list_calendars",
+                       "connection_health"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -1622,6 +1706,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
             return "You don't have calendar access."
         return tool_list_calendars(sender_name)
 
+    if name == "connection_health":
+        return tool_connection_health(sender_name)
     if name == "show_settings":
         return tool_show_settings()
     if name == "update_setting":
@@ -1651,6 +1737,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
                                       sender_name)
     if name == "show_list":
         return tool_show_list(tool_input["list_name"])
+    if name == "show_all_lists":
+        return tool_show_all_lists()
     if name == "clear_list":
         return tool_clear_list(tool_input["list_name"])
     if name == "check_off_item":
