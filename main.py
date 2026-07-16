@@ -621,6 +621,107 @@ def tool_check_calendar(days_ahead=7, person=None):
         for e in events)
 
 
+def _cal_guard(service, person):
+    """Shared not-connected check for calendar write ops. Returns an error string or None."""
+    if service:
+        return None
+    if person and google_needs_reconnect(person):
+        return (f"{person}'s Google access expired and needs reconnecting. A parent "
+                f"should sign in again via the connect link.")
+    return "The Google account isn't connected yet."
+
+
+def tool_find_events(query=None, days_ahead=30, person=None):
+    """Find upcoming events, returning each with its ID so it can be edited or deleted.
+    Optional `query` matches text in the title. This is how Guppi locates the specific
+    event before changing it — it never guesses an ID."""
+    service = get_calendar_service(person)
+    err = _cal_guard(service, person)
+    if err:
+        return err
+    now = now_local()
+    later = now + datetime.timedelta(days=days_ahead)
+    try:
+        result = service.events().list(
+            calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(),
+            timeMax=later.isoformat(), singleEvents=True, orderBy="startTime",
+            maxResults=50, q=query if query else None).execute()
+    except Exception as e:
+        print(f"[cal] find_events failed: {e}")
+        return f"Couldn't search the calendar: {e}"
+    events = result.get("items", [])
+    if not events:
+        return "No matching events found."
+    lines = []
+    for e in events:
+        start = e["start"].get("dateTime", e["start"].get("date"))
+        loc = f" @ {e['location']}" if e.get("location") else ""
+        lines.append(f"id={e['id']} | {start} | {e.get('summary','(no title)')}{loc}")
+    return ("Matching events (use the id to edit or delete):\n" + "\n".join(lines))
+
+
+def tool_edit_calendar_event(event_id, person=None, summary=None, start_iso=None,
+                             end_iso=None, location=None, details=None):
+    """Change fields on an existing event. Only the fields provided are changed; the
+    rest are left as they are. event_id comes from find_events."""
+    service = get_calendar_service(person)
+    err = _cal_guard(service, person)
+    if err:
+        return err
+    tzname = str(TIMEZONE)
+    try:
+        ev = service.events().get(calendarId=FAMILY_CALENDAR_ID,
+                                  eventId=event_id).execute()
+    except Exception as e:
+        print(f"[cal] edit get failed: {e}")
+        return "I couldn't find that event - it may have been deleted. Try finding it again."
+    if summary is not None:
+        ev["summary"] = summary
+    if start_iso is not None:
+        ev["start"] = {"dateTime": start_iso, "timeZone": tzname}
+    if end_iso is not None:
+        ev["end"] = {"dateTime": end_iso, "timeZone": tzname}
+    if location is not None:
+        ev["location"] = location
+    if details is not None:
+        # Preserve the Guppi marker if present, replace the detail portion.
+        stamp = now_local().strftime("%b %d, %Y at %I:%M %p")
+        who = person or "a family member"
+        marker = f"— Edited by Guppi (requested by {who} on {stamp})."
+        ev["description"] = f"{details}\n\n{marker}"
+    try:
+        updated = service.events().update(
+            calendarId=FAMILY_CALENDAR_ID, eventId=event_id, body=ev).execute()
+    except Exception as e:
+        print(f"[cal] edit update failed: {e}")
+        return f"Couldn't update the event: {e}"
+    when = updated["start"].get("dateTime", updated["start"].get("date"))
+    return f"Updated '{updated.get('summary','(no title)')}' — now {when}."
+
+
+def tool_delete_calendar_event(event_id, person=None):
+    """Delete an event by id (from find_events)."""
+    service = get_calendar_service(person)
+    err = _cal_guard(service, person)
+    if err:
+        return err
+    # Fetch the title first so the confirmation is meaningful.
+    title = "the event"
+    try:
+        ev = service.events().get(calendarId=FAMILY_CALENDAR_ID,
+                                  eventId=event_id).execute()
+        title = f"'{ev.get('summary','(no title)')}'"
+    except Exception:
+        pass
+    try:
+        service.events().delete(calendarId=FAMILY_CALENDAR_ID,
+                                eventId=event_id).execute()
+    except Exception as e:
+        print(f"[cal] delete failed: {e}")
+        return "I couldn't delete that - it may already be gone. Try finding it again."
+    return f"Deleted {title} from the calendar."
+
+
 def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
                             location=None, details=None):
     service = get_calendar_service(person)
@@ -1516,6 +1617,35 @@ def tools_for_role(role, is_group=False):
                             "description": ("All other useful info: attendees, what to "
                                             "bring, cost, contacts, instructions, notes.")}},
                 "required": ["summary", "start_iso", "end_iso"]}})
+        tools.append({
+            "name": "find_events",
+            "description": ("Find upcoming events, each returned WITH its id. Use this "
+                            "FIRST whenever the user wants to change or cancel an event, "
+                            "so you know which event to act on. Optional `query` filters "
+                            "by title text (e.g. 'dentist', 'game')."),
+            "input_schema": {"type": "object", "properties": {
+                "query": {"type": "string", "description": "Text to match in event titles."},
+                "days_ahead": {"type": "integer", "description": "How far ahead (default 30)."}}}})
+        tools.append({
+            "name": "edit_calendar_event",
+            "description": ("Change an existing event. Provide event_id (from find_events) "
+                            "and ONLY the fields to change — omit anything staying the same. "
+                            "Use for 'move the dentist to 3pm', 'rename X', 'add a location'."),
+            "input_schema": {"type": "object", "properties": {
+                "event_id": {"type": "string"},
+                "summary": {"type": "string"},
+                "start_iso": {"type": "string"},
+                "end_iso": {"type": "string"},
+                "location": {"type": "string"},
+                "details": {"type": "string"}},
+                "required": ["event_id"]}})
+        tools.append({
+            "name": "delete_calendar_event",
+            "description": ("Delete/cancel an event by event_id (from find_events). "
+                            "Confirm with the user which event before deleting if there's "
+                            "any ambiguity."),
+            "input_schema": {"type": "object", "properties": {
+                "event_id": {"type": "string"}}, "required": ["event_id"]}})
 
     if perms["email"]:
         tools.append({
@@ -1695,6 +1825,25 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return tool_add_calendar_event(
             tool_input["summary"], tool_input["start_iso"], tool_input["end_iso"],
             sender_name, tool_input.get("location"), tool_input.get("details"))
+
+    if name == "find_events":
+        if not perms["calendar_read"]:
+            return "You don't have calendar access."
+        return tool_find_events(tool_input.get("query"),
+                                tool_input.get("days_ahead", 30), sender_name)
+
+    if name == "edit_calendar_event":
+        if not perms["calendar_write"]:
+            return "Only a parent or caregiver can change calendar events."
+        return tool_edit_calendar_event(
+            tool_input["event_id"], sender_name, tool_input.get("summary"),
+            tool_input.get("start_iso"), tool_input.get("end_iso"),
+            tool_input.get("location"), tool_input.get("details"))
+
+    if name == "delete_calendar_event":
+        if not perms["calendar_write"]:
+            return "Only a parent or caregiver can delete calendar events."
+        return tool_delete_calendar_event(tool_input["event_id"], sender_name)
 
     if name == "search_email":
         if not perms["email"]:
@@ -2516,10 +2665,13 @@ def _poll_unread(person):
 
 
 def job_urgent_email_poll():
-    """Every N minutes (6am-10pm): for each connected adult, check every inbox they've
-    connected (Gmail and/or live.com over IMAP) for new unread mail. Only calls Claude if
-    there IS something new. Alerts ONLY that inbox's owner — one adult never sees
-    another's mail."""
+    """Every N minutes (6am-10pm): for each connected adult, scan new unread mail across
+    all their inboxes for two things:
+      1. genuine urgency (school closure, appointment change) -> alert now
+      2. deadlines / due dates / invoices -> proactively offer to set a reminder or add
+         a calendar entry
+    Only calls Claude when there IS new mail. Alerts ONLY that inbox's owner. De-dupes so
+    the same email is never flagged twice."""
     if not proactive_on() or in_quiet_hours():
         return
     for name, chat in _adults_with_chats():
@@ -2544,23 +2696,73 @@ def job_urgent_email_poll():
             continue
         if not claude_call_allowed():
             return
+
+        today = now_local().strftime("%A, %B %d, %Y")
         try:
             resp = claude.messages.create(
-                model=MODEL, max_tokens=200,
-                system=("You are Guppi. Below are new unread emails. Decide if ANY is "
-                        "genuinely urgent or time-sensitive enough to interrupt someone by "
-                        "text right now (e.g. school closure, urgent appointment change, "
-                        "safety issue). Marketing, newsletters, promotions, and routine "
-                        "notifications are NOT urgent. If something truly is, reply with "
-                        "ONE short plain-text alert under 300 chars, no markdown. If "
-                        "nothing is truly urgent, reply with exactly: NONE"),
+                model=MODEL, max_tokens=350,
+                system=(f"You are Guppi, scanning a family member's NEW unread emails. "
+                        f"Today is {today}. Look for two kinds of things:\n"
+                        f"1) URGENT: genuinely time-sensitive items worth an interruption "
+                        f"now (school closure, appointment change, safety, a bill due very "
+                        f"soon).\n"
+                        f"2) DEADLINES/INVOICES: due dates, payment amounts and due dates, "
+                        f"RSVP-by dates, form deadlines, appointment dates.\n"
+                        f"IGNORE marketing, promotions, newsletters, 'limited time offers', "
+                        f"and routine notifications — those are never urgent or deadlines.\n"
+                        f"Reply with STRICT JSON only, no prose:\n"
+                        f'{{"urgent": "<one short sentence, or empty>", '
+                        f'"items": [{{"what": "<short description incl. amount if an '
+                        f'invoice>", "date": "<YYYY-MM-DD or empty if none>", '
+                        f'"from": "<sender>"}}]}}\n'
+                        f"If nothing qualifies, reply {{\"urgent\": \"\", \"items\": []}}."),
                 messages=[{"role": "user", "content": "\n\n".join(summaries)}])
-            verdict = "".join(b.text for b in resp.content if b.type == "text").strip()
+            raw = "".join(b.text for b in resp.content if b.type == "text").strip()
         except Exception as e:
             print(f"[poll] Claude failed for {name}: {e}")
             continue
-        if verdict and verdict.upper() != "NONE":
-            send_message(chat, verdict, proactive=True)
+
+        # Parse the JSON verdict defensively.
+        try:
+            cleaned = raw.replace("```json", "").replace("```", "").strip()
+            verdict = json.loads(cleaned)
+        except Exception:
+            print(f"[poll] couldn't parse verdict for {name}: {raw[:120]}")
+            continue
+
+        # 1) Urgent -> alert immediately.
+        urgent = (verdict.get("urgent") or "").strip()
+        if urgent and urgent.upper() != "NONE":
+            send_message(chat, urgent, proactive=True)
+
+        # 2) Deadlines / invoices -> offer to act, de-duped so we never repeat one.
+        seen_key = f"flagged_deadlines_{name}"
+        already = set((get_setting(seen_key) or "").split("|")) if get_setting(seen_key) else set()
+        new_lines = []
+        new_sigs = []
+        for it in verdict.get("items", []):
+            what = (it.get("what") or "").strip()
+            if not what:
+                continue
+            date = (it.get("date") or "").strip()
+            frm = (it.get("from") or "").strip()
+            sig = f"{what[:40]}|{date}"          # dedupe signature
+            if sig in already:
+                continue
+            new_sigs.append(sig)
+            when = f" (due {date})" if date else ""
+            src = f" — from {frm}" if frm else ""
+            new_lines.append(f"• {what}{when}{src}")
+
+        if new_lines:
+            body = ("I spotted possible deadlines in your new email:\n"
+                    + "\n".join(new_lines)
+                    + "\n\nWant me to set reminders or add any to the calendar? "
+                      "Just tell me which.")
+            send_message(chat, body, proactive=True)
+            # Remember what we've flagged (cap the stored history so it can't grow forever).
+            merged = list(already | set(new_sigs))
+            set_setting(seen_key, "|".join(merged[-100:]))
 
 
 # =============================================================================
