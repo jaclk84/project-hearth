@@ -270,6 +270,17 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS list_templates (
         name TEXT PRIMARY KEY,
         items_json TEXT NOT NULL)""")
+    # Shared household commitments — who agreed to do what, by when. This is family
+    # logistics (not personal memory), so it's usable in the GROUP chat. Closes the loop:
+    # "I'll grab Charlotte" -> recorded, and "who's got what?" -> answered.
+    conn.execute("""CREATE TABLE IF NOT EXISTS commitments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task TEXT NOT NULL,
+        who TEXT,
+        when_text TEXT,
+        created_by TEXT,
+        done INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL)""")
     conn.commit()
     for name, role in SEEDED_PEOPLE:
         conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
@@ -1603,6 +1614,56 @@ def tool_delete_reminder(reminder_id, requester_chat, requester_role):
 
 
 # ---- Shared lists -----------------------------------------------------------
+def tool_add_commitment(task, who=None, when_text=None, created_by=None):
+    """Record who agreed to do a household task ('Jason is picking up Charlotte at 3').
+    Shared logistics, so it works in the group. Keeps the loop closed on verbal plans."""
+    conn = db()
+    conn.execute("INSERT INTO commitments (task, who, when_text, created_by, created_at) "
+                 "VALUES (?,?,?,?,?)",
+                 (task, who, when_text, created_by, now_local().isoformat()))
+    conn.commit()
+    conn.close()
+    whopart = f"{who} " if who else ""
+    whenpart = f" ({when_text})" if when_text else ""
+    return f"Noted: {whopart}on '{task}'{whenpart}."
+
+
+def tool_list_commitments(include_done=False):
+    """Show open household commitments — who's doing what. Answers 'what's on our plate?'
+    and 'who's got what today?'."""
+    conn = db()
+    if include_done:
+        rows = conn.execute("SELECT id, task, who, when_text, done FROM commitments "
+                            "ORDER BY id").fetchall()
+    else:
+        rows = conn.execute("SELECT id, task, who, when_text, done FROM commitments "
+                            "WHERE done = 0 ORDER BY id").fetchall()
+    conn.close()
+    if not rows:
+        return "Nothing on the shared list right now."
+    out = []
+    for r in rows:
+        who = r["who"] or "someone"
+        when = f" — {r['when_text']}" if r["when_text"] else ""
+        mark = " ✓" if r["done"] else ""
+        out.append(f"[{r['id']}] {who}: {r['task']}{when}{mark}")
+    return "\n".join(out)
+
+
+def tool_complete_commitment(commitment_id):
+    """Mark a household commitment done ('Charlotte's picked up')."""
+    conn = db()
+    row = conn.execute("SELECT task, who FROM commitments WHERE id = ?",
+                       (commitment_id,)).fetchone()
+    if not row:
+        conn.close()
+        return "I couldn't find that one - try listing what's on the plate again."
+    conn.execute("UPDATE commitments SET done = 1 WHERE id = ?", (commitment_id,))
+    conn.commit()
+    conn.close()
+    return f"Marked done: {row['task']}."
+
+
 def tool_add_to_list(list_name, item, added_by):
     conn = db()
     conn.execute("INSERT INTO list_items (list_name, item, added_by, created_at) VALUES (?,?,?,?)",
@@ -1914,6 +1975,26 @@ def tools_for_role(role, is_group=False):
         {"name": "list_templates",
          "description": "Show the names of saved list templates.",
          "input_schema": {"type": "object", "properties": {}}},
+        {"name": "add_commitment",
+         "description": ("Record who agreed to do a household task, so it's not forgotten. "
+                         "Use when someone commits in conversation ('I'll pick up "
+                         "Charlotte at 3', 'I've got the dentist run'). who = the person "
+                         "responsible; when_text = a plain-language time like 'today at 3' "
+                         "if given. This is shared family logistics and works in the group."),
+         "input_schema": {"type": "object", "properties": {
+             "task": {"type": "string"},
+             "who": {"type": "string", "description": "Who is responsible."},
+             "when_text": {"type": "string", "description": "When, in plain words."}},
+             "required": ["task"]}},
+        {"name": "list_commitments",
+         "description": ("Show open household commitments (who's doing what). Use for "
+                         "'what's on our plate?', 'who's got what?', 'what did we agree "
+                         "on?'."),
+         "input_schema": {"type": "object", "properties": {}}},
+        {"name": "complete_commitment",
+         "description": "Mark a household commitment done, by its id (from list_commitments).",
+         "input_schema": {"type": "object", "properties": {
+             "commitment_id": {"type": "integer"}}, "required": ["commitment_id"]}},
         {"type": "web_search_20250305", "name": "web_search"},
     ]
 
@@ -2117,6 +2198,14 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "list_templates":
         return tool_list_templates()
 
+    if name == "add_commitment":
+        return tool_add_commitment(tool_input["task"], tool_input.get("who"),
+                                   tool_input.get("when_text"), sender_name)
+    if name == "list_commitments":
+        return tool_list_commitments()
+    if name == "complete_commitment":
+        return tool_complete_commitment(tool_input["commitment_id"])
+
     if name == "invite_person":
         return link_person(tool_input["name"], sender_role)
 
@@ -2205,7 +2294,19 @@ for something private here, briefly say you'll help them privately and suggest t
 message you directly. Do not explain what the private thing was.
 
 Keep group replies especially short and useful. Don't chime in with commentary - answer
-what was asked and stop."""
+what was asked and stop.
+
+ATTRIBUTION: in the group, be clear about WHO. The person you're talking to right now is
+named above - a reminder they ask for is THEIRS, so confirm it by name ("I'll remind Jason
+at 3"). When one person offers to do a task ("I'll grab Charlotte") and another asks you to
+remember it, set the reminder for the person who committed and name them. Never assume a
+"remind me" belongs to anyone but the person who said it.
+
+CLOSING THE LOOP: when you set a reminder or add an event from a group conversation,
+confirm it plainly so both people see it's handled and who owns it. If a task was raised
+but nobody has clearly taken it, you may offer once to set a reminder - but do not nag or
+repeat yourself, and never take sides or comment on who should do it. You are neutral
+logistics support, never a participant in a disagreement."""
     else:
         place = """You are in a private one-to-one chat with this person. What you say here
 is seen only by them."""
@@ -2543,11 +2644,14 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                  f"'in an hour', 'tonight', or 'tomorrow morning'.)")
     if group_offer:
         time_hint += ("\n\n(You were NOT directly addressed — you overheard this in the "
-                      "family group chat and it sounds like a schedulable event or task. "
-                      "Respond with ONE short, friendly line offering to help: ask if "
-                      "they'd like you to add it to the calendar and/or set a reminder. "
-                      "Do NOT add anything yet — just offer. If it turns out not to be a "
-                      "real task, stay brief or say nothing useful. Keep it to one line.)")
+                      "family group chat. It's either a schedulable event/task or someone "
+                      "committing to handle something. Respond with ONE short, friendly "
+                      "line: if it's an event, offer to add it to the calendar and/or set "
+                      "a reminder; if someone committed to a task ('I'll grab Charlotte'), "
+                      "offer to note who's got it (and set a reminder if there's a time). "
+                      "Do NOT record or add anything yet — just offer. Name the person "
+                      "when relevant. If it turns out not to be a real task, say nothing "
+                      "useful. Keep it to one line.)")
     text_part = f"{time_hint}\n\n{user_message}"
     if image_data:
         this_turn = {"role": "user", "content": [
@@ -2630,7 +2734,9 @@ def _looks_schedulish(text):
                   "evening", "noon", "am", "pm", "o'clock", "oclock", "next week",
                   "this week", "weekend", "pick up", "pickup", "drop off", "dropoff",
                   "appointment", "practice", "game", "meeting", "remind", "at 1", "at 2",
-                  "at 3", "at 4", "at 5", "at 6", "at 7", "at 8", "at 9", ":00", ":30")
+                  "at 3", "at 4", "at 5", "at 6", "at 7", "at 8", "at 9", ":00", ":30",
+                  "i'll", "i will", "i've got", "i got", "i can get", "i can do",
+                  "i'll take", "on it", "i'll handle", "my turn", "you take", "can you")
     return any(w in t for w in time_words)
 
 
@@ -2645,12 +2751,13 @@ def _group_scheduling_intent(text):
     try:
         resp = claude.messages.create(
             model=MODEL, max_tokens=5,
-            system=("Decide if this ONE message from a family group chat describes a "
-                    "specific event, appointment, or task with a time that someone might "
-                    "want on a calendar or as a reminder (e.g. 'pick up Charlotte at 3 "
-                    "tomorrow', 'dentist Tuesday at 2', 'soccer moved to 5'). Answer ONLY "
-                    "'YES' or 'NO'. Answer NO for general chat, questions, opinions, "
-                    "reactions, or anything without a concrete time/event."),
+            system=("Decide if this ONE message from a family group chat is either (a) a "
+                    "specific event/appointment/task with a time someone might want on a "
+                    "calendar or as a reminder ('pick up Charlotte at 3 tomorrow', "
+                    "'dentist Tuesday at 2'), OR (b) someone committing to handle a task "
+                    "('I'll grab Charlotte', 'I've got dinner', 'I can do pickup'). Answer "
+                    "ONLY 'YES' or 'NO'. Answer NO for general chat, questions, opinions, "
+                    "reactions, or anything without a concrete task/event/commitment."),
             messages=[{"role": "user", "content": text}])
         verdict = "".join(b.text for b in resp.content if b.type == "text").strip().upper()
         return verdict.startswith("YES")
