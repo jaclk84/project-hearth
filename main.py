@@ -453,9 +453,6 @@ def load_google_token(person):
     except Exception as e:
         print(f"[gtoken] {person}: could not build creds: {e}")
         return None
-    print(f"[gtoken] {person}: valid={creds.valid} expired={creds.expired} "
-          f"has_refresh={bool(creds.refresh_token)} "
-          f"scopes_match={set(creds.scopes or []) == set(SCOPES)}")
     if creds and not creds.valid and creds.refresh_token:
         # Refresh whenever the creds aren't currently valid (covers 'expired' AND other
         # not-valid states), not only when flagged expired.
@@ -463,7 +460,6 @@ def load_google_token(person):
             creds.refresh(GoogleRequest())
             save_google_token(person, creds)
             set_setting(f"google_dead_{person}", "")   # healthy again
-            print(f"[gtoken] {person}: refreshed OK")
         except Exception as e:
             print(f"Token refresh failed for {person}: {e}")
             if "invalid_grant" in str(e):
@@ -535,7 +531,6 @@ def get_calendar_service(person=None):
     creds = load_google_token(person) if person else None
     if not creds:
         fallback = any_connected_adult()
-        print(f"[cal] {person} had no creds; fallback adult = {fallback}")
         creds = load_google_token(fallback) if fallback else None
     if not creds:
         print(f"[cal] no usable Google credentials at all")
@@ -948,7 +943,6 @@ def get_ms_access_token(person):
         return None
     save_ms_token(person, tok)
     set_setting(f"ms_dead_{person}", "")
-    print(f"[ms] {person}: token refreshed OK")
     return tok["access_token"]
 
 
@@ -1050,7 +1044,6 @@ def _ms_imap_connect(person):
         M = imaplib.IMAP4_SSL(MS_IMAP_HOST, MS_IMAP_PORT, timeout=20)
         M.authenticate("XOAUTH2",
                        lambda _=None: _xoauth2_string(email_addr, token).encode())
-        print(f"[ms] {person}: IMAP connected as {email_addr}")
         return M
     except Exception as e:
         print(f"[ms] IMAP XOAUTH2 connect failed for {person} ({email_addr}): {e}")
@@ -1452,11 +1445,19 @@ def tool_nudge(target, text, due_iso, created_by, sender_role, repeat="none"):
     return f"Reminder set for {who}: '{text}' at {due_iso}{tail}."
 
 
-def tool_list_reminders():
+def tool_list_reminders(for_chat=None):
+    """List upcoming reminders. If for_chat is given, only that person's (plus family-wide
+    ones with no specific owner); otherwise all. IDs are shown so they can be deleted."""
     conn = db()
-    rows = conn.execute(
-        "SELECT id, text, due_at, repeat FROM reminders WHERE fired = 0 ORDER BY due_at"
-    ).fetchall()
+    if for_chat:
+        rows = conn.execute(
+            "SELECT id, text, due_at, repeat, for_chat FROM reminders "
+            "WHERE fired = 0 AND (for_chat = ? OR for_chat IS NULL) ORDER BY due_at",
+            (str(for_chat),)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, text, due_at, repeat, for_chat FROM reminders "
+            "WHERE fired = 0 ORDER BY due_at").fetchall()
     conn.close()
     if not rows:
         return "No upcoming reminders."
@@ -1465,6 +1466,26 @@ def tool_list_reminders():
         rep = "" if (r["repeat"] or "none") == "none" else f" (repeats {r['repeat'].replace(':',' ')})"
         out.append(f"[{r['id']}] {r['due_at']}: {r['text']}{rep}")
     return "\n".join(out)
+
+
+def tool_delete_reminder(reminder_id, requester_chat, requester_role):
+    """Delete a reminder by id (ids come from list_reminders). A person can delete their
+    own reminders (or family-wide ones); a parent can delete any."""
+    conn = db()
+    row = conn.execute("SELECT text, for_chat FROM reminders WHERE id = ?",
+                       (reminder_id,)).fetchone()
+    if not row:
+        conn.close()
+        return "I couldn't find that reminder - it may already be gone. Try listing them again."
+    # Permission: parents can delete anything; others only their own or family-wide.
+    owns = (row["for_chat"] is None) or (str(row["for_chat"]) == str(requester_chat))
+    if requester_role != "adult" and not owns:
+        conn.close()
+        return "That reminder belongs to someone else, so I can't remove it for you."
+    conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+    conn.commit()
+    conn.close()
+    return f"Deleted the reminder: {row['text']}."
 
 
 # ---- Shared lists -----------------------------------------------------------
@@ -1707,8 +1728,14 @@ def tools_for_role(role, is_group=False):
                         "description": "none|daily|weekly|monthly|weekly:<day>"}},
              "required": ["text", "due_iso"]}},
         {"name": "list_reminders",
-         "description": "Show upcoming reminders.",
+         "description": "Show upcoming reminders, each with an [id] you can use to delete it.",
          "input_schema": {"type": "object", "properties": {}}},
+        {"name": "delete_reminder",
+         "description": ("Delete/cancel a reminder by its id (ids come from "
+                         "list_reminders). If the user names a reminder to remove, call "
+                         "list_reminders first to get its id, then delete it."),
+         "input_schema": {"type": "object", "properties": {
+             "reminder_id": {"type": "integer"}}, "required": ["reminder_id"]}},
         {"name": "add_to_list",
          "description": "Add an item to a shared list, e.g. 'grocery' or 'todo'.",
          "input_schema": {"type": "object", "properties": {
@@ -1805,6 +1832,17 @@ def tools_for_role(role, is_group=False):
                 "name": {"type": "string"}}, "required": ["name"]}})
         if not is_group:
             tools.append({
+                "name": "manage_deadline_ignores",
+                "description": ("Control which email senders Guppi ignores when flagging "
+                                "deadlines/invoices. Use when a parent says things like "
+                                "'ignore deadline emails from Todoist', 'stop flagging "
+                                "Amazon', or 'what senders are you ignoring?'. action is "
+                                "'add', 'remove', or 'list'; sender is a name or address "
+                                "fragment like 'todoist'."),
+                "input_schema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["add", "remove", "list"]},
+                    "sender": {"type": "string"}}, "required": ["action"]}})
+            tools.append({
                 "name": "connection_health",
                 "description": ("Check whether this person's accounts (Google calendar/"
                                 "Gmail, Microsoft/live.com email) are connected and "
@@ -1845,7 +1883,7 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     # read the answer. Belt-and-braces on top of not offering the tool at all.
     GROUP_FORBIDDEN = {"search_email", "recall", "remember", "forget",
                        "show_settings", "update_setting", "list_calendars",
-                       "connection_health"}
+                       "connection_health", "manage_deadline_ignores"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -1897,6 +1935,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
 
     if name == "connection_health":
         return tool_connection_health(sender_name)
+    if name == "manage_deadline_ignores":
+        return tool_manage_deadline_ignores(tool_input["action"], tool_input.get("sender"))
     if name == "show_settings":
         return tool_show_settings()
     if name == "update_setting":
@@ -1914,7 +1954,9 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
                                  sender_chat, sender_name,
                                  tool_input.get("repeat", "none"))
     if name == "list_reminders":
-        return tool_list_reminders()
+        return tool_list_reminders(sender_chat)
+    if name == "delete_reminder":
+        return tool_delete_reminder(tool_input["reminder_id"], sender_chat, sender_role)
     if name == "nudge":
         return tool_nudge(tool_input["target"], tool_input["text"], tool_input["due_iso"],
                           sender_name, sender_role, tool_input.get("repeat", "none"))
@@ -2549,6 +2591,41 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
+def _ignored_senders():
+    """The list of email sender substrings the family has asked Guppi to ignore for
+    deadline/invoice flagging (e.g. 'todoist'). Stored family-wide, lowercased."""
+    raw = get_setting("deadline_ignore_senders") or ""
+    return [s for s in raw.split("|") if s]
+
+
+def tool_manage_deadline_ignores(action, sender=None):
+    """Let the family control which senders are ignored for deadline alerts.
+    action: 'add' | 'remove' | 'list'. sender: a name or address fragment, e.g. 'todoist'."""
+    current = _ignored_senders()
+    action = (action or "list").lower()
+    if action == "list":
+        if not current:
+            return "I'm not ignoring any senders for deadline alerts right now."
+        return "I'm ignoring deadline alerts from: " + ", ".join(current)
+    if not sender:
+        return "Tell me which sender - for example, 'ignore deadline emails from Todoist'."
+    key = sender.strip().lower()
+    if action == "add":
+        if key in current:
+            return f"I was already ignoring {key} for deadline alerts."
+        current.append(key)
+        set_setting("deadline_ignore_senders", "|".join(current[:50]))
+        return (f"Done - I'll no longer flag deadlines from emails matching \"{key}\". "
+                f"You can undo this by saying 'stop ignoring {key}'.")
+    if action == "remove":
+        if key not in current:
+            return f"I wasn't ignoring {key}."
+        current = [s for s in current if s != key]
+        set_setting("deadline_ignore_senders", "|".join(current))
+        return f"Okay - I'll flag deadlines from {key} again."
+    return "I can add, remove, or list ignored senders."
+
+
 def _adults_with_chats():
     conn = db()
     rows = conn.execute(
@@ -2745,10 +2822,14 @@ def job_urgent_email_poll():
             continue  # nothing new -> no Claude call, no cost
         set_setting(f"last_email_id_{name}", newest)
 
+        ignore = _ignored_senders()
         summaries = []
         for m in msgs:
             if m["id"] == last_id:
                 break
+            frm = (m.get("from") or "").lower()
+            if any(bad in frm for bad in ignore):
+                continue  # family asked to ignore this sender for deadline alerts
             snip = f" - {m['snippet']}" if m.get("snippet") else ""
             summaries.append(f"From {m['from']}: {m['subject']}{snip}")
         if not summaries:
