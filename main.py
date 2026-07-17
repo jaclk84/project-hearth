@@ -1278,10 +1278,10 @@ def tool_search_email(query, person, max_results=5):
     'you have no emails', is worse than useless. Enforced in CODE, not the prompt."""
     providers = connected_providers(person)
     if not providers:
-        return (f"{person} hasn't connected an email account yet. For Outlook/live.com, "
-                f"a parent opens {BASE_URL}/connect-microsoft?person={person} and signs "
-                f"in. For Gmail, say: connect my email. "
-                f"To connect Gmail, visit /connect?person={person}.")
+        return (f"{person} hasn't connected an email account yet. For Gmail, open "
+                f"{BASE_URL}/connect?person={person} in a browser and sign in (this also "
+                f"connects the calendar). For Outlook/live.com, open "
+                f"{BASE_URL}/connect-microsoft?person={person} and sign in.")
 
     # Build queries suited to each provider. Gmail understands its own operators
     # (is:important, from:, after:); IMAP does not — to IMAP those are just literal
@@ -1732,8 +1732,11 @@ def tools_for_role(role, is_group=False):
          "input_schema": {"type": "object", "properties": {}}},
         {"name": "delete_reminder",
          "description": ("Delete/cancel a reminder by its id (ids come from "
-                         "list_reminders). If the user names a reminder to remove, call "
-                         "list_reminders first to get its id, then delete it."),
+                         "list_reminders). To remove a reminder the user named, you MUST "
+                         "call list_reminders to get its id, then ACTUALLY call this tool "
+                         "with that id in the SAME turn. Never tell the user a reminder is "
+                         "deleted unless this tool has returned a success message - listing "
+                         "it is not deleting it."),
          "input_schema": {"type": "object", "properties": {
              "reminder_id": {"type": "integer"}}, "required": ["reminder_id"]}},
         {"name": "add_to_list",
@@ -2158,19 +2161,38 @@ memory or assumption. You do not know what is there unless you call the tool and
 result. Always call the tool first. Never say "you have no emails" or "nothing is
 scheduled" unless a tool actually returned that.
 
+CRITICAL: never tell someone an action is done unless the tool that performs it actually
+ran and returned success. Deleting, editing, adding, or moving something requires CALLING
+that specific tool - looking something up with a list/find tool is NOT the same as
+changing it. If you looked up an item to get its id, you must still call the delete/edit
+tool in the same turn before saying "done". If a tool failed or you didn't call it, say
+so honestly rather than claiming success.
+
 When searching email, build broad queries. Senders rarely match a plain name - mail
 "from Google" comes from addresses like no-reply@accounts.google.com.
 
-If someone wants to CONNECT their email, the steps depend on the provider:
-- Outlook / live.com / hotmail: this needs a secure Microsoft sign-in. Tell them a parent
-  must open this link in a browser and sign in (replace NAME with their first name):
-  "https://web-production-5fa1fd.up.railway.app/connect-microsoft?person=NAME". Do NOT ask for a
-  Microsoft password in chat - personal Microsoft accounts no longer allow that.
-- Gmail: tell them to send it as a command so the password stays protected:
-  /connectemail their@gmail.com their-app-password
-  and to use an APP PASSWORD (from their Google account security page), not their normal
-  password. Never ask anyone to type a normal password into a chat message, and never
-  repeat a password back.
+If someone wants to CONNECT their calendar or email, the steps depend on the provider.
+The EASY path is a secure sign-in link they open in a browser - prefer it, and never send
+someone hunting for app passwords when a link will do.
+
+- Google (Calendar AND Gmail together - ONE sign-in covers both, because they share the
+  same Google account): tell them to open this link in a browser and sign in (replace NAME
+  with their first name):
+  "https://web-production-5fa1fd.up.railway.app/connect?person=NAME"
+  They may see a "Google hasn't verified this app" screen - that's expected for a private
+  family app; they click Advanced, then "Go to Guppi..." then Allow. This single link
+  connects BOTH their calendar and their Gmail. Do NOT tell a Google/Gmail user to create
+  an app password - that is not needed and sends them in circles.
+
+- Outlook / live.com / hotmail: a secure Microsoft sign-in. Tell them to open this link in
+  a browser and sign in (replace NAME with their first name):
+  "https://web-production-5fa1fd.up.railway.app/connect-microsoft?person=NAME". Do NOT ask
+  for a Microsoft password in chat - personal Microsoft accounts no longer allow that.
+
+- App passwords are a LAST RESORT, only for a non-Google, non-Microsoft IMAP provider (or
+  if someone truly can't use the Google link). Only then: /connectemail their@email.com
+  their-app-password, using an APP PASSWORD, never their normal password. Never ask anyone
+  to type a normal password into chat, and never repeat a password back.
 
 You are given the CURRENT DATE AND TIME with each message. Use it to resolve every
 relative time yourself, precisely: "in 2 minutes", "in an hour", "tonight", "tomorrow",
