@@ -1088,6 +1088,32 @@ def _imap_snippet(msg, limit=120):
         return ""
 
 
+def _imap_full_body(msg, limit=4000):
+    """Full-ish plain-text body of an IMAP message (for reading scheduling details).
+    Prefers text/plain; falls back to a crude HTML strip. Capped so it stays sane."""
+    try:
+        if msg.is_multipart():
+            plain = ""
+            html = ""
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+                text = payload.decode(errors="replace")
+                if ctype == "text/plain":
+                    plain += text
+                elif ctype == "text/html" and not plain:
+                    html += text
+            body = plain or re.sub(r"<[^>]+>", " ", html)
+        else:
+            payload = msg.get_payload(decode=True)
+            body = payload.decode(errors="replace") if payload else ""
+        return body.strip()[:limit]
+    except Exception:
+        return ""
+
+
 def imap_search(person, keywords, max_results=5):
     """Search a person's IMAP inbox. `keywords` is plain words (Gmail-style operators are
     stripped upstream). Returns normalized dicts, newest first."""
@@ -1122,6 +1148,7 @@ def imap_search(person, keywords, max_results=5):
                 "from": _decode(hmsg.get("From", "?")),
                 "subject": _decode(hmsg.get("Subject", "(no subject)")),
                 "snippet": _imap_snippet(body_msg) if body_msg else "",
+                "full_body": _imap_full_body(body_msg) if body_msg else "",
                 "id": mid.decode(), "provider": "imap"})
     except Exception as e:
         print(f"[imap] search failed for {person}: {e}")
@@ -1243,6 +1270,93 @@ def connected_providers(person):
         out.append("imap")   # both are served by _imap_connect() (app-pw or MS-OAuth)
     conn.close()
     return out
+
+
+def _gmail_full_body(service, msg_id):
+    """Return the full plain-text body of a Gmail message (walks MIME parts)."""
+    try:
+        msg = service.users().messages().get(
+            userId="me", id=msg_id, format="full").execute()
+    except Exception as e:
+        print(f"[email:google] full fetch failed: {e}")
+        return ""
+
+    def walk(part):
+        # Prefer text/plain; fall back to stripping text/html.
+        mime = part.get("mimeType", "")
+        body = part.get("body", {})
+        data = body.get("data")
+        if data and mime == "text/plain":
+            return base64.urlsafe_b64decode(data).decode(errors="replace")
+        if data and mime == "text/html":
+            html = base64.urlsafe_b64decode(data).decode(errors="replace")
+            return re.sub(r"<[^>]+>", " ", html)  # crude tag strip
+        text = ""
+        for p in part.get("parts", []) or []:
+            text += walk(p)
+        return text
+
+    return walk(msg.get("payload", {})).strip()
+
+
+def tool_read_email(query, person, max_results=3):
+    """Find the email(s) matching `query` and return their FULL text (not a snippet), so
+    Guppi can read the whole thing and pull out scheduling details — who/what/when/where.
+    Use this (not search_email) when the user is asking about a specific email's contents,
+    or wants an event or reminder created from an email."""
+    providers = connected_providers(person)
+    if not providers:
+        return (f"{person} hasn't connected an email account yet. For Gmail, open "
+                f"{BASE_URL}/connect?person={person}; for Outlook/live.com, "
+                f"{BASE_URL}/connect-microsoft?person={person}.")
+
+    # Clean query for IMAP (drop Gmail operators); keep raw for Gmail.
+    imap_q = re.sub(r"\b(is|in|category|label|has|filename):\S+", "", query)
+    imap_q = re.sub(r"\b(newer_than|older_than|after|before):\S+", "", imap_q)
+    imap_q = re.sub(r"\bfrom:(\S+)", r"\1", imap_q)
+    imap_q = re.sub(r"\s+", " ", imap_q).strip()
+
+    results = []
+
+    if "google" in providers:
+        service = get_gmail_service(person)
+        if service:
+            try:
+                res = service.users().messages().list(
+                    userId="me", q=query, maxResults=max_results).execute()
+                for m in res.get("messages", []):
+                    md = service.users().messages().get(
+                        userId="me", id=m["id"], format="metadata",
+                        metadataHeaders=["From", "Subject", "Date"]).execute()
+                    h = {x["name"]: x["value"] for x in md["payload"]["headers"]}
+                    body = _gmail_full_body(service, m["id"])
+                    results.append({"from": h.get("From", "?"),
+                                    "subject": h.get("Subject", "(no subject)"),
+                                    "date": h.get("Date", ""), "body": body})
+            except Exception as e:
+                print(f"[read_email:google] failed: {e}")
+
+    if "imap" in providers:
+        for m in imap_search(person, imap_q, max_results):
+            # imap_search already fetched the body; but it was snippet-truncated. Re-fetch
+            # the full body for these specific ids for completeness.
+            results.append({"from": m["from"], "subject": m["subject"],
+                            "date": "", "body": m.get("full_body") or m.get("snippet", "")})
+
+    if not results:
+        return "I couldn't find an email matching that."
+
+    # Cap total body length so we don't blow up the context; a scheduling email is short.
+    out = []
+    for r in results[:max_results]:
+        body = (r["body"] or "").strip()
+        if len(body) > 2000:
+            body = body[:2000] + " …(truncated)"
+        hdr = f"From: {r['from']}\nSubject: {r['subject']}"
+        if r.get("date"):
+            hdr += f"\nDate: {r['date']}"
+        out.append(f"{hdr}\n\n{body}")
+    return "\n\n----- next email -----\n\n".join(out)
 
 
 def _gmail_search(person, query, max_results):
@@ -1714,6 +1828,16 @@ def tools_for_role(role, is_group=False):
             "description": "Search this person's own Gmail. Uses Gmail search syntax.",
             "input_schema": {"type": "object", "properties": {
                 "query": {"type": "string"}}, "required": ["query"]}})
+        tools.append({
+            "name": "read_email",
+            "description": ("Read the FULL text of a specific email (not just a snippet). "
+                            "Use this - not search_email - whenever someone asks what an "
+                            "email says, or wants an event or reminder created from an "
+                            "email. It returns the whole message so you can pull out the "
+                            "who / what / when / where. `query` finds the email (e.g. "
+                            "'from:school field trip', 'Azie appointment')."),
+            "input_schema": {"type": "object", "properties": {
+                "query": {"type": "string"}}, "required": ["query"]}})
 
     # ---- Always available (shared, family-safe) ----
     tools += [
@@ -1884,7 +2008,7 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
 
     # HARD GUARD 2: private things never happen in the group chat, where everyone can
     # read the answer. Belt-and-braces on top of not offering the tool at all.
-    GROUP_FORBIDDEN = {"search_email", "recall", "remember", "forget",
+    GROUP_FORBIDDEN = {"search_email", "read_email", "recall", "remember", "forget",
                        "show_settings", "update_setting", "list_calendars",
                        "connection_health", "manage_deadline_ignores"}
     if is_group and name in GROUP_FORBIDDEN:
@@ -1930,6 +2054,11 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         if not perms["email"]:
             return "You don't have email access."
         return tool_search_email(tool_input["query"], sender_name)
+
+    if name == "read_email":
+        if not perms["email"]:
+            return "You don't have email access."
+        return tool_read_email(tool_input["query"], sender_name)
 
     if name == "list_calendars":
         if not perms["calendar_read"]:
@@ -2170,6 +2299,16 @@ so honestly rather than claiming success.
 
 When searching email, build broad queries. Senders rarely match a plain name - mail
 "from Google" comes from addresses like no-reply@accounts.google.com.
+
+When someone asks about a specific email, or asks you to schedule something from an email,
+use read_email (not search_email) so you see the FULL message. Read it for the scheduling
+context - who it involves, what the event is, when it happens (date and time), and where
+(address/location) - plus anything useful like what to bring or a cost. Then PROACTIVELY
+offer to act: propose adding a calendar event (with the location and details filled in)
+and/or setting a reminder, and ask which they'd like. For example: "This is a dentist
+appointment for Charlotte on Aug 3 at 2pm at 12 Main St. Want me to add it to the calendar
+and remind you that morning?" If the date or time is ambiguous or missing, say what you
+found and ask before creating anything. Never invent a time the email doesn't give.
 
 If someone wants to CONNECT their calendar or email, the steps depend on the provider.
 The EASY path is a secure sign-in link they open in a browser - prefer it, and never send
