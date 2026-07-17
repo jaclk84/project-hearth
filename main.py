@@ -56,6 +56,7 @@
 
 import os
 import re
+import time
 import json
 import sqlite3
 import datetime
@@ -2766,10 +2767,42 @@ def _group_scheduling_intent(text):
         return False
 
 
+# When Guppi speaks in a group, it opens a short window during which the next message
+# from THAT person is treated as a reply to Guppi — so "Yes for 4:40" after an offer is
+# heard, not dropped. Keyed by (group_chat_id, person_id) -> timestamp.
+_GROUP_REPLY_WINDOW = {}
+_GROUP_REPLY_SECONDS = 150   # ~2.5 minutes to answer Guppi's offer/question
+
+def _open_reply_window(group_chat_id, person_id):
+    if group_chat_id and person_id:
+        _GROUP_REPLY_WINDOW[(str(group_chat_id), str(person_id))] = time.time()
+
+def _in_reply_window(group_chat_id, person_id):
+    ts = _GROUP_REPLY_WINDOW.get((str(group_chat_id), str(person_id)))
+    return bool(ts) and (time.time() - ts) < _GROUP_REPLY_SECONDS
+
+
+def _is_question_for_guppi(text):
+    """A direct question the assistant should answer even without being named — the kind
+    only Guppi would field in a family group ('what's on our plate?', 'what's on the
+    calendar?', 'who's got what?', 'any reminders?')."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    triggers = ("what's on our plate", "whats on our plate", "on our plate",
+                "what's on the calendar", "whats on the calendar", "on the calendar",
+                "who's got what", "whos got what", "who has what", "what did we agree",
+                "what are our", "what's on our", "whats on our", "our reminders",
+                "our schedule", "what's scheduled", "whats scheduled",
+                "what's on my", "whats on my", "what do we have")
+    return any(g in t for g in triggers)
+
+
 def _is_addressed(text, message, bot_username):
     """In a GROUP, only respond when actually addressed. Otherwise Guppi would butt
     into every family conversation. Addressed means: a /command, an @mention of the
-    bot, a reply to one of the bot's messages, or the name 'Guppi' at the start."""
+    bot, a reply to one of the bot's messages, the name 'Guppi' at the start, or a
+    direct assistant-question like 'what's on our plate?'."""
     if not text:
         return False
     t = text.strip()
@@ -2781,6 +2814,8 @@ def _is_addressed(text, message, bot_username):
     if (reply_to.get("from") or {}).get("is_bot"):
         return True
     if t.lower().startswith("guppi"):
+        return True
+    if _is_question_for_guppi(t):
         return True
     return False
 
@@ -2880,7 +2915,11 @@ async def telegram_webhook(request: Request):
     # concrete event/task Guppi could schedule, in which case it speaks up to OFFER.
     group_offer = False
     if is_group and not _is_addressed(text, message, BOT_USERNAME):
-        if _group_scheduling_intent(text):
+        if _in_reply_window(chat_id, sender_chat_id):
+            # Guppi just spoke to this person; their next message is a reply to it
+            # (e.g. "Yes for 4:40"). Treat it as addressed so the loop can close.
+            pass
+        elif _group_scheduling_intent(text):
             group_offer = True   # a schedulable task was mentioned; offer to help
         else:
             return {"ok": True}  # ordinary chatter — stay quiet
@@ -2912,6 +2951,10 @@ async def telegram_webhook(request: Request):
         reply = "Sorry, I'm having a little trouble right now. Try again in a moment."
 
     send_message(chat_id, reply)
+    # In a group, opening a short reply window means the person's NEXT message (their
+    # "yes"/"actually 4:40") is treated as a reply to Guppi and won't be dropped.
+    if is_group and reply:
+        _open_reply_window(chat_id, sender_chat_id)
     return {"ok": True}
 
 
