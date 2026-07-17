@@ -2511,12 +2511,14 @@ def fetch_telegram_photo(file_id):
 
 
 def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
-              image_data=None, image_media_type=None):
+              image_data=None, image_media_type=None, group_offer=False):
     """Answer a message.
 
     `sender_chat_id` identifies the PERSON (in a group, the individual who spoke).
     `chat_id` is where the reply goes (the group, or the person's private chat).
     `is_group` gates private information — see build_system_prompt and tools_for_role.
+    `group_offer` is True when Guppi wasn't directly addressed in a group but overheard a
+    schedulable task — it should make a brief, friendly OFFER, not a full response.
 
     Conversation memory: the last few turns for this chat are prepended so short
     follow-ups ("yes", "add that", "the second one") have something to refer to.
@@ -2525,7 +2527,8 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     who_id = sender_chat_id or chat_id
     sender_name, sender_role = identify_sender(who_id)
     print(f"[guppi] {'GROUP' if is_group else 'private'} msg from "
-          f"{sender_name or 'UNKNOWN'} ({sender_role}) chat={who_id}")
+          f"{sender_name or 'UNKNOWN'} ({sender_role}) chat={who_id}"
+          f"{' [overheard-offer]' if group_offer else ''}")
 
     # Give Claude the current DATE AND TIME, with the timezone offset. Date alone is
     # not enough: "in 2 minutes", "in an hour", "tonight" all need a clock to anchor
@@ -2538,6 +2541,13 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     time_hint = (f"(Right now it is {clock} on {today}. In ISO 8601 that is {iso_now}. "
                  f"Use this to work out any relative time such as 'in 2 minutes', "
                  f"'in an hour', 'tonight', or 'tomorrow morning'.)")
+    if group_offer:
+        time_hint += ("\n\n(You were NOT directly addressed — you overheard this in the "
+                      "family group chat and it sounds like a schedulable event or task. "
+                      "Respond with ONE short, friendly line offering to help: ask if "
+                      "they'd like you to add it to the calendar and/or set a reminder. "
+                      "Do NOT add anything yet — just offer. If it turns out not to be a "
+                      "real task, stay brief or say nothing useful. Keep it to one line.)")
     text_part = f"{time_hint}\n\n{user_message}"
     if image_data:
         this_turn = {"role": "user", "content": [
@@ -2606,6 +2616,47 @@ def save_history(chat_id, user_text, assistant_text):
 @app.get("/")
 def home():
     return {"status": "Project Hearth - Guppi (Telegram edition) is running."}
+
+
+def _looks_schedulish(text):
+    """Cheap pre-filter: could this message plausibly be about scheduling something?
+    Keeps us from spending a Claude call on 'lol' or 'what's for dinner'. Deliberately
+    broad — the Claude classifier makes the real decision; this just skips the obvious no."""
+    if not text or len(text) < 6:
+        return False
+    t = text.lower()
+    time_words = ("today", "tomorrow", "tonight", "monday", "tuesday", "wednesday",
+                  "thursday", "friday", "saturday", "sunday", "morning", "afternoon",
+                  "evening", "noon", "am", "pm", "o'clock", "oclock", "next week",
+                  "this week", "weekend", "pick up", "pickup", "drop off", "dropoff",
+                  "appointment", "practice", "game", "meeting", "remind", "at 1", "at 2",
+                  "at 3", "at 4", "at 5", "at 6", "at 7", "at 8", "at 9", ":00", ":30")
+    return any(w in t for w in time_words)
+
+
+def _group_scheduling_intent(text):
+    """Ask Claude, cheaply, whether an UNADDRESSED group message is a real schedulable
+    task/event Guppi should offer to help with. Returns True only for clear cases, so
+    Guppi doesn't butt into ordinary family chatter. Fails closed (silent) on any error."""
+    if not _looks_schedulish(text):
+        return False
+    if not claude_call_allowed():
+        return False
+    try:
+        resp = claude.messages.create(
+            model=MODEL, max_tokens=5,
+            system=("Decide if this ONE message from a family group chat describes a "
+                    "specific event, appointment, or task with a time that someone might "
+                    "want on a calendar or as a reminder (e.g. 'pick up Charlotte at 3 "
+                    "tomorrow', 'dentist Tuesday at 2', 'soccer moved to 5'). Answer ONLY "
+                    "'YES' or 'NO'. Answer NO for general chat, questions, opinions, "
+                    "reactions, or anything without a concrete time/event."),
+            messages=[{"role": "user", "content": text}])
+        verdict = "".join(b.text for b in resp.content if b.type == "text").strip().upper()
+        return verdict.startswith("YES")
+    except Exception as e:
+        print(f"[group] intent check failed: {e}")
+        return False
 
 
 def _is_addressed(text, message, bot_username):
@@ -2718,9 +2769,14 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, welcome_message(name, role))
         return {"ok": True}
 
-    # ---- In a group, stay quiet unless spoken to --------------------------------
+    # ---- In a group, stay quiet unless spoken to -- OR unless someone mentions a
+    # concrete event/task Guppi could schedule, in which case it speaks up to OFFER.
+    group_offer = False
     if is_group and not _is_addressed(text, message, BOT_USERNAME):
-        return {"ok": True}
+        if _group_scheduling_intent(text):
+            group_offer = True   # a schedulable task was mentioned; offer to help
+        else:
+            return {"ok": True}  # ordinary chatter — stay quiet
 
     # ---- Photos -----------------------------------------------------------------
     image_data = image_media_type = None
@@ -2743,7 +2799,7 @@ async def telegram_webhook(request: Request):
 
     try:
         reply = ask_guppi(text or "(no text)", chat_id, sender_chat_id, is_group,
-                          image_data, image_media_type)
+                          image_data, image_media_type, group_offer=group_offer)
     except Exception as e:
         print(f"Error in ask_guppi: {e}")
         reply = "Sorry, I'm having a little trouble right now. Try again in a moment."
