@@ -1070,7 +1070,7 @@ def _cal_insert_event(service, summary, start_iso, end_iso, tzname,
 
 
 def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
-                            location=None, details=None):
+                            location=None, details=None, personal=False):
     service = get_calendar_service(person)
     if not service:
         if person and google_needs_reconnect(person):
@@ -1095,6 +1095,10 @@ def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
     }
     if location:
         body["location"] = location   # Google makes this tappable -> maps/directions
+    # Personal / just-for-me events (usually a work obligation) get the sage color, the
+    # same way travel does, so they're easy to tell apart from family events at a glance.
+    if personal:
+        body["colorId"] = TRAVEL_COLOR_ID
 
     service.events().insert(calendarId=FAMILY_CALENDAR_ID, body=body).execute()
     extra = f" at {location}" if location else ""
@@ -2339,7 +2343,14 @@ def tools_for_role(role, is_group=False):
                              "description": "Address or place name, if known."},
                 "details": {"type": "string",
                             "description": ("All other useful info: attendees, what to "
-                                            "bring, cost, contacts, instructions, notes.")}},
+                                            "bring, cost, contacts, instructions, notes.")},
+                "personal": {"type": "boolean",
+                             "description": ("True when the event is just for the person "
+                                             "asking - a work obligation or personal "
+                                             "commitment they describe as 'for me' / 'just "
+                                             "me' / 'my [work] thing', rather than a shared "
+                                             "family event. Personal events are colored "
+                                             "sage on the calendar.")}},
                 "required": ["summary", "start_iso", "end_iso"]}})
         tools.append({
             "name": "find_events",
@@ -2663,7 +2674,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
             return "Only a parent or caregiver can add calendar events."
         return tool_add_calendar_event(
             tool_input["summary"], tool_input["start_iso"], tool_input["end_iso"],
-            sender_name, tool_input.get("location"), tool_input.get("details"))
+            sender_name, tool_input.get("location"), tool_input.get("details"),
+            tool_input.get("personal", False))
 
     if name == "find_events":
         if not perms["calendar_read"]:
