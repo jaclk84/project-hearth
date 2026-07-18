@@ -2387,6 +2387,19 @@ or supporting details. The same applies when adding an event from an email or fr
 someone tells you: include all the relevant specifics, not just the time. If it's a list,
 offer to save it. Don't invent details the source doesn't show.
 
+RECONCILE BEFORE ADDING: whenever you learn about an event - from an attachment, an email,
+or someone telling you ("lacrosse practice moved to Thursday at 5") - do NOT blindly add
+it. First call find_events to see what's already on the calendar for that thing. Then:
+(1) if a matching event exists but the DATE or TIME differs, this is a CHANGE - offer to
+update the existing event, don't create a duplicate; (2) if there's no matching event,
+it's MISSING - offer to add it; (3) if the new event overlaps something already scheduled,
+call out the CONFLICT and ask how to resolve it. Then think about knock-on LOGISTICS and
+raise them briefly: does the location plus travel time mean someone has to leave earlier
+than they'd expect; does back-to-back timing with another event need a pickup/handoff; does
+the timing land over a mealtime so dinner needs a plan. Surface these as short offers
+("This runs 5-6:30 across town - want a reminder to leave by 4:30, and should I note
+dinner will be late?"), not lectures. Always confirm before changing the calendar.
+
 CRITICAL: never answer a question about the calendar, email, reminders, or lists from
 memory or assumption. You do not know what is there unless you call the tool and read the
 result. Always call the tool first. Never say "you have no emails" or "nothing is
@@ -2590,6 +2603,41 @@ def get_weather_line():
         return None
 
 
+def fetch_telegram_document(file_id, mime_type=None, file_name=None):
+    """Download a document/attachment someone sent (a school PDF, a scanned flyer, etc.).
+    Returns (base64, kind, media_type) where kind is 'pdf' or 'image', or None. We route
+    PDFs to Claude as documents and images as images — Claude reads both natively,
+    including SCANNED pages, which is why we don't need a PDF text-extraction library."""
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    try:
+        info = telegram_api("getFile", {"file_id": file_id})
+        if not info or "file_path" not in info:
+            return None
+        url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}"
+        with urllib.request.urlopen(url, timeout=30) as r:
+            data = r.read()
+        # Cap size so a huge attachment can't blow up the request (~10MB).
+        if len(data) > 10 * 1024 * 1024:
+            print(f"[tg] document too large ({len(data)} bytes)")
+            return None
+        name = (file_name or info.get("file_path", "")).lower()
+        mt = (mime_type or "").lower()
+        b64 = base64.b64encode(data).decode()
+        if mt == "application/pdf" or name.endswith(".pdf"):
+            return b64, "pdf", "application/pdf"
+        if mt.startswith("image/") or name.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            media_type = ("image/png" if name.endswith(".png") else
+                          "image/webp" if name.endswith(".webp") else
+                          "image/gif" if name.endswith(".gif") else "image/jpeg")
+            return b64, "image", media_type
+        print(f"[tg] unsupported document type: mime={mt} name={name}")
+        return None
+    except Exception as e:
+        print(f"[tg] document fetch failed: {e}")
+        return None
+
+
 def fetch_telegram_photo(file_id):
     """Download a photo someone sent. Telegram is two steps: getFile gives a path,
     then you download from the file endpoint. Returns (base64, media_type) or None."""
@@ -2613,7 +2661,8 @@ def fetch_telegram_photo(file_id):
 
 
 def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
-              image_data=None, image_media_type=None, group_offer=False):
+              image_data=None, image_media_type=None, group_offer=False,
+              doc_data=None, doc_media_type=None):
     """Answer a message.
 
     `sender_chat_id` identifies the PERSON (in a group, the individual who spoke).
@@ -2654,14 +2703,26 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                       "when relevant. If it turns out not to be a real task, say nothing "
                       "useful. Keep it to one line.)")
     text_part = f"{time_hint}\n\n{user_message}"
-    if image_data:
+    attach_note = ("\n\n(The user sent this attachment. Read it carefully. If it contains "
+                   "one or more events, dates, or deadlines - like a school calendar, "
+                   "field-trip form, practice schedule, or invoice - extract EACH one "
+                   "with its date, time, and location. For every event, CHECK the calendar "
+                   "with find_events to see if it's already there: if the time changed, "
+                   "offer to update it; if it's missing, offer to add it; if it creates a "
+                   "conflict with something already scheduled, point that out. Then offer "
+                   "any logistics help that follows - travel time, a pickup, or a meal "
+                   "around the timing. Summarize what you found and ask before making "
+                   "changes. If it's a list, offer to save it.)")
+    if doc_data:
+        this_turn = {"role": "user", "content": [
+            {"type": "document", "source": {"type": "base64",
+             "media_type": doc_media_type or "application/pdf", "data": doc_data}},
+            {"type": "text", "text": text_part + attach_note}]}
+    elif image_data:
         this_turn = {"role": "user", "content": [
             {"type": "image", "source": {"type": "base64",
              "media_type": image_media_type or "image/jpeg", "data": image_data}},
-            {"type": "text", "text": text_part + ("\n\n(The user sent this image. If it "
-             "shows an event, offer to add it to the calendar with the right date/time. "
-             "If it's a list, offer to save it. Confirm details briefly before acting on "
-             "anything ambiguous.)")}]}
+            {"type": "text", "text": text_part + attach_note}]}
     else:
         this_turn = {"role": "user", "content": text_part}
 
@@ -2693,7 +2754,8 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
         reply = reply.strip() or "Sorry, I didn't catch that - can you say it another way?"
         # Remember this exchange for next time (store the raw user text, not the
         # time-hint wrapper, so history stays readable and doesn't pile up stale clocks).
-        save_history(who_id, user_message if not image_data else "(sent a photo)", reply)
+        placeholder = "(sent a photo)" if image_data else ("(sent an attachment)" if doc_data else None)
+        save_history(who_id, user_message if not placeholder else placeholder, reply)
         return reply
 
     return "Sorry, that took too many steps. Can you rephrase?"
@@ -2936,7 +2998,28 @@ async def telegram_webhook(request: Request):
         if not text:
             text = "(sent a photo)"
 
-    if not text and not image_data:
+    # ---- Documents / attachments (school PDFs, scanned flyers) -------------------
+    doc_data = doc_media_type = None
+    document = message.get("document")
+    if document:
+        got = fetch_telegram_document(
+            document.get("file_id"), document.get("mime_type"),
+            document.get("file_name"))
+        if got:
+            b64, kind, media_type = got
+            print(f"[tg] fetched document ({kind}, {media_type})")
+            if kind == "pdf":
+                doc_data, doc_media_type = b64, media_type
+            else:  # an image sent as a file -> treat like a photo
+                image_data, image_media_type = b64, media_type
+            if not text:
+                text = "(sent an attachment)"
+        else:
+            send_message(chat_id, "I couldn't open that attachment. If it's a PDF or "
+                                  "photo I can read it - otherwise try sending it as a photo.")
+            return {"ok": True}
+
+    if not text and not image_data and not doc_data:
         return {"ok": True}
 
     # Strip a leading @mention so Claude doesn't see it as part of the request.
@@ -2945,7 +3028,8 @@ async def telegram_webhook(request: Request):
 
     try:
         reply = ask_guppi(text or "(no text)", chat_id, sender_chat_id, is_group,
-                          image_data, image_media_type, group_offer=group_offer)
+                          image_data, image_media_type, group_offer=group_offer,
+                          doc_data=doc_data, doc_media_type=doc_media_type)
     except Exception as e:
         print(f"Error in ask_guppi: {e}")
         reply = "Sorry, I'm having a little trouble right now. Try again in a moment."
