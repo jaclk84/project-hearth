@@ -146,6 +146,10 @@ WEATHER_LON = os.environ.get("LONGITUDE", "-75.16")
 FLIGHT_API_KEY = os.environ.get("FLIGHT_API_KEY", "")
 FLIGHT_API_HOST = os.environ.get("FLIGHT_API_HOST", "aerodatabox.p.rapidapi.com")
 
+# Google Calendar color for travel events, so trips stand out. "2" is Sage (muted green)
+# in Google's fixed 11-color event palette. Override via env if you prefer another.
+TRAVEL_COLOR_ID = os.environ.get("TRAVEL_COLOR_ID", "2")
+
 
 def now_local():
     """Current time in the family's timezone — always use this, never datetime.now()."""
@@ -887,7 +891,8 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
         summary=f"{who} \u2708 {out['number']} {out['dep_airport']}\u2192{out['arr_airport']}",
         start_iso=out["dep_time"], end_iso=out["arr_time"], tzname=tzname,
         location=f"{out['dep_airport']} \u2192 {out['arr_airport']}",
-        details=f"{out['airline']} flight {out['number']}. Auto-added by Guppi.")
+        details=f"{out['airline']} flight {out['number']}. Auto-added by Guppi.",
+        color_id=TRAVEL_COLOR_ID)
     created.append(f"outbound {out['number']} ({out['dep_airport']}\u2192{out['arr_airport']})")
 
     # Trip-block bounds start at outbound departure minus 1 hour (airport buffer).
@@ -904,7 +909,8 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
             summary=f"{who} \u2708 {ret['number']} {ret['dep_airport']}\u2192{ret['arr_airport']}",
             start_iso=ret["dep_time"], end_iso=ret["arr_time"], tzname=tzname,
             location=f"{ret['dep_airport']} \u2192 {ret['arr_airport']}",
-            details=f"{ret['airline']} flight {ret['number']}. Auto-added by Guppi.")
+            details=f"{ret['airline']} flight {ret['number']}. Auto-added by Guppi.",
+            color_id=TRAVEL_COLOR_ID)
         created.append(f"return {ret['number']} ({ret['dep_airport']}\u2192{ret['arr_airport']})")
 
         # (1) Trip block: outbound depart -1h  ->  return arrival.
@@ -915,7 +921,8 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
             location=f"{out['arr_airport']}",
             details=(f"Outbound {out['number']} {out['dep_airport']}\u2192{out['arr_airport']}; "
                      f"return {ret['number']} {ret['dep_airport']}\u2192{ret['arr_airport']}. "
-                     f"Block starts 1h before departure for airport travel. Auto-added by Guppi."))
+                     f"Block starts 1h before departure for airport travel. Auto-added by Guppi."),
+            color_id=TRAVEL_COLOR_ID)
         created.append("trip block")
         summary_line = (f"Added your trip: block from 1h before {out['number']} departs "
                         f"({out['dep_airport']}) through {ret['number']} arrival "
@@ -932,8 +939,10 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
 
 
 def _cal_insert_event(service, summary, start_iso, end_iso, tzname,
-                      location=None, details=None):
-    """Low-level: insert one event. Shared by the flight tool (and reusable elsewhere)."""
+                      location=None, details=None, color_id=None):
+    """Low-level: insert one event. Shared by the flight tool (and reusable elsewhere).
+    color_id is a Google Calendar color number (e.g. "2" = Sage) — used to visually
+    distinguish certain events like travel."""
     body = {
         "summary": summary,
         "description": details or "",
@@ -943,6 +952,8 @@ def _cal_insert_event(service, summary, start_iso, end_iso, tzname,
     }
     if location:
         body["location"] = location
+    if color_id:
+        body["colorId"] = str(color_id)
     service.events().insert(calendarId=FAMILY_CALENDAR_ID, body=body).execute()
 
 
