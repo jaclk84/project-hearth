@@ -2743,8 +2743,17 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
             results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    out = run_tool(block.name, block.input, sender_name, sender_role,
-                                   who_id, is_group)
+                    # A tool that raises must not kill the whole turn. Catch it, log
+                    # exactly what failed, and hand the model a graceful error string so
+                    # it can adapt ("I couldn't reach the calendar just now") instead of
+                    # the user getting a blank "something went wrong".
+                    try:
+                        out = run_tool(block.name, block.input, sender_name, sender_role,
+                                       who_id, is_group)
+                    except Exception as e:
+                        print(f"[tool] ERROR in '{block.name}' input={block.input}: {e}")
+                        out = (f"That didn't work just now ({block.name} ran into a "
+                               f"problem). Let the user know and offer to try again.")
                     results.append({"type": "tool_result", "tool_use_id": block.id,
                                     "content": out})
             messages.append({"role": "user", "content": results})
@@ -3361,16 +3370,23 @@ def job_urgent_email_poll():
 # =============================================================================
 scheduler = BackgroundScheduler(timezone=str(TIMEZONE))
 
+def _job_error_listener(event):
+    """A background job raised. Log exactly which one and why, so a failing briefing or
+    poll is visible and diagnosable — and never silently stops the whole scheduler."""
+    print(f"[scheduler] JOB '{event.job_id}' FAILED: {event.exception!r}")
+
 def start_scheduler():
+    from apscheduler.events import EVENT_JOB_ERROR
+    scheduler.add_listener(_job_error_listener, EVENT_JOB_ERROR)
     poll_min = int(get_setting("poll_minutes") or 30)
     scheduler.add_job(job_reminders, "interval", minutes=1, id="reminders",
-                      replace_existing=True, max_instances=1)
+                      replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_morning_briefing, "cron", hour=6, minute=0, id="briefing",
-                      replace_existing=True, max_instances=1)
+                      replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_urgent_email_poll, "interval", minutes=poll_min,
-                      id="email_poll", replace_existing=True, max_instances=1)
+                      id="email_poll", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_weekly_digest, "cron", day_of_week="sun", hour=18, minute=0,
-                      id="weekly_digest", replace_existing=True, max_instances=1)
+                      id="weekly_digest", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.start()
     print(f"[scheduler] started: reminders/min, briefing 6am, weekly Sun 6pm, email poll/{poll_min}min (all sent PRIVATELY, never to the group)")
 
