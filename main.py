@@ -69,8 +69,8 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi import FastAPI, Request, Response, UploadFile, File
+from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse
 from anthropic import Anthropic
 
 from google_auth_oauthlib.flow import Flow
@@ -304,6 +304,103 @@ def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# =============================================================================
+#  BACKUP — protect the one SQLite file (reminders, lists, memory, AND OAuth
+#  tokens) that lives on the Railway volume. If that file is lost, everyone has
+#  to reconnect every account. We push a safe copy to the primary parent's
+#  Telegram on a schedule (and on demand), so a backup lands somewhere the family
+#  controls without any new service, library, or key.
+# =============================================================================
+def make_db_snapshot():
+    """Make a CONSISTENT copy of the live DB. You cannot just copy the file — a copy
+    taken mid-write can be corrupt. SQLite's backup API takes a proper point-in-time
+    snapshot even while the app is using the DB. Returns the snapshot path or None."""
+    import tempfile
+    try:
+        stamp = now_local().strftime("%Y%m%d-%H%M")
+        snap_path = os.path.join(tempfile.gettempdir(), f"guppi-backup-{stamp}.db")
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(snap_path)
+        with dst:
+            src.backup(dst)          # atomic, consistent, safe during writes
+        src.close(); dst.close()
+        return snap_path
+    except Exception as e:
+        print(f"[backup] snapshot failed: {e}")
+        return None
+
+
+def _tg_send_document(chat_id, file_path, caption=""):
+    """Send a file to a Telegram chat via multipart/form-data (telegram_api only does
+    JSON, so document upload needs its own multipart request)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    try:
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+        filename = os.path.basename(file_path)
+        boundary = "----GuppiBackup" + now_local().strftime("%Y%m%d%H%M%S")
+        parts = []
+        # chat_id field
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
+                     f'name="chat_id"\r\n\r\n{chat_id}\r\n')
+        if caption:
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
+                         f'name="caption"\r\n\r\n{caption}\r\n')
+        pre = "".join(parts).encode()
+        file_header = (f"--{boundary}\r\nContent-Disposition: form-data; "
+                       f'name="document"; filename="{filename}"\r\n'
+                       f"Content-Type: application/octet-stream\r\n\r\n").encode()
+        closing = f"\r\n--{boundary}--\r\n".encode()
+        payload = pre + file_header + file_bytes + closing
+        req = urllib.request.Request(
+            f"{TELEGRAM_API}/sendDocument", data=payload,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body = json.loads(r.read())
+        if not body.get("ok"):
+            print(f"[backup] sendDocument failed: {body}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[backup] sendDocument error: {e}")
+        return False
+
+
+def run_backup(reason="scheduled"):
+    """Snapshot the DB and push it to the primary parent's Telegram. Returns a status
+    string. Used by both the daily job and the manual 'back up now' command."""
+    target = _first_parent_chat()
+    if not target:
+        return "No parent is connected yet, so there's nowhere safe to send a backup."
+    snap = make_db_snapshot()
+    if not snap:
+        return "The backup couldn't be created just now. I'll try again on the next cycle."
+    size_kb = max(1, os.path.getsize(snap) // 1024)
+    when = now_local().strftime("%A %b %-d, %-I:%M %p")
+    caption = (f"Guppi backup ({reason}) — {when}. {size_kb} KB. "
+               f"Keep this file safe; it can restore everything (accounts, reminders, "
+               f"lists, memory) if the server data is ever lost.")
+    ok = _tg_send_document(target, snap, caption)
+    try:
+        os.remove(snap)
+    except Exception:
+        pass
+    if ok:
+        print(f"[backup] sent ({reason}, {size_kb}KB)")
+        return f"Backup done — I sent the database file to your chat ({size_kb} KB)."
+    return "The backup was created but couldn't be sent. I'll retry next cycle."
+
+
+def job_daily_backup():
+    """Once a day: push a DB snapshot to the primary parent. Wrapped so a failure is
+    logged and never destabilizes the scheduler."""
+    try:
+        run_backup(reason="daily automatic")
+    except Exception as e:
+        print(f"[backup] daily job error: {e}")
 
 
 # =============================================================================
@@ -2256,6 +2353,12 @@ def tools_for_role(role, is_group=False):
                     "action": {"type": "string", "enum": ["add", "remove", "list"]},
                     "sender": {"type": "string"}}, "required": ["action"]}})
             tools.append({
+                "name": "backup_now",
+                "description": ("Immediately back up Guppi's database and send the file to "
+                                "this parent's Telegram. Use when a parent says 'back up "
+                                "now', 'save a backup', or 'export the data'."),
+                "input_schema": {"type": "object", "properties": {}}})
+            tools.append({
                 "name": "connection_health",
                 "description": ("Check whether this person's accounts (Google calendar/"
                                 "Gmail, Microsoft/live.com email) are connected and "
@@ -2296,7 +2399,7 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     # read the answer. Belt-and-braces on top of not offering the tool at all.
     GROUP_FORBIDDEN = {"search_email", "read_email", "recall", "remember", "forget",
                        "show_settings", "update_setting", "list_calendars",
-                       "connection_health", "manage_deadline_ignores"}
+                       "connection_health", "manage_deadline_ignores", "backup_now"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -2358,6 +2461,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
             return "You don't have calendar access."
         return tool_list_calendars(sender_name)
 
+    if name == "backup_now":
+        return run_backup(reason="you asked")
     if name == "connection_health":
         return tool_connection_health(sender_name)
     if name == "manage_deadline_ignores":
@@ -3598,8 +3703,54 @@ def start_scheduler():
                       id="email_poll", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_weekly_digest, "cron", day_of_week="sun", hour=18, minute=0,
                       id="weekly_digest", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(job_daily_backup, "cron", hour=3, minute=30, id="daily_backup",
+                      replace_existing=True, max_instances=1, coalesce=True)
     scheduler.start()
-    print(f"[scheduler] started: reminders/min, briefing 6am, weekly Sun 6pm, email poll/{poll_min}min (all sent PRIVATELY, never to the group)")
+    print(f"[scheduler] started: reminders/min, briefing 6am, weekly Sun 6pm, email poll/{poll_min}min, backup 3:30am (all sent PRIVATELY, never to the group)")
+
+
+@app.get("/backup")
+def backup_download(secret: str = ""):
+    """Download a fresh DB snapshot on demand. Visit
+    /backup?secret=<TELEGRAM_SETUP_SECRET>. Secret-protected because this file contains
+    OAuth tokens."""
+    if not TELEGRAM_SETUP_SECRET or secret != TELEGRAM_SETUP_SECRET:
+        return {"ok": False, "error": "bad or missing secret"}
+    snap = make_db_snapshot()
+    if not snap:
+        return {"ok": False, "error": "snapshot failed"}
+    return FileResponse(snap, filename=os.path.basename(snap),
+                        media_type="application/octet-stream")
+
+
+@app.post("/restore")
+async def restore_upload(request: Request, secret: str = "", file: UploadFile = File(...)):
+    """Restore the database from a previously downloaded backup. This OVERWRITES the live
+    DB, so it's guarded by the setup secret AND makes a safety copy of the current DB
+    first. POST the backup file as multipart 'file' to
+    /restore?secret=<TELEGRAM_SETUP_SECRET>."""
+    if not TELEGRAM_SETUP_SECRET or secret != TELEGRAM_SETUP_SECRET:
+        return {"ok": False, "error": "bad or missing secret"}
+    try:
+        data = await file.read()
+        # Sanity-check it's actually a SQLite file before overwriting anything.
+        if not data.startswith(b"SQLite format 3\x00"):
+            return {"ok": False, "error": "that doesn't look like a Guppi database file"}
+        # Safety copy of the CURRENT db before overwriting, in case the restore is wrong.
+        try:
+            pre = make_db_snapshot()
+            if pre:
+                os.replace(pre, DB_PATH + ".pre-restore")
+        except Exception:
+            pass
+        with open(DB_PATH, "wb") as f:
+            f.write(data)
+        print(f"[restore] database restored from upload ({len(data)} bytes)")
+        return {"ok": True, "restored_bytes": len(data),
+                "note": "Database restored. The previous DB was saved as guppi.db.pre-restore."}
+    except Exception as e:
+        print(f"[restore] failed: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/set-webhook")
