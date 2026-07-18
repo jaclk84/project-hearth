@@ -67,6 +67,7 @@ import email as emaillib
 from email.header import decode_header
 import urllib.request
 import urllib.parse
+import urllib.error
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import RedirectResponse, HTMLResponse
@@ -789,6 +790,15 @@ def _lookup_flight(flight_number, date_iso):
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # RapidAPI puts the real reason in the body ("not subscribed", "invalid key",
+        # "not permitted for this endpoint"). Surface it so the cause is obvious.
+        try:
+            body = e.read().decode(errors="replace")[:300]
+        except Exception:
+            body = ""
+        print(f"[flight] lookup failed for {fn} {date_iso}: HTTP {e.code} - {body}")
+        return None
     except Exception as e:
         print(f"[flight] lookup failed for {fn} {date_iso}: {e}")
         return None
