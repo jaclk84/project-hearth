@@ -786,7 +786,13 @@ def _lookup_flight(flight_number, date_iso):
     url = f"https://{FLIGHT_API_HOST}/flights/number/{urllib.parse.quote(fn)}/{date_iso}"
     req = urllib.request.Request(url, headers={
         "X-RapidAPI-Key": FLIGHT_API_KEY,
-        "X-RapidAPI-Host": FLIGHT_API_HOST})
+        "X-RapidAPI-Host": FLIGHT_API_HOST,
+        # Cloudflare (in front of the API) returns 403 error 1010 for requests without a
+        # normal browser User-Agent. urllib's default ("Python-urllib/x") gets flagged as
+        # a bot, so we present a standard browser UA to pass the integrity check.
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read())
