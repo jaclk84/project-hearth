@@ -293,6 +293,21 @@ def init_db():
         created_by TEXT,
         done INTEGER DEFAULT 0,
         created_at TEXT NOT NULL)""")
+    # Special occasions with escalating reminders (birthdays, anniversaries, vacations,
+    # renewals). A daily job computes days-until and fires 90/30/7/1-day nudges with a
+    # help offer (gift ideas / packing list / "take action"). month/day drive annual
+    # recurrence; `year` is set only for one-offs (a specific vacation).
+    conn.execute("""CREATE TABLE IF NOT EXISTS occasions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        kind TEXT NOT NULL,          -- birthday | anniversary | holiday | vacation | renewal | other
+        month INTEGER NOT NULL,
+        day INTEGER NOT NULL,
+        year INTEGER,                -- NULL = recurs every year
+        for_chat TEXT,               -- whose briefing gets the nudges (NULL = all parents)
+        notes TEXT,
+        created_by TEXT,
+        created_at TEXT NOT NULL)""")
     conn.commit()
     for name, role in SEEDED_PEOPLE:
         conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
@@ -1900,6 +1915,163 @@ def tool_delete_reminder(reminder_id, requester_chat, requester_role):
 
 
 # ---- Shared lists -----------------------------------------------------------
+def tool_add_occasion(title, kind, month, day, year=None, for_chat=None,
+                      notes=None, created_by=None):
+    """Register a special occasion that should get escalating reminders (a birthday,
+    anniversary, holiday, vacation, or renewal). Annual by default; set year for a
+    one-off like a specific vacation."""
+    kind = (kind or "other").lower().strip()
+    valid = {"birthday", "anniversary", "holiday", "vacation", "renewal", "other"}
+    if kind not in valid:
+        kind = "other"
+    try:
+        month = int(month); day = int(day)
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            return "That date doesn't look right - give me a month (1-12) and day (1-31)."
+    except (ValueError, TypeError):
+        return "I need a numeric month and day for the occasion."
+    conn = db()
+    conn.execute(
+        "INSERT INTO occasions (title, kind, month, day, year, for_chat, notes, "
+        "created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (title, kind, month, day, year, str(for_chat) if for_chat else None,
+         notes, created_by, now_local().isoformat()))
+    conn.commit(); conn.close()
+    when = datetime.date(2000, month, day).strftime("%B %-d")
+    yr = f", {year}" if year else " (every year)"
+    lead = "90/30/7/1 days before" if kind == "vacation" else "30/7/1 days before"
+    return (f"Got it - I'll track {title} ({kind}) on {when}{yr} and remind you {lead}, "
+            f"with help when it's close.")
+
+
+def tool_list_occasions():
+    """List the special occasions Guppi is tracking."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, title, kind, month, day, year FROM occasions "
+        "ORDER BY month, day").fetchall()
+    conn.close()
+    if not rows:
+        return "I'm not tracking any special occasions yet."
+    out = []
+    for r in rows:
+        when = datetime.date(2000, r["month"], r["day"]).strftime("%b %-d")
+        yr = f" {r['year']}" if r["year"] else ""
+        out.append(f"[{r['id']}] {when}{yr} - {r['title']} ({r['kind']})")
+    return "Special occasions I'm tracking:\n" + "\n".join(out)
+
+
+def tool_delete_occasion(occasion_id):
+    """Stop tracking a special occasion."""
+    conn = db()
+    row = conn.execute("SELECT title FROM occasions WHERE id = ?",
+                       (occasion_id,)).fetchone()
+    if not row:
+        conn.close()
+        return "I couldn't find that occasion - try listing them again."
+    conn.execute("DELETE FROM occasions WHERE id = ?", (occasion_id,))
+    conn.commit(); conn.close()
+    return f"Stopped tracking {row['title']}."
+
+
+# Which lead-time milestones each kind gets, and how the nudge is framed.
+_OCCASION_LEADS = {
+    "vacation": [90, 30, 7, 1],
+}
+_DEFAULT_LEADS = [30, 7, 1]
+
+def _occasion_next_date(month, day, year, today):
+    """The next occurrence of an occasion as a date. For annual (year=None) it's this
+    year or next; for a one-off it's the fixed date."""
+    if year:
+        try:
+            return datetime.date(int(year), month, day)
+        except ValueError:
+            return None
+    # Annual: this year if not yet passed, else next year. Handle Feb 29 gracefully.
+    for yr in (today.year, today.year + 1):
+        try:
+            d = datetime.date(yr, month, day)
+        except ValueError:
+            d = datetime.date(yr, month, 28) if month == 2 else None
+        if d and d >= today:
+            return d
+    return None
+
+
+def _occasion_message(occ, days_out):
+    """Build the escalating nudge + help offer for an occasion at a given milestone."""
+    title, kind = occ["title"], occ["kind"]
+    gift_kinds = {"birthday", "anniversary", "holiday"}
+    if days_out == 1:
+        base = f"Tomorrow: {title}."
+    elif days_out == 7:
+        base = f"One week until {title}."
+    elif days_out == 30:
+        base = f"About a month until {title}."
+    elif days_out == 90:
+        base = f"About 3 months until {title}."
+    else:
+        base = f"{days_out} days until {title}."
+
+    if kind in gift_kinds:
+        if days_out >= 30:
+            offer = " Want some gift ideas, or should I set a reminder to shop?"
+        elif days_out == 7:
+            offer = " Time to get the gift sorted - want ideas or a reminder to order?"
+        else:
+            offer = " Last chance for anything you still need."
+    elif kind == "vacation":
+        if days_out >= 30:
+            offer = " Want me to start a packing list or a prep to-do list?"
+        elif days_out == 7:
+            offer = " Want to review the packing list and trip details?"
+        else:
+            offer = " Final check - bags packed, plans confirmed?"
+    elif kind == "renewal":
+        offer = " Want me to set a reminder to take care of it?"
+    else:
+        offer = " Want me to set a reminder or help you prepare?"
+
+    note = f" ({occ['notes']})" if occ["notes"] else ""
+    return base + note + offer
+
+
+def job_occasion_reminders():
+    """Once a day: for each tracked occasion, if today is exactly a milestone (90/30/7/1
+    days out, per kind), send the escalating nudge + help offer to the right parent(s).
+    De-duped per occasion+year+milestone so each fires once."""
+    if not proactive_on() or in_quiet_hours():
+        return
+    today = now_local().date()
+    conn = db()
+    occ_rows = conn.execute("SELECT * FROM occasions").fetchall()
+    conn.close()
+    if not occ_rows:
+        return
+
+    parents = _adults_with_chats()
+    for occ in occ_rows:
+        nxt = _occasion_next_date(occ["month"], occ["day"], occ["year"], today)
+        if not nxt:
+            continue
+        days_out = (nxt - today).days
+        leads = _OCCASION_LEADS.get(occ["kind"], _DEFAULT_LEADS)
+        if days_out not in leads:
+            continue
+        # Dedupe: fire each milestone once per occurrence.
+        sig = f"occasion_fired_{occ['id']}_{nxt.isoformat()}_{days_out}"
+        if get_setting(sig):
+            continue
+        msg = _occasion_message(occ, days_out)
+        targets = ([(None, occ["for_chat"])] if occ["for_chat"]
+                   else parents)
+        for _n, chat in targets:
+            if chat:
+                send_message(chat, msg, proactive=True)
+        set_setting(sig, "1")
+
+
 def tool_add_commitment(task, who=None, when_text=None, created_by=None):
     """Record who agreed to do a household task ('Jason is picking up Charlotte at 3').
     Shared logistics, so it works in the group. Keeps the loop closed on verbal plans."""
@@ -2297,6 +2469,35 @@ def tools_for_role(role, is_group=False):
          "description": "Mark a household commitment done, by its id (from list_commitments).",
          "input_schema": {"type": "object", "properties": {
              "commitment_id": {"type": "integer"}}, "required": ["commitment_id"]}},
+        {"name": "add_occasion",
+         "description": ("Track a special occasion that should get escalating reminders: "
+                         "a birthday, anniversary, holiday, vacation, or annual renewal "
+                         "(registration, checkup, taxes). Guppi will nudge 30/7/1 days "
+                         "before (90/30/7/1 for vacations) and offer help - gift ideas for "
+                         "birthdays/anniversaries/holidays, a packing list for vacations, "
+                         "or an action reminder for renewals. Use for 'remember Mom's "
+                         "birthday is March 5', 'our anniversary is June 12', 'we're going "
+                         "to Disney July 20-27', 'car registration renews in October'. "
+                         "kind must be one of: birthday, anniversary, holiday, vacation, "
+                         "renewal, other. Give month and day as numbers; add year only for "
+                         "a one-off (a specific vacation)."),
+         "input_schema": {"type": "object", "properties": {
+             "title": {"type": "string"},
+             "kind": {"type": "string",
+                      "enum": ["birthday", "anniversary", "holiday", "vacation",
+                               "renewal", "other"]},
+             "month": {"type": "integer"},
+             "day": {"type": "integer"},
+             "year": {"type": "integer", "description": "Only for one-off events."},
+             "notes": {"type": "string"}},
+             "required": ["title", "kind", "month", "day"]}},
+        {"name": "list_occasions",
+         "description": "List the special occasions Guppi is tracking (birthdays, etc.).",
+         "input_schema": {"type": "object", "properties": {}}},
+        {"name": "delete_occasion",
+         "description": "Stop tracking a special occasion, by its id (from list_occasions).",
+         "input_schema": {"type": "object", "properties": {
+             "occasion_id": {"type": "integer"}}, "required": ["occasion_id"]}},
         {"type": "web_search_20250305", "name": "web_search"},
     ]
 
@@ -2522,6 +2723,16 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return tool_list_commitments()
     if name == "complete_commitment":
         return tool_complete_commitment(tool_input["commitment_id"])
+
+    if name == "add_occasion":
+        return tool_add_occasion(
+            tool_input["title"], tool_input["kind"], tool_input["month"],
+            tool_input["day"], tool_input.get("year"), sender_chat,
+            tool_input.get("notes"), sender_name)
+    if name == "list_occasions":
+        return tool_list_occasions()
+    if name == "delete_occasion":
+        return tool_delete_occasion(tool_input["occasion_id"])
 
     if name == "invite_person":
         return link_person(tool_input["name"], sender_role)
@@ -2900,20 +3111,92 @@ def claude_call_allowed():
     return True
 
 
+_WEATHER_CODES = {
+    0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Cloudy",
+    45: "Foggy", 48: "Foggy", 51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
+    56: "Freezing drizzle", 57: "Freezing drizzle",
+    61: "Light rain", 63: "Rain", 65: "Heavy rain",
+    66: "Freezing rain", 67: "Freezing rain",
+    71: "Light snow", 73: "Snow", 75: "Heavy snow", 77: "Snow",
+    80: "Rain showers", 81: "Rain showers", 82: "Heavy rain showers",
+    85: "Snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorms", 96: "Thunderstorms with hail", 99: "Severe thunderstorms",
+}
+
 def get_weather_line():
-    """One-line forecast from open-meteo (no API key). Best-effort; never fatal."""
+    """A useful one-line forecast from open-meteo (no API key): condition, high/low, WHEN
+    precipitation is likely (morning/afternoon/evening), and notable-weather flags (heat,
+    cold, wind, storms). Best-effort; never fatal."""
     try:
         url = (f"https://api.open-meteo.com/v1/forecast?latitude={WEATHER_LAT}"
-               f"&longitude={WEATHER_LON}&daily=temperature_2m_max,temperature_2m_min,"
-               f"precipitation_probability_max&temperature_unit=fahrenheit"
+               f"&longitude={WEATHER_LON}"
+               f"&daily=temperature_2m_max,temperature_2m_min,weather_code,"
+               f"precipitation_probability_max,wind_speed_10m_max"
+               f"&hourly=precipitation_probability,weather_code"
+               f"&temperature_unit=fahrenheit&wind_speed_unit=mph"
                f"&timezone=auto&forecast_days=1")
         with urllib.request.urlopen(url, timeout=8) as r:
             data = json.loads(r.read())
         d = data["daily"]
         hi = round(d["temperature_2m_max"][0])
         lo = round(d["temperature_2m_min"][0])
+        code = d["weather_code"][0]
         rain = d["precipitation_probability_max"][0]
-        return f"Weather: high {hi}, low {lo}, {rain}% chance of rain."
+        wind = round(d.get("wind_speed_10m_max", [0])[0])
+        condition = _WEATHER_CODES.get(code, "Mixed")
+
+        # Figure out WHEN precip is likely, from the hourly probabilities.
+        timing = ""
+        try:
+            hourly = data["hourly"]
+            times = hourly["time"]
+            probs = hourly["precipitation_probability"]
+            # Bucket the day: morning (6-11), afternoon (12-17), evening (18-22).
+            buckets = {"morning": [], "afternoon": [], "evening": []}
+            for t, p in zip(times, probs):
+                if p is None:
+                    continue
+                hr = int(t[11:13])
+                if 6 <= hr <= 11:
+                    buckets["morning"].append(p)
+                elif 12 <= hr <= 17:
+                    buckets["afternoon"].append(p)
+                elif 18 <= hr <= 22:
+                    buckets["evening"].append(p)
+            # Which parts of day have a real chance (>40%)?
+            wet = [name for name, ps in buckets.items() if ps and max(ps) >= 40]
+            if rain >= 30 and wet:
+                timing = " in the " + " and ".join(wet) if len(wet) < 3 else " on and off"
+        except Exception:
+            pass
+
+        # Build the core line.
+        line = f"Weather: {condition.lower()}, high {hi} / low {lo}."
+        # Add precipitation detail when it matters.
+        wet_conditions = code >= 51 or rain >= 30
+        if wet_conditions:
+            kind = ("snow" if 71 <= code <= 77 or 85 <= code <= 86 else
+                    "storms" if code >= 95 else "rain")
+            line += f" {rain}% chance of {kind}{timing}."
+
+        # Notable-event flags worth calling out.
+        flags = []
+        if hi >= 95:
+            flags.append("very hot - stay hydrated")
+        elif hi >= 90:
+            flags.append("hot")
+        if lo <= 20:
+            flags.append("very cold - bundle up")
+        elif lo <= 32:
+            flags.append("freezing overnight")
+        if wind >= 30:
+            flags.append(f"windy ({wind} mph)")
+        if code >= 95:
+            flags.append("thunderstorms - plan around them")
+        if flags:
+            joined = "; ".join(flags)
+            line += " " + joined[0].upper() + joined[1:] + "."
+        return line
     except Exception as e:
         print(f"[weather] failed: {e}")
         return None
@@ -3476,30 +3759,63 @@ def job_reminders():
         conn.commit(); conn.close()
 
 
+def reminders_for_briefing(for_chat=None, horizon_hours=36):
+    """Reminders relevant to THIS MORNING's briefing: ones due today or within the next
+    ~36 hours. The full list (via list_reminders) dumps everything — so a Saturday
+    briefing wrongly showed Tuesday's recycling. This scopes to what's actually imminent,
+    which is what a morning briefing is for."""
+    now = now_local()
+    cutoff = now + datetime.timedelta(hours=horizon_hours)
+    conn = db()
+    if for_chat:
+        rows = conn.execute(
+            "SELECT text, due_at FROM reminders WHERE fired = 0 "
+            "AND (for_chat = ? OR for_chat IS NULL) ORDER BY due_at",
+            (str(for_chat),)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT text, due_at FROM reminders WHERE fired = 0 ORDER BY due_at").fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            due = datetime.datetime.fromisoformat(r["due_at"])
+        except (ValueError, TypeError):
+            continue
+        if due <= cutoff:                    # today or imminent only
+            when = due.strftime("%-I:%M %p") if due.date() == now.date() else due.strftime("%a %-I:%M %p")
+            out.append(f"{when}: {r['text']}")
+    return "\n".join(out) if out else "None due today."
+
+
 def job_morning_briefing():
-    """6am: one short briefing to each parent — calendar + due reminders + weather."""
+    """6am: one short briefing to each parent — calendar + TODAY's reminders + weather.
+    Reminders are scoped to today/imminent so a Saturday briefing doesn't list Tuesday's
+    recurring recycling."""
     if not proactive_on() or in_quiet_hours():
         return
     calendar = tool_check_calendar(days_ahead=1)
-    reminders = tool_list_reminders()
     weather = get_weather_line()
 
-    if not claude_call_allowed():
-        return
-    context = (f"Today's calendar:\n{calendar}\n\nUpcoming reminders:\n{reminders}\n\n"
-               f"{weather or ''}")
-    try:
-        resp = claude.messages.create(
-            model=MODEL, max_tokens=300,
-            system=("You are Guppi. Write ONE short, plain-text good-morning briefing for "
-                    "a parent, summarizing today's schedule, any reminders, and the weather. "
-                    "No markdown, no emoji, under 300 characters. Warm but efficient."),
-            messages=[{"role": "user", "content": context}])
-        text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    except Exception as e:
-        print(f"[briefing] Claude failed: {e}")
-        return
     for name, chat in _adults_with_chats():
+        if not claude_call_allowed():
+            return
+        reminders = reminders_for_briefing(for_chat=chat)
+        context = (f"Today's calendar:\n{calendar}\n\nReminders due today:\n{reminders}\n\n"
+                   f"{weather or ''}")
+        try:
+            resp = claude.messages.create(
+                model=MODEL, max_tokens=300,
+                system=("You are Guppi. Write ONE short, plain-text good-morning briefing "
+                        "for a parent, summarizing today's schedule, any reminders DUE "
+                        "TODAY, and the weather. Only mention reminders that are actually "
+                        "due today or imminent - do not list far-off ones. No markdown, no "
+                        "emoji, under 300 characters. Warm but efficient."),
+                messages=[{"role": "user", "content": context}])
+            text = "".join(b.text for b in resp.content if b.type == "text").strip()
+        except Exception as e:
+            print(f"[briefing] Claude failed: {e}")
+            continue
         send_message(chat, text, proactive=True)
 
 
@@ -3705,8 +4021,10 @@ def start_scheduler():
                       id="weekly_digest", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_daily_backup, "cron", hour=3, minute=30, id="daily_backup",
                       replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(job_occasion_reminders, "cron", hour=7, minute=0, id="occasions",
+                      replace_existing=True, max_instances=1, coalesce=True)
     scheduler.start()
-    print(f"[scheduler] started: reminders/min, briefing 6am, weekly Sun 6pm, email poll/{poll_min}min, backup 3:30am (all sent PRIVATELY, never to the group)")
+    print(f"[scheduler] started: reminders/min, briefing 6am, occasions 7am, weekly Sun 6pm, email poll/{poll_min}min, backup 3:30am (all sent PRIVATELY, never to the group)")
 
 
 @app.get("/backup")
