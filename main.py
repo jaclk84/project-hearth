@@ -2542,7 +2542,14 @@ def tools_for_role(role, is_group=False):
     if not is_group:
         tools += [
             {"name": "remember",
-             "description": "Save a durable fact about the family. Follow the memory rules strictly.",
+             "description": ("Save a durable fact about the family (a preference, an "
+                             "allergy, a standing detail). Follow the memory rules "
+                             "strictly. IMPORTANT: do NOT use this for birthdays, "
+                             "anniversaries, holidays, vacations, or annual renewals - "
+                             "even if the user says 'remember'. Those are recurring dates "
+                             "that need escalating reminders, so use add_occasion instead. "
+                             "'Remember Lillian's birthday is April 13' -> add_occasion, "
+                             "not remember."),
              "input_schema": {"type": "object", "properties": {
                  "fact": {"type": "string"},
                  "about": {"type": "string", "description": "Who the fact concerns, if anyone."}},
@@ -2981,6 +2988,12 @@ When a tool returns a confirmation with specific details - who will be reminded,
 dates, any "heads up" caveat - relay those details faithfully. Don't soften "you and your
 partner" into "you", and don't drop a heads-up about a near date. The user needs to know
 exactly what was set up, especially who is covered.
+
+Birthdays, anniversaries, holidays, vacations, and annual renewals are RECURRING DATES, not
+plain facts. Always register them with add_occasion (so they generate escalating reminders),
+even when the user says "remember" - e.g. "remember Lillian's birthday is April 13" is an
+add_occasion call, not a remember call. Only use remember for non-date facts (preferences,
+allergies, standing details).
 
 When searching email, build broad queries. Senders rarely match a plain name - mail
 "from Google" comes from addresses like no-reply@accounts.google.com.
