@@ -139,6 +139,12 @@ MS_IMAP_PORT = 993
 WEATHER_LAT = os.environ.get("LATITUDE", "39.95")
 WEATHER_LON = os.environ.get("LONGITUDE", "-75.16")
 
+# AeroDataBox via RapidAPI — flight lookup by number+date. Free tier is enough for a
+# few trips a month. Set FLIGHT_API_KEY in Railway (the RapidAPI key). Without it, the
+# flight tool falls back to asking the user for times.
+FLIGHT_API_KEY = os.environ.get("FLIGHT_API_KEY", "")
+FLIGHT_API_HOST = os.environ.get("FLIGHT_API_HOST", "aerodatabox.p.rapidapi.com")
+
 
 def now_local():
     """Current time in the family's timezone — always use this, never datetime.now()."""
@@ -767,6 +773,145 @@ def tool_delete_calendar_event(event_id, person=None):
         print(f"[cal] delete failed: {e}")
         return "I couldn't delete that - it may already be gone. Try finding it again."
     return f"Deleted {title} from the calendar."
+
+
+def _lookup_flight(flight_number, date_iso):
+    """Look up one flight by number + date via AeroDataBox. Returns a dict with
+    departure/arrival airport codes and scheduled local ISO times, or None. Fails soft:
+    any error (no key, not found, network) returns None so the caller can ask the user."""
+    if not FLIGHT_API_KEY:
+        return None
+    fn = flight_number.replace(" ", "").upper()
+    url = f"https://{FLIGHT_API_HOST}/flights/number/{urllib.parse.quote(fn)}/{date_iso}"
+    req = urllib.request.Request(url, headers={
+        "X-RapidAPI-Key": FLIGHT_API_KEY,
+        "X-RapidAPI-Host": FLIGHT_API_HOST})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        print(f"[flight] lookup failed for {fn} {date_iso}: {e}")
+        return None
+    # The endpoint returns a list (a number can have multiple legs/segments a day).
+    flights = data if isinstance(data, list) else data.get("flights") or []
+    if not flights:
+        print(f"[flight] no results for {fn} {date_iso}")
+        return None
+    f = flights[0]
+    dep = f.get("departure", {}) or {}
+    arr = f.get("arrival", {}) or {}
+
+    def _airport(side):
+        ap = side.get("airport", {}) or {}
+        return ap.get("iata") or ap.get("icao") or ap.get("name") or "?"
+
+    def _sched_time(side):
+        # AeroDataBox gives scheduledTime: {local: "2026-07-22 08:00-04:00", utc: "..."}.
+        st = side.get("scheduledTime") or side.get("revisedTime") or {}
+        local = st.get("local") if isinstance(st, dict) else None
+        if not local:
+            return None
+        # Normalize "YYYY-MM-DD HH:MM±HH:MM" -> ISO 8601 with 'T'.
+        return local.replace(" ", "T", 1)
+
+    return {
+        "number": fn,
+        "dep_airport": _airport(dep), "arr_airport": _airport(arr),
+        "dep_time": _sched_time(dep), "arr_time": _sched_time(arr),
+        "airline": (f.get("airline", {}) or {}).get("name", ""),
+    }
+
+
+def tool_add_flight(outbound_number, outbound_date, person=None,
+                    return_number=None, return_date=None):
+    """Add a work trip to the calendar from flight numbers. Looks up each flight's real
+    airports and times, then creates: (1) a trip-block event spanning from 1 hour before
+    the outbound departure (airport buffer) to the return arrival, and (2) an individual
+    event for each flight. Falls back to asking for details if lookup isn't available."""
+    service = get_calendar_service(person)
+    err = _cal_guard(service, person)
+    if err:
+        return err
+
+    out = _lookup_flight(outbound_number, outbound_date)
+    if not out or not out["dep_time"] or not out["arr_time"]:
+        return (f"I couldn't look up flight {outbound_number} on {outbound_date} "
+                f"automatically. Tell me the departure and arrival airports and times "
+                f"from your confirmation and I'll add it, or forward me the airline email.")
+
+    ret = None
+    if return_number and return_date:
+        ret = _lookup_flight(return_number, return_date)
+        if not ret or not ret["dep_time"] or not ret["arr_time"]:
+            ret = None  # we'll still add the outbound; note the return couldn't be found
+
+    who = person or "Trip"
+    tzname = str(TIMEZONE)
+    created = []
+
+    # (2) Individual outbound flight event (actual gate-to-gate times).
+    _cal_insert_event(
+        service,
+        summary=f"{who} \u2708 {out['number']} {out['dep_airport']}\u2192{out['arr_airport']}",
+        start_iso=out["dep_time"], end_iso=out["arr_time"], tzname=tzname,
+        location=f"{out['dep_airport']} \u2192 {out['arr_airport']}",
+        details=f"{out['airline']} flight {out['number']}. Auto-added by Guppi.")
+    created.append(f"outbound {out['number']} ({out['dep_airport']}\u2192{out['arr_airport']})")
+
+    # Trip-block bounds start at outbound departure minus 1 hour (airport buffer).
+    try:
+        dep_dt = datetime.datetime.fromisoformat(out["dep_time"])
+        block_start = (dep_dt - datetime.timedelta(hours=1)).isoformat()
+    except ValueError:
+        block_start = out["dep_time"]
+
+    if ret:
+        # (2) Individual return flight event.
+        _cal_insert_event(
+            service,
+            summary=f"{who} \u2708 {ret['number']} {ret['dep_airport']}\u2192{ret['arr_airport']}",
+            start_iso=ret["dep_time"], end_iso=ret["arr_time"], tzname=tzname,
+            location=f"{ret['dep_airport']} \u2192 {ret['arr_airport']}",
+            details=f"{ret['airline']} flight {ret['number']}. Auto-added by Guppi.")
+        created.append(f"return {ret['number']} ({ret['dep_airport']}\u2192{ret['arr_airport']})")
+
+        # (1) Trip block: outbound depart -1h  ->  return arrival.
+        _cal_insert_event(
+            service,
+            summary=f"{who} \u2708 Trip: {out['dep_airport']}\u2194{out['arr_airport']}",
+            start_iso=block_start, end_iso=ret["arr_time"], tzname=tzname,
+            location=f"{out['arr_airport']}",
+            details=(f"Outbound {out['number']} {out['dep_airport']}\u2192{out['arr_airport']}; "
+                     f"return {ret['number']} {ret['dep_airport']}\u2192{ret['arr_airport']}. "
+                     f"Block starts 1h before departure for airport travel. Auto-added by Guppi."))
+        created.append("trip block")
+        summary_line = (f"Added your trip: block from 1h before {out['number']} departs "
+                        f"({out['dep_airport']}) through {ret['number']} arrival "
+                        f"({ret['arr_airport']}), plus both flight events.")
+    else:
+        note = ""
+        if return_number:
+            note = (f" I couldn't look up the return ({return_number}) - tell me its details "
+                    f"or forward the confirmation and I'll add it.")
+        summary_line = (f"Added your outbound flight {out['number']} "
+                        f"({out['dep_airport']}\u2192{out['arr_airport']}).{note}")
+
+    return summary_line
+
+
+def _cal_insert_event(service, summary, start_iso, end_iso, tzname,
+                      location=None, details=None):
+    """Low-level: insert one event. Shared by the flight tool (and reusable elsewhere)."""
+    body = {
+        "summary": summary,
+        "description": details or "",
+        "extendedProperties": {"private": {"created_by": "guppi"}},
+        "start": {"dateTime": start_iso, "timeZone": tzname},
+        "end": {"dateTime": end_iso, "timeZone": tzname},
+    }
+    if location:
+        body["location"] = location
+    service.events().insert(calendarId=FAMILY_CALENDAR_ID, body=body).execute()
 
 
 def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
@@ -1883,6 +2028,22 @@ def tools_for_role(role, is_group=False):
                             "any ambiguity."),
             "input_schema": {"type": "object", "properties": {
                 "event_id": {"type": "string"}}, "required": ["event_id"]}})
+        tools.append({
+            "name": "add_flight",
+            "description": ("Add a work/travel trip to the calendar from flight NUMBERS. "
+                            "Use when someone gives a flight number and date ('I'm on "
+                            "AA1234 July 22, back on AA1235 the 26th'). It looks up the "
+                            "real airports and times and creates a trip-block event (from "
+                            "1 hour before outbound departure through the return arrival) "
+                            "PLUS an event for each flight. Dates must be YYYY-MM-DD; infer "
+                            "the year from context if not stated. Include the return flight "
+                            "whenever it's given."),
+            "input_schema": {"type": "object", "properties": {
+                "outbound_number": {"type": "string", "description": "e.g. 'AA1234'"},
+                "outbound_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "return_number": {"type": "string"},
+                "return_date": {"type": "string", "description": "YYYY-MM-DD"}},
+                "required": ["outbound_number", "outbound_date"]}})
 
     if perms["email"]:
         tools.append({
@@ -2131,6 +2292,13 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         if not perms["calendar_write"]:
             return "Only a parent or caregiver can delete calendar events."
         return tool_delete_calendar_event(tool_input["event_id"], sender_name)
+
+    if name == "add_flight":
+        if not perms["calendar_write"]:
+            return "Only a parent or caregiver can add calendar events."
+        return tool_add_flight(
+            tool_input["outbound_number"], tool_input["outbound_date"], sender_name,
+            tool_input.get("return_number"), tool_input.get("return_date"))
 
     if name == "search_email":
         if not perms["email"]:
