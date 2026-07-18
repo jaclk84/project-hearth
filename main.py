@@ -1915,11 +1915,16 @@ def tool_delete_reminder(reminder_id, requester_chat, requester_role):
 
 
 # ---- Shared lists -----------------------------------------------------------
-def tool_add_occasion(title, kind, month, day, year=None, for_chat=None,
-                      notes=None, created_by=None):
+def tool_add_occasion(title, kind, month, day, year=None, scope="family",
+                      creator_chat=None, notes=None, created_by=None):
     """Register a special occasion that should get escalating reminders (a birthday,
     anniversary, holiday, vacation, or renewal). Annual by default; set year for a
-    one-off like a specific vacation."""
+    one-off like a specific vacation.
+
+    scope: 'family' (default) -> both parents get the nudges; 'just_me' -> only the
+    person who added it. A family birthday should be 'family' so both parents are
+    reminded; something only one parent handles (their own work travel, a renewal they
+    own) can be 'just_me'."""
     kind = (kind or "other").lower().strip()
     valid = {"birthday", "anniversary", "holiday", "vacation", "renewal", "other"}
     if kind not in valid:
@@ -1930,18 +1935,21 @@ def tool_add_occasion(title, kind, month, day, year=None, for_chat=None,
             return "That date doesn't look right - give me a month (1-12) and day (1-31)."
     except (ValueError, TypeError):
         return "I need a numeric month and day for the occasion."
+    # for_chat NULL => all parents get it (family); a specific chat => only that person.
+    for_chat = str(creator_chat) if (scope == "just_me" and creator_chat) else None
     conn = db()
     conn.execute(
         "INSERT INTO occasions (title, kind, month, day, year, for_chat, notes, "
         "created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (title, kind, month, day, year, str(for_chat) if for_chat else None,
-         notes, created_by, now_local().isoformat()))
+        (title, kind, month, day, year, for_chat, notes, created_by,
+         now_local().isoformat()))
     conn.commit(); conn.close()
     when = datetime.date(2000, month, day).strftime("%B %-d")
     yr = f", {year}" if year else " (every year)"
     lead = "90/30/7/1 days before" if kind == "vacation" else "30/7/1 days before"
-    return (f"Got it - I'll track {title} ({kind}) on {when}{yr} and remind you {lead}, "
-            f"with help when it's close.")
+    who = "just you" if for_chat else "both parents"
+    return (f"Got it - I'll track {title} ({kind}) on {when}{yr} and remind {who} "
+            f"{lead}, with help when it's close.")
 
 
 def tool_list_occasions():
@@ -2480,7 +2488,11 @@ def tools_for_role(role, is_group=False):
                          "to Disney July 20-27', 'car registration renews in October'. "
                          "kind must be one of: birthday, anniversary, holiday, vacation, "
                          "renewal, other. Give month and day as numbers; add year only for "
-                         "a one-off (a specific vacation)."),
+                         "a one-off (a specific vacation). scope: use 'family' (the "
+                         "default) for anything both parents should be reminded of - "
+                         "birthdays, anniversaries, family trips, shared renewals; use "
+                         "'just_me' only when it's something one parent alone handles. "
+                         "When unsure, prefer 'family'."),
          "input_schema": {"type": "object", "properties": {
              "title": {"type": "string"},
              "kind": {"type": "string",
@@ -2489,6 +2501,9 @@ def tools_for_role(role, is_group=False):
              "month": {"type": "integer"},
              "day": {"type": "integer"},
              "year": {"type": "integer", "description": "Only for one-off events."},
+             "scope": {"type": "string", "enum": ["family", "just_me"],
+                       "description": "family = both parents reminded (default); "
+                                      "just_me = only the person adding it."},
              "notes": {"type": "string"}},
              "required": ["title", "kind", "month", "day"]}},
         {"name": "list_occasions",
@@ -2727,7 +2742,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "add_occasion":
         return tool_add_occasion(
             tool_input["title"], tool_input["kind"], tool_input["month"],
-            tool_input["day"], tool_input.get("year"), sender_chat,
+            tool_input["day"], tool_input.get("year"),
+            tool_input.get("scope", "family"), sender_chat,
             tool_input.get("notes"), sender_name)
     if name == "list_occasions":
         return tool_list_occasions()
