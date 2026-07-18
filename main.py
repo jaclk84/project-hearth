@@ -776,7 +776,7 @@ def tool_delete_calendar_event(event_id, person=None):
     return f"Deleted {title} from the calendar."
 
 
-def _lookup_flight(flight_number, date_iso):
+def _lookup_flight(flight_number, date_iso, _retry=False):
     """Look up one flight by number + date via AeroDataBox. Returns a dict with
     departure/arrival airport codes and scheduled local ISO times, or None. Fails soft:
     any error (no key, not found, network) returns None so the caller can ask the user."""
@@ -797,12 +797,16 @@ def _lookup_flight(flight_number, date_iso):
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read())
     except urllib.error.HTTPError as e:
-        # RapidAPI puts the real reason in the body ("not subscribed", "invalid key",
-        # "not permitted for this endpoint"). Surface it so the cause is obvious.
         try:
             body = e.read().decode(errors="replace")[:300]
         except Exception:
             body = ""
+        # A 429 is a transient rate-limit (Basic plan is ~1 req/sec), not a real miss.
+        # Wait and retry once before giving up, so a throttle doesn't drop the flight.
+        if e.code == 429 and not _retry:
+            print(f"[flight] rate-limited on {fn}; retrying once")
+            time.sleep(1.5)
+            return _lookup_flight(flight_number, date_iso, _retry=True)
         print(f"[flight] lookup failed for {fn} {date_iso}: HTTP {e.code} - {body}")
         return None
     except Exception as e:
@@ -823,12 +827,23 @@ def _lookup_flight(flight_number, date_iso):
 
     def _sched_time(side):
         # AeroDataBox gives scheduledTime: {local: "2026-07-22 08:00-04:00", utc: "..."}.
+        # Google Calendar needs full ISO 8601 WITH seconds ("2026-07-22T08:00:00-04:00");
+        # a missing :SS is a 400 Bad Request. Parse it robustly and re-emit clean ISO.
         st = side.get("scheduledTime") or side.get("revisedTime") or {}
         local = st.get("local") if isinstance(st, dict) else None
         if not local:
             return None
-        # Normalize "YYYY-MM-DD HH:MM±HH:MM" -> ISO 8601 with 'T'.
-        return local.replace(" ", "T", 1)
+        s = local.strip().replace(" ", "T", 1)
+        # Split off the timezone offset (+HH:MM / -HH:MM) so we can normalize the time part.
+        m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)\s*([+-]\d{2}:?\d{2}|Z)?$", s)
+        if not m:
+            return s  # last resort: hand back what we have
+        stamp, offset = m.group(1), m.group(2) or ""
+        if stamp.count(":") == 1:      # HH:MM -> HH:MM:SS
+            stamp += ":00"
+        if offset and offset != "Z" and ":" not in offset:  # +0400 -> +04:00
+            offset = offset[:3] + ":" + offset[3:]
+        return stamp + offset
 
     return {
         "number": fn,
@@ -857,6 +872,7 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
 
     ret = None
     if return_number and return_date:
+        time.sleep(1.2)   # Basic plan allows ~1 request/sec; space the two lookups out
         ret = _lookup_flight(return_number, return_date)
         if not ret or not ret["dep_time"] or not ret["arr_time"]:
             ret = None  # we'll still add the outbound; note the return couldn't be found
