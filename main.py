@@ -1946,10 +1946,32 @@ def tool_add_occasion(title, kind, month, day, year=None, scope="family",
     conn.commit(); conn.close()
     when = datetime.date(2000, month, day).strftime("%B %-d")
     yr = f", {year}" if year else " (every year)"
-    lead = "90/30/7/1 days before" if kind == "vacation" else "30/7/1 days before"
-    who = "just you" if for_chat else "both parents"
-    return (f"Got it - I'll track {title} ({kind}) on {when}{yr} and remind {who} "
-            f"{lead}, with help when it's close.")
+    leads = _OCCASION_LEADS.get(kind, _DEFAULT_LEADS)
+    who = "just you" if for_chat else "you and your partner"
+
+    # If it was added INSIDE the normal lead window, only the milestones still ahead will
+    # fire THIS year — say so, so there's no silent surprise (a birthday added 4 days out
+    # only gets the 1-day nudge this cycle; next year it gets them all).
+    today = now_local().date()
+    nxt = _occasion_next_date(month, day, year, today)
+    remaining = [d for d in leads if nxt and (nxt - today).days <= d and (nxt - today).days >= 0]
+    all_ahead = [d for d in leads if nxt and (nxt - today).days <= d]
+    lead_str = "/".join(str(d) for d in leads)
+
+    base = (f"Got it - tracking {title} ({kind}) on {when}{yr}. "
+            f"I'll remind {who} {lead_str} days before, with help when it's close.")
+    if nxt:
+        days_away = (nxt - today).days
+        first_missed = [d for d in leads if d > days_away]
+        if first_missed and days_away >= 0 and not year:
+            got = [d for d in leads if d <= days_away]
+            got_str = (", ".join(str(d) for d in got) + "-day") if got else "no"
+            base += (f" Heads up: it's only {days_away} days away, so this year you'll just "
+                     f"get the {got_str} reminder(s) - you'll get the full set next year.")
+        elif first_missed and days_away >= 0 and year:
+            base += (f" Heads up: it's only {days_away} days away, so some of the earlier "
+                     f"reminders have already passed.")
+    return base
 
 
 def tool_list_occasions():
@@ -2954,6 +2976,11 @@ that specific tool - looking something up with a list/find tool is NOT the same 
 changing it. If you looked up an item to get its id, you must still call the delete/edit
 tool in the same turn before saying "done". If a tool failed or you didn't call it, say
 so honestly rather than claiming success.
+
+When a tool returns a confirmation with specific details - who will be reminded, which
+dates, any "heads up" caveat - relay those details faithfully. Don't soften "you and your
+partner" into "you", and don't drop a heads-up about a near date. The user needs to know
+exactly what was set up, especially who is covered.
 
 When searching email, build broad queries. Senders rarely match a plain name - mail
 "from Google" comes from addresses like no-reply@accounts.google.com.
