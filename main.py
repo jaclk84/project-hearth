@@ -3560,6 +3560,15 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
           f"{sender_name or 'UNKNOWN'} ({sender_role}) chat={who_id}"
           f"{' [overheard-offer]' if group_offer else ''}")
 
+    # LEARNING: if this person has emails flagged and awaiting an outcome, and this
+    # message engages with them, credit those senders as "acted on". Private, named
+    # adults only (matches who gets email flags). Best-effort; never fatal.
+    if not is_group and sender_name and sender_role == "adult":
+        try:
+            _resolve_acted_outcomes(sender_name, user_message)
+        except Exception as e:
+            print(f"[learning] outcome resolve failed: {e}")
+
     # Give Claude the current DATE AND TIME, with the timezone offset. Date alone is
     # not enough: "in 2 minutes", "in an hour", "tonight" all need a clock to anchor
     # to. Without this the model invents a plausible-looking time, which lands in the
@@ -3973,6 +3982,43 @@ def _record_sender_outcome(person, sender_fragment, acted):
                         key=lambda kv: kv[1]["acted"] + kv[1]["dismissed"], reverse=True)
         stats = dict(ranked[:40])
     set_setting(f"sender_stats_{person}", json.dumps(stats))
+
+
+def _pending_outcomes(person):
+    """Senders flagged in the most recent poll that haven't been resolved (acted or
+    dismissed) yet."""
+    raw = get_setting(f"pending_outcomes_{person}") or ""
+    return [s for s in raw.split("|") if s]
+
+
+def _set_pending_outcomes(person, senders):
+    """A new poll flagged `senders`. Any senders still pending from a PREVIOUS poll were
+    never engaged -> count them as dismissed, then replace the pending set with the new
+    ones. This is how 'you ignored it' becomes a signal without the user doing anything."""
+    stale = _pending_outcomes(person)
+    for s in stale:
+        _record_sender_outcome(person, s, acted=False)   # unengaged -> dismissed
+    # Store the new pending set (bounded).
+    clean = [s.strip()[:60] for s in senders if s.strip()][:20]
+    set_setting(f"pending_outcomes_{person}", "|".join(clean))
+
+
+def _resolve_acted_outcomes(person, text):
+    """Called when the person sends a message. If they're engaging with a just-flagged
+    email (asking for a reminder, calendar add, reply, etc.), credit the pending senders
+    as 'acted' and clear them. Kept deliberately simple: any substantive engagement while
+    outcomes are pending counts as acting on the flag."""
+    pending = _pending_outcomes(person)
+    if not pending:
+        return
+    t = (text or "").lower()
+    # Signals that the person is acting on the flagged email(s).
+    act_cues = ("remind", "reminder", "calendar", "add ", "yes", "reply", "draft",
+                "schedule", "set ", "pay", "rsvp", "sure", "do it", "please")
+    if any(cue in t for cue in act_cues):
+        for s in pending:
+            _record_sender_outcome(person, s, acted=True)
+        set_setting(f"pending_outcomes_{person}", "")   # resolved
 
 
 def _learned_suggestion(person):
@@ -4395,6 +4441,27 @@ def job_urgent_email_poll():
             # Remember what we've flagged (cap the stored history so it can't grow forever).
             merged = list(already | set(new_sigs))
             set_setting(seen_key, "|".join(merged[-100:]))
+            # LEARNING: record the senders we just flagged as "awaiting outcome". If the
+            # person engages with this flag (asks for a reminder/calendar/reply) before the
+            # next poll, those senders get an "acted" tally; if a later poll flags new mail
+            # and these were never engaged, they get "dismissed". This is what makes the
+            # priority model adaptive. Senders that were flagged BECAUSE they're already on
+            # the explicit priority list are skipped (no need to learn what you told us).
+            flagged_senders = [(it.get("from") or "").strip()
+                               for it in verdict.get("items", []) if it.get("from")]
+            pri = _priority_senders(name)
+            learnable = [s for s in flagged_senders
+                         if s and not any(p in s.lower() for p in pri)]
+            if learnable:
+                _set_pending_outcomes(name, learnable)
+
+        # LEARNING: if a clear pattern has emerged, offer a rule change (at most once per
+        # poll, and only when we actually messaged them, to avoid nagging out of nowhere).
+        if new_lines:
+            sug = _learned_suggestion(name)
+            if sug and not get_setting(f"suggested_{name}_{sug[:30]}"):
+                send_message(chat, sug, proactive=True)
+                set_setting(f"suggested_{name}_{sug[:30]}", "1")  # don't repeat this one
 
 
 # =============================================================================
