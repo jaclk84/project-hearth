@@ -4531,11 +4531,18 @@ def job_urgent_email_poll():
 
         # LEARNING: if a clear pattern has emerged, offer a rule change (at most once per
         # poll, and only when we actually messaged them, to avoid nagging out of nowhere).
+        # Track already-offered suggestions in ONE bounded list per person (not a settings
+        # row each — that would grow forever).
         if new_lines:
             sug = _learned_suggestion(name)
-            if sug and not get_setting(f"suggested_{name}_{sug[:30]}"):
-                send_message(chat, sug, proactive=True)
-                set_setting(f"suggested_{name}_{sug[:30]}", "1")  # don't repeat this one
+            if sug:
+                sig = sug[:40]
+                offered_raw = get_setting(f"suggested_{name}") or ""
+                offered = [s for s in offered_raw.split("||") if s]
+                if sig not in offered:
+                    send_message(chat, sug, proactive=True)
+                    offered.append(sig)
+                    set_setting(f"suggested_{name}", "||".join(offered[-30:]))  # bounded
 
 
 # =============================================================================
