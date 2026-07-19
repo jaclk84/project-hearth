@@ -62,6 +62,7 @@ import sqlite3
 import datetime
 from zoneinfo import ZoneInfo
 import base64
+import hmac
 import imaplib
 import smtplib
 import email as emaillib
@@ -116,6 +117,13 @@ TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "America/New_York"))
 #   an incoming webhook really came from Telegram and not a stranger POSTing to us.
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_SETUP_SECRET = os.environ.get("TELEGRAM_SETUP_SECRET", "")
+
+def _secret_ok(supplied):
+    """Timing-safe check of a supplied secret against TELEGRAM_SETUP_SECRET. Uses
+    hmac.compare_digest so a wrong guess can't be narrowed by response-time measurement."""
+    if not TELEGRAM_SETUP_SECRET or not supplied:
+        return False
+    return hmac.compare_digest(str(supplied), TELEGRAM_SETUP_SECRET)
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -453,7 +461,7 @@ def bind_adult(chat_id, supplied_secret):
     a free adult slot (an adult in the roster with no chat bound yet)."""
     if not TELEGRAM_SETUP_SECRET:
         return "Setup isn't configured yet. A parent needs to set the setup secret."
-    if not supplied_secret or supplied_secret != TELEGRAM_SETUP_SECRET:
+    if not _secret_ok(supplied_secret):
         print(f"[security] bad setup secret from chat {chat_id}")
         return "That setup code isn't right."
     conn = db()
@@ -3859,11 +3867,15 @@ async def telegram_webhook(request: Request):
     # so a stranger POSTing to our URL can't impersonate Telegram.
     if TELEGRAM_WEBHOOK_SECRET:
         got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if got != TELEGRAM_WEBHOOK_SECRET:
+        if not hmac.compare_digest(got, TELEGRAM_WEBHOOK_SECRET):
             print("[security] webhook secret mismatch; ignoring")
             return {"ok": True}
 
-    update = await request.json()
+    try:
+        update = await request.json()
+    except Exception:
+        print("[tg] malformed webhook body; ignoring")
+        return {"ok": True}
     message = update.get("message") or update.get("edited_message")
     if not message:
         return {"ok": True}
@@ -4580,7 +4592,7 @@ def backup_download(secret: str = ""):
     """Download a fresh DB snapshot on demand. Visit
     /backup?secret=<TELEGRAM_SETUP_SECRET>. Secret-protected because this file contains
     OAuth tokens."""
-    if not TELEGRAM_SETUP_SECRET or secret != TELEGRAM_SETUP_SECRET:
+    if not _secret_ok(secret):
         return {"ok": False, "error": "bad or missing secret"}
     snap = make_db_snapshot()
     if not snap:
@@ -4595,7 +4607,7 @@ async def restore_upload(request: Request, secret: str = "", file: UploadFile = 
     DB, so it's guarded by the setup secret AND makes a safety copy of the current DB
     first. POST the backup file as multipart 'file' to
     /restore?secret=<TELEGRAM_SETUP_SECRET>."""
-    if not TELEGRAM_SETUP_SECRET or secret != TELEGRAM_SETUP_SECRET:
+    if not _secret_ok(secret):
         return {"ok": False, "error": "bad or missing secret"}
     try:
         data = await file.read()
@@ -4609,11 +4621,26 @@ async def restore_upload(request: Request, secret: str = "", file: UploadFile = 
                 os.replace(pre, DB_PATH + ".pre-restore")
         except Exception:
             pass
-        with open(DB_PATH, "wb") as f:
+        # Write to a temp file first, verify it actually opens as a valid SQLite database,
+        # THEN atomically swap it into place with os.replace (atomic on the same
+        # filesystem). Writing directly over the live DB while connections are open risks
+        # corruption and a half-written file if interrupted. os.replace is the safe swap.
+        tmp_path = DB_PATH + ".incoming"
+        with open(tmp_path, "wb") as f:
             f.write(data)
+        try:
+            _test = sqlite3.connect(tmp_path)
+            _test.execute("PRAGMA schema_version;").fetchone()   # forces a real read
+            _test.close()
+        except Exception as e:
+            os.remove(tmp_path)
+            return {"ok": False, "error": f"uploaded file isn't a usable database: {e}"}
+        os.replace(tmp_path, DB_PATH)   # atomic swap
         print(f"[restore] database restored from upload ({len(data)} bytes)")
         return {"ok": True, "restored_bytes": len(data),
-                "note": "Database restored. The previous DB was saved as guppi.db.pre-restore."}
+                "note": ("Database restored (atomic swap). Previous DB saved as "
+                         "guppi.db.pre-restore. Restart the app so all connections pick "
+                         "up the restored file.")}
     except Exception as e:
         print(f"[restore] failed: {e}")
         return {"ok": False, "error": str(e)}
@@ -4623,7 +4650,7 @@ async def restore_upload(request: Request, secret: str = "", file: UploadFile = 
 def set_webhook(secret: str = ""):
     """One-time setup: point Telegram at this server. Visit
     /set-webhook?secret=<TELEGRAM_SETUP_SECRET> once after deploying."""
-    if not TELEGRAM_SETUP_SECRET or secret != TELEGRAM_SETUP_SECRET:
+    if not _secret_ok(secret):
         return {"ok": False, "error": "bad or missing secret"}
     payload = {"url": f"{BASE_URL}/telegram",
                "allowed_updates": ["message", "edited_message"]}
