@@ -63,7 +63,9 @@ import datetime
 from zoneinfo import ZoneInfo
 import base64
 import imaplib
+import smtplib
 import email as emaillib
+from email.mime.text import MIMEText
 from email.header import decode_header
 import urllib.request
 import urllib.parse
@@ -96,6 +98,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
 ]
 
 # The family's local timezone. Railway servers run on UTC, so without this Guppi
@@ -131,8 +134,11 @@ MS_REDIRECT_URI = f"{BASE_URL}/oauth/microsoft/callback"
 MS_AUTHORITY = "https://login.microsoftonline.com/common"
 # offline_access -> refresh token; the IMAP resource scope -> mail access.
 MS_SCOPES = ("offline_access openid email profile "
-             "https://outlook.office.com/IMAP.AccessAsUser.All")
+             "https://outlook.office.com/IMAP.AccessAsUser.All "
+             "https://outlook.office.com/SMTP.Send")
 MS_IMAP_HOST = "outlook.office365.com"
+MS_SMTP_HOST = "smtp.office365.com"
+MS_SMTP_PORT = 587
 MS_IMAP_PORT = 993
 
 # Where to get weather for the briefing (open-meteo needs no API key). Defaults to
@@ -1343,6 +1349,135 @@ def _xoauth2_string(user, token):
     return f"user={user}\x01auth=Bearer {token}\x01\x01"
 
 
+def _gmail_send(person, to_addr, subject, body, reply_headers=None):
+    """Send via the Gmail API using the person's OAuth token (needs gmail.send scope)."""
+    service = get_gmail_service(person)
+    if not service:
+        return False, "Gmail isn't connected (or needs reconnecting for send access)."
+    try:
+        msg = MIMEText(body)
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        if reply_headers:
+            # Threading a reply: reference the original so it lands in the same thread.
+            if reply_headers.get("message_id"):
+                msg["In-Reply-To"] = reply_headers["message_id"]
+                msg["References"] = reply_headers["message_id"]
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        send_body = {"raw": raw}
+        if reply_headers and reply_headers.get("thread_id"):
+            send_body["threadId"] = reply_headers["thread_id"]
+        service.users().messages().send(userId="me", body=send_body).execute()
+        return True, None
+    except Exception as e:
+        print(f"[send:gmail] failed for {person}: {e}")
+        return False, str(e)
+
+
+def _ms_smtp_send(person, to_addr, subject, body, reply_headers=None):
+    """Send via Outlook SMTP using the person's OAuth token (SASL XOAUTH2, SMTP.Send)."""
+    token = get_ms_access_token(person)
+    if not token:
+        return False, "Microsoft account isn't connected (or needs reconnecting)."
+    conn = db()
+    row = conn.execute("SELECT email_addr FROM ms_tokens WHERE person = ?",
+                       (person,)).fetchone()
+    conn.close()
+    from_addr = row["email_addr"] if row else None
+    if not from_addr:
+        return False, "No Microsoft email address on file."
+    try:
+        msg = MIMEText(body)
+        msg["From"] = from_addr
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        if reply_headers and reply_headers.get("message_id"):
+            msg["In-Reply-To"] = reply_headers["message_id"]
+            msg["References"] = reply_headers["message_id"]
+        auth = _xoauth2_string(from_addr, token)
+        import base64 as _b64
+        smtp = smtplib.SMTP(MS_SMTP_HOST, MS_SMTP_PORT, timeout=25)
+        smtp.ehlo(); smtp.starttls(); smtp.ehlo()
+        # SMTP AUTH XOAUTH2: the auth string is the same XOAUTH2 blob, base64'd.
+        code, resp = smtp.docmd("AUTH", "XOAUTH2 " +
+                                _b64.b64encode(auth.encode()).decode())
+        if code not in (235, 334):
+            smtp.quit()
+            return False, f"SMTP auth rejected ({code})."
+        smtp.sendmail(from_addr, [to_addr], msg.as_string())
+        smtp.quit()
+        return True, None
+    except Exception as e:
+        print(f"[send:ms] failed for {person}: {e}")
+        return False, str(e)
+
+
+def send_email_for(person, to_addr, subject, body, reply_headers=None):
+    """Provider-agnostic send: use whichever email account this person has connected.
+    Prefers Gmail (API) then Microsoft (SMTP). Returns (ok, error)."""
+    providers = connected_providers(person)
+    if "google" in providers:
+        ok, err = _gmail_send(person, to_addr, subject, body, reply_headers)
+        if ok:
+            return True, "google"
+    if "imap" in providers:  # imap here means the MS/live.com account
+        ok, err = _ms_smtp_send(person, to_addr, subject, body, reply_headers)
+        if ok:
+            return True, "microsoft"
+        return False, err
+    return False, "No email account is connected to send from."
+
+
+# ---- Draft-then-confirm email sending --------------------------------------
+# Guppi NEVER sends without explicit confirmation. draft_email prepares a draft and
+# stashes it here (per person); the user reviews and can edit; send_pending_email only
+# fires after they say send. In-memory, so a pending draft clears on redeploy (fine —
+# an unsent draft that survives a restart would be a surprise, not a feature).
+_PENDING_EMAIL = {}   # person -> {to, subject, body, reply_headers}
+
+def tool_draft_email(person, to_addr, subject, body, reply_headers=None):
+    """Prepare an email draft and show it to the user for approval. Does NOT send. The
+    user then says 'send it' (-> send_pending_email) or asks for changes."""
+    if not to_addr or "@" not in to_addr:
+        return ("I need a valid email address to send to. Who should this go to?")
+    _PENDING_EMAIL[person] = {
+        "to": to_addr, "subject": subject or "(no subject)",
+        "body": body, "reply_headers": reply_headers}
+    preview = (f"Here's the draft — say \"send it\" to send, or tell me what to change:\n\n"
+               f"To: {to_addr}\n"
+               f"Subject: {subject or '(no subject)'}\n\n"
+               f"{body}")
+    return preview
+
+
+def tool_send_pending_email(person):
+    """Send the draft the user just approved. Only works if there's a pending draft AND
+    the user has confirmed — Guppi must have shown the draft first via draft_email."""
+    pending = _PENDING_EMAIL.get(person)
+    if not pending:
+        return ("I don't have a draft ready to send. Tell me what you'd like to say and "
+                "who it's for, and I'll draft it first.")
+    ok, info = send_email_for(person, pending["to"], pending["subject"],
+                              pending["body"], pending.get("reply_headers"))
+    if ok:
+        _PENDING_EMAIL.pop(person, None)
+        # Record that an email was sent (feeds the priority signal later, and lets the
+        # user verify). Not the full body — just that it happened, to whom.
+        print(f"[send] {person} -> {pending['to']} via {info}")
+        return f"Sent to {pending['to']}. ✓"
+    _PENDING_EMAIL.pop(person, None)
+    return (f"I couldn't send it: {info}. This may mean the account needs reconnecting "
+            f"with send access (the email connection was set up before sending was "
+            f"enabled — reconnect to grant it).")
+
+
+def tool_discard_draft(person):
+    """Throw away a pending email draft."""
+    if _PENDING_EMAIL.pop(person, None):
+        return "Okay, I've discarded that draft."
+    return "There was no draft to discard."
+
+
 def _ms_imap_connect(person):
     """Connect to Outlook IMAP using this person's OAuth access token (XOAUTH2)."""
     token = get_ms_access_token(person)
@@ -2414,6 +2549,37 @@ def tools_for_role(role, is_group=False):
                             "'from:school field trip', 'Azie appointment')."),
             "input_schema": {"type": "object", "properties": {
                 "query": {"type": "string"}}, "required": ["query"]}})
+        tools.append({
+            "name": "draft_email",
+            "description": ("Prepare an email draft and show it to the user for approval. "
+                            "This does NOT send - it drafts and previews. Use when the "
+                            "user wants to send or reply to an email ('email the coach we'll "
+                            "be late', 'reply to the PTA that I'll volunteer'). Write a "
+                            "clear, appropriately-toned message in the user's voice. If "
+                            "replying to an email you found via read_email, pass its "
+                            "reply_headers so it threads correctly. After drafting, the "
+                            "user will say 'send it' or ask for changes - never send "
+                            "without that confirmation."),
+            "input_schema": {"type": "object", "properties": {
+                "to_addr": {"type": "string", "description": "Recipient email address."},
+                "subject": {"type": "string"},
+                "body": {"type": "string", "description": "The full message text."},
+                "reply_headers": {"type": "object", "description": (
+                    "For replies only: {message_id, thread_id} from the email being "
+                    "replied to, so it threads."), "properties": {
+                        "message_id": {"type": "string"},
+                        "thread_id": {"type": "string"}}}},
+                "required": ["to_addr", "body"]}})
+        tools.append({
+            "name": "send_pending_email",
+            "description": ("Send the draft the user just approved. Only call this after "
+                            "draft_email showed a draft AND the user clearly confirmed "
+                            "('send it', 'yes send', 'go ahead'). Never call it on your own."),
+            "input_schema": {"type": "object", "properties": {}}})
+        tools.append({
+            "name": "discard_draft",
+            "description": "Throw away the pending email draft if the user changes their mind.",
+            "input_schema": {"type": "object", "properties": {}}})
 
     # ---- Always available (shared, family-safe) ----
     tools += [
@@ -2609,6 +2775,21 @@ def tools_for_role(role, is_group=False):
                     "action": {"type": "string", "enum": ["add", "remove", "list"]},
                     "sender": {"type": "string"}}, "required": ["action"]}})
             tools.append({
+                "name": "manage_email_priorities",
+                "description": ("Control which email senders are PRIORITY (always flagged, "
+                                "even without a deadline keyword) or IGNORED (never "
+                                "flagged) for this person, and view learned patterns. Use "
+                                "when a parent says 'always flag emails from the school', "
+                                "'the coach is important', 'never flag newsletters', or "
+                                "'what are my email priorities?'. This is per-person. "
+                                "action: 'prioritize', 'ignore', 'unprioritize', "
+                                "'unignore', or 'list'. sender is a name/address fragment."),
+                "input_schema": {"type": "object", "properties": {
+                    "action": {"type": "string",
+                               "enum": ["prioritize", "ignore", "unprioritize",
+                                        "unignore", "list"]},
+                    "sender": {"type": "string"}}, "required": ["action"]}})
+            tools.append({
                 "name": "backup_now",
                 "description": ("Immediately back up Guppi's database and send the file to "
                                 "this parent's Telegram. Use when a parent says 'back up "
@@ -2653,9 +2834,11 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
 
     # HARD GUARD 2: private things never happen in the group chat, where everyone can
     # read the answer. Belt-and-braces on top of not offering the tool at all.
-    GROUP_FORBIDDEN = {"search_email", "read_email", "recall", "remember", "forget",
+    GROUP_FORBIDDEN = {"search_email", "read_email", "draft_email", "send_pending_email",
+                       "discard_draft", "recall", "remember", "forget",
                        "show_settings", "update_setting", "list_calendars",
-                       "connection_health", "manage_deadline_ignores", "backup_now"}
+                       "connection_health", "manage_deadline_ignores",
+                       "manage_email_priorities", "backup_now"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -2713,6 +2896,19 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
             return "You don't have email access."
         return tool_read_email(tool_input["query"], sender_name)
 
+    if name == "draft_email":
+        if not perms["email"]:
+            return "You don't have email access."
+        return tool_draft_email(
+            sender_name, tool_input["to_addr"], tool_input.get("subject"),
+            tool_input["body"], tool_input.get("reply_headers"))
+    if name == "send_pending_email":
+        if not perms["email"]:
+            return "You don't have email access."
+        return tool_send_pending_email(sender_name)
+    if name == "discard_draft":
+        return tool_discard_draft(sender_name)
+
     if name == "list_calendars":
         if not perms["calendar_read"]:
             return "You don't have calendar access."
@@ -2724,6 +2920,9 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return tool_connection_health(sender_name)
     if name == "manage_deadline_ignores":
         return tool_manage_deadline_ignores(tool_input["action"], tool_input.get("sender"))
+    if name == "manage_email_priorities":
+        return tool_manage_email_priorities(
+            tool_input["action"], tool_input.get("sender"), sender_name)
     if name == "show_settings":
         return tool_show_settings()
     if name == "update_setting":
@@ -3022,6 +3221,16 @@ and/or setting a reminder, and ask which they'd like. For example: "This is a de
 appointment for Charlotte on Aug 3 at 2pm at 12 Main St. Want me to add it to the calendar
 and remind you that morning?" If the date or time is ambiguous or missing, say what you
 found and ask before creating anything. Never invent a time the email doesn't give.
+
+SENDING EMAIL - confirm before sending, always. When the user wants to send or reply to an
+email, use draft_email to write it and show it to them FIRST. Never send without an explicit
+go-ahead. After you show the draft, the user may: say "send it" (then call
+send_pending_email), ask for changes (call draft_email again with the revised text - you can
+revise as many times as they want), or drop it (discard_draft). Write in a natural, warm
+tone that fits the relationship and situation - a note to a coach is casual, a note to a
+teacher is polite. For a reply, use read_email first to get the thread's context (recipient,
+subject, and the reply_headers so it threads). If you don't know the recipient's address,
+ask - never guess an email address. Keep drafts concise unless asked for more.
 
 If someone wants to CONNECT their calendar or email, the steps depend on the provider.
 The EASY path is a secure sign-in link they open in a browser - prefer it, and never send
@@ -3728,6 +3937,113 @@ def _ignored_senders():
     return [s for s in raw.split("|") if s]
 
 
+def _priority_senders(person):
+    """Sender substrings this person always wants surfaced (e.g. 'school', a coach's
+    address). Per-person, since priorities differ between parents. Lowercased."""
+    raw = get_setting(f"priority_senders_{person}") or ""
+    return [s for s in raw.split("|") if s]
+
+
+def _sender_stats(person):
+    """Per-sender outcome tallies for THIS person: how often they acted on vs. dismissed
+    flagged mail from a sender. Drives the learned nudge. Stored as a compact JSON dict."""
+    raw = get_setting(f"sender_stats_{person}")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _record_sender_outcome(person, sender_fragment, acted):
+    """Bump the acted/dismissed tally for a sender. Called when the user acts on (or
+    dismisses) something Guppi flagged. Bounded to the 40 most-active senders."""
+    if not sender_fragment:
+        return
+    key = sender_fragment.strip().lower()[:40]
+    if not key:
+        return
+    stats = _sender_stats(person)
+    rec = stats.get(key, {"acted": 0, "dismissed": 0})
+    rec["acted" if acted else "dismissed"] += 1
+    stats[key] = rec
+    if len(stats) > 40:
+        ranked = sorted(stats.items(),
+                        key=lambda kv: kv[1]["acted"] + kv[1]["dismissed"], reverse=True)
+        stats = dict(ranked[:40])
+    set_setting(f"sender_stats_{person}", json.dumps(stats))
+
+
+def _learned_suggestion(person):
+    """If outcome data clearly points one way for a sender, return a one-line suggestion
+    Guppi can offer. Conservative: needs a clear pattern, only suggests, never auto-applies."""
+    stats = _sender_stats(person)
+    ignored = set(_ignored_senders())
+    priority = set(_priority_senders(person))
+    for sender, rec in stats.items():
+        a, d = rec.get("acted", 0), rec.get("dismissed", 0)
+        if d >= 3 and a == 0 and sender not in ignored:
+            return (f"You've dismissed the last {d} flagged emails from \"{sender}\". "
+                    f"Want me to stop flagging them?")
+        if a >= 3 and d == 0 and sender not in priority:
+            return (f"You've acted on the last {a} emails from \"{sender}\". "
+                    f"Want me to always flag them as priority?")
+    return None
+
+
+def tool_manage_email_priorities(action, sender=None, person=None):
+    """Manage which senders are PRIORITY (always flag) or IGNORED (never flag) for this
+    person, and view learned patterns.
+    action: 'prioritize' | 'ignore' | 'unprioritize' | 'unignore' | 'list'."""
+    action = (action or "list").lower()
+    pri = _priority_senders(person)
+    ign = _ignored_senders()
+
+    if action == "list":
+        lines = []
+        if pri:
+            lines.append("Always flag: " + ", ".join(pri))
+        if ign:
+            lines.append("Never flag: " + ", ".join(ign))
+        if not lines:
+            lines.append("No priority or ignore rules set yet.")
+        sug = _learned_suggestion(person)
+        if sug:
+            lines.append("\n" + sug)
+        return "\n".join(lines)
+
+    if not sender:
+        return "Tell me which sender - e.g. 'always flag emails from the school'."
+    key = sender.strip().lower()
+
+    if action == "prioritize":
+        if key not in pri:
+            pri.append(key)
+            set_setting(f"priority_senders_{person}", "|".join(pri[:50]))
+        if key in ign:
+            ign = [s for s in ign if s != key]
+            set_setting("deadline_ignore_senders", "|".join(ign))
+        return f"Done - I'll always flag emails from \"{key}\" as priority."
+    if action == "ignore":
+        if key not in ign:
+            ign.append(key)
+            set_setting("deadline_ignore_senders", "|".join(ign[:50]))
+        if key in pri:
+            pri = [s for s in pri if s != key]
+            set_setting(f"priority_senders_{person}", "|".join(pri))
+        return f"Done - I'll stop flagging emails from \"{key}\"."
+    if action == "unprioritize":
+        pri = [s for s in pri if s != key]
+        set_setting(f"priority_senders_{person}", "|".join(pri))
+        return f"Okay - \"{key}\" is no longer a priority sender."
+    if action == "unignore":
+        ign = [s for s in ign if s != key]
+        set_setting("deadline_ignore_senders", "|".join(ign))
+        return f"Okay - I'll consider emails from \"{key}\" again."
+    return "I can prioritize, ignore, unprioritize, unignore, or list senders."
+
+
 def tool_manage_deadline_ignores(action, sender=None):
     """Let the family control which senders are ignored for deadline alerts.
     action: 'add' | 'remove' | 'list'. sender: a name or address fragment, e.g. 'todoist'."""
@@ -3986,15 +4302,23 @@ def job_urgent_email_poll():
         set_setting(f"last_email_id_{name}", newest)
 
         ignore = _ignored_senders()
+        priority = _priority_senders(name)
         summaries = []
+        priority_hits = []      # senders on this person's always-flag list that showed up
         for m in msgs:
             if m["id"] == last_id:
                 break
             frm = (m.get("from") or "").lower()
-            if any(bad in frm for bad in ignore):
-                continue  # family asked to ignore this sender for deadline alerts
+            is_priority = any(p in frm for p in priority)
+            # Ignore filter applies UNLESS the sender is explicitly a priority (explicit
+            # priority always wins over ignore).
+            if not is_priority and any(bad in frm for bad in ignore):
+                continue
             snip = f" - {m['snippet']}" if m.get("snippet") else ""
-            summaries.append(f"From {m['from']}: {m['subject']}{snip}")
+            tag = " [PRIORITY SENDER]" if is_priority else ""
+            summaries.append(f"From {m['from']}: {m['subject']}{snip}{tag}")
+            if is_priority:
+                priority_hits.append(m.get("from") or "")
         if not summaries:
             continue
         if not claude_call_allowed():
@@ -4011,8 +4335,13 @@ def job_urgent_email_poll():
                         f"soon).\n"
                         f"2) DEADLINES/INVOICES: due dates, payment amounts and due dates, "
                         f"RSVP-by dates, form deadlines, appointment dates.\n"
+                        f"3) PRIORITY SENDERS: any email tagged [PRIORITY SENDER] is from "
+                        f"someone this person told me to ALWAYS surface. Include it as an "
+                        f"item even if it has no explicit deadline - summarize what it's "
+                        f"about so they don't miss it.\n"
                         f"IGNORE marketing, promotions, newsletters, 'limited time offers', "
-                        f"and routine notifications — those are never urgent or deadlines.\n"
+                        f"and routine notifications — those are never urgent or deadlines "
+                        f"(UNLESS tagged [PRIORITY SENDER]).\n"
                         f"Reply with STRICT JSON only, no prose:\n"
                         f'{{"urgent": "<one short sentence, or empty>", '
                         f'"items": [{{"what": "<short description incl. amount if an '
