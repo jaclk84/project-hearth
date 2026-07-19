@@ -63,6 +63,7 @@ import datetime
 from zoneinfo import ZoneInfo
 import base64
 import hmac
+import html as html_lib
 import imaplib
 import smtplib
 import email as emaillib
@@ -202,6 +203,14 @@ PERMISSIONS = {
 def init_db():
     os.makedirs("/app/data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    # WAL lets readers and a writer proceed concurrently instead of blocking each other —
+    # important because the scheduler threads and the webhook hit the DB at the same time
+    # (M3). Set once; it persists on the database file.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+    except Exception as e:
+        print(f"[db] could not set WAL: {e}")
     # One Google token PER PERSON (keyed by their name), not one global token.
     # This is what lets Jason and Kim each connect their own account, and keeps
     # each adult's inbox private to them.
@@ -330,7 +339,10 @@ def init_db():
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout raises the busy-wait from the 5s default so overlapping writes from the
+    # scheduler threads and webhook requests wait rather than erroring "database is locked"
+    # (M3). WAL mode is set once at startup (init_db) for better read/write concurrency.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -423,13 +435,48 @@ def run_backup(reason="scheduled"):
     return "The backup was created but couldn't be sent. I'll retry next cycle."
 
 
+def _prune_old_settings(days=10):
+    """M7: dated counter/dedupe keys (count_*, cap_warned_*, occasion_fired_*,
+    flagged_deadlines_* etc.) accumulate forever otherwise. Delete ones whose embedded
+    date is older than `days`. Conservative — only touches keys with a recognizable date."""
+    import re as _re
+    cutoff = (now_local().date() - datetime.timedelta(days=days))
+    conn = db()
+    try:
+        rows = conn.execute("SELECT key FROM settings").fetchall()
+        gone = 0
+        for row in rows:
+            k = row["key"]
+            m = _re.search(r"(\d{4}-\d{2}-\d{2})", k)
+            if not m:
+                continue
+            try:
+                d = datetime.date.fromisoformat(m.group(1))
+            except ValueError:
+                continue
+            if d < cutoff:
+                conn.execute("DELETE FROM settings WHERE key = ?", (k,))
+                gone += 1
+        conn.commit()
+        if gone:
+            print(f"[cleanup] pruned {gone} old dated settings keys")
+    except Exception as e:
+        print(f"[cleanup] settings prune failed: {e}")
+    finally:
+        conn.close()
+
+
 def job_daily_backup():
-    """Once a day: push a DB snapshot to the primary parent. Wrapped so a failure is
-    logged and never destabilizes the scheduler."""
+    """Once a day: push a DB snapshot to the primary parent, and prune stale settings.
+    Wrapped so a failure is logged and never destabilizes the scheduler."""
     try:
         run_backup(reason="daily automatic")
     except Exception as e:
         print(f"[backup] daily job error: {e}")
+    try:
+        _prune_old_settings()
+    except Exception as e:
+        print(f"[cleanup] daily prune error: {e}")
 
 
 # =============================================================================
@@ -643,36 +690,68 @@ def make_flow():
     return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
 
 
-@app.get("/connect")
-def connect(person: str = ""):
-    """Connect a Google account. Visit /connect?person=Jason  (or ?person=Kim).
+def _make_oauth_state(person):
+    """A signed, unguessable state value: person + random nonce + HMAC over both, so the
+    callback can verify it originated from us (CSRF) and wasn't crafted by a stranger."""
+    import secrets as _secrets
+    nonce = _secrets.token_urlsafe(16)
+    payload = f"{person}:{nonce}"
+    sig = hmac.new(TELEGRAM_SETUP_SECRET.encode(), payload.encode(),
+                   "sha256").hexdigest()[:16]
+    return f"{payload}:{sig}"
 
-    The name rides along in Google's 'state' parameter and comes back at the
-    callback, so we know whose token we just received."""
+
+def _verify_oauth_state(state):
+    """Return the person name if the state is a valid signed token we issued, else None."""
+    try:
+        person, nonce, sig = state.split(":", 2)
+    except (ValueError, AttributeError):
+        return None
+    payload = f"{person}:{nonce}"
+    expect = hmac.new(TELEGRAM_SETUP_SECRET.encode(), payload.encode(),
+                      "sha256").hexdigest()[:16]
+    return person if hmac.compare_digest(sig, expect) else None
+
+
+@app.get("/connect")
+def connect(person: str = "", secret: str = ""):
+    """Connect a Google account. Visit /connect?person=Jason&secret=<SETUP_SECRET>.
+
+    Requires the setup secret so a stranger who finds the URL can't bind their OWN account
+    under a family member's name (which would make Guppi read the attacker's inbox). The
+    name rides in a SIGNED 'state' value, verified at the callback (CSRF protection)."""
+    if not _secret_ok(secret):
+        return HTMLResponse(
+            "<h2>Setup code required</h2><p>To connect an account, use the link a parent "
+            "set up, which includes the setup code.</p>", status_code=403)
     if not person:
         return HTMLResponse(
             "<h2>Who is connecting?</h2>"
-            "<p>Add your name to the address, for example:</p>"
-            "<p><code>/connect?person=Jason</code> &nbsp; or &nbsp; "
-            "<code>/connect?person=Kim</code></p>")
+            "<p>Add your name, e.g. <code>/connect?person=Jason&secret=YOUR_CODE</code></p>")
     flow = make_flow()
     auth_url, _ = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true",
-        state=person)
+        state=_make_oauth_state(person))
     return RedirectResponse(auth_url)
 
 
 @app.get("/oauth/callback")
 def oauth_callback(request: Request, state: str = ""):
+    # H2: only accept a state value we signed ourselves — rejects CSRF and stranger-crafted
+    # callbacks that would bind an attacker's account under a family name.
+    person = _verify_oauth_state(state)
+    if not person:
+        return HTMLResponse("<h2>This sign-in link is invalid or expired.</h2>",
+                            status_code=403)
     flow = make_flow()
     # Railway serves HTTPS at its edge but forwards internally as HTTP; the OAuth
     # library refuses non-HTTPS. Rebuild as https (it IS secure end to end).
     callback_url = str(request.url).replace("http://", "https://", 1)
     flow.fetch_token(authorization_response=callback_url)
-    person = state or "Unknown"
     save_google_token(person, flow.credentials)
     print(f"[oauth] saved Google token for {person}")
-    return HTMLResponse(f"<h2>Guppi is connected to {person}'s Google account.</h2>"
+    safe = html_lib.escape(person)
+    return HTMLResponse(f"<h2>Guppi is connected to {safe}'s Google account.</h2>"
                         "<p>You can close this window.</p>")
 
 
@@ -1279,21 +1358,27 @@ def get_ms_access_token(person):
 
 def ms_needs_reconnect(person):
     return get_setting(f"ms_dead_{person}") == "1"
-    return tok["access_token"]
 
 
 @app.get("/connect-microsoft")
-def connect_microsoft(person: str = ""):
-    """Connect a live.com/outlook account: /connect-microsoft?person=Jason"""
+def connect_microsoft(person: str = "", secret: str = ""):
+    """Connect a live.com/outlook account:
+    /connect-microsoft?person=Jason&secret=<SETUP_SECRET>. Requires the setup secret (H2)
+    so a stranger can't bind their own account under a family name."""
     if not MS_CLIENT_ID:
         return HTMLResponse("<h2>Microsoft isn't configured yet.</h2>"
                             "<p>MS_CLIENT_ID and MS_CLIENT_SECRET need to be set in Railway.</p>")
+    if not _secret_ok(secret):
+        return HTMLResponse(
+            "<h2>Setup code required</h2><p>Use the link a parent set up, which includes "
+            "the setup code.</p>", status_code=403)
     if not person:
         return HTMLResponse("<h2>Who is connecting?</h2>"
-                            "<p>For example: <code>/connect-microsoft?person=Jason</code></p>")
+                            "<p>e.g. <code>/connect-microsoft?person=Jason&secret=YOUR_CODE</code></p>")
     params = {"client_id": MS_CLIENT_ID, "response_type": "code",
               "redirect_uri": MS_REDIRECT_URI, "response_mode": "query",
-              "scope": MS_SCOPES, "state": person, "prompt": "select_account"}
+              "scope": MS_SCOPES, "state": _make_oauth_state(person),
+              "prompt": "select_account"}
     return RedirectResponse(
         f"{MS_AUTHORITY}/oauth2/v2.0/authorize?" + urllib.parse.urlencode(params))
 
@@ -1302,10 +1387,15 @@ def connect_microsoft(person: str = ""):
 def ms_callback(code: str = "", state: str = "", error: str = "",
                 error_description: str = ""):
     if error:
-        return HTMLResponse(f"<h2>Microsoft sign-in failed</h2><p>{error}: {error_description}</p>")
+        return HTMLResponse("<h2>Microsoft sign-in failed</h2><p>"
+                            + html_lib.escape(f"{error}: {error_description}") + "</p>")
     if not code:
         return HTMLResponse("<h2>No authorization code came back.</h2>")
-    person = state or "Unknown"
+    # H2: verify the signed state we issued.
+    person = _verify_oauth_state(state)
+    if not person:
+        return HTMLResponse("<h2>This sign-in link is invalid or expired.</h2>",
+                            status_code=403)
     tok = _ms_token_request({
         "client_id": MS_CLIENT_ID, "client_secret": MS_CLIENT_SECRET,
         "grant_type": "authorization_code", "code": code,
@@ -1442,7 +1532,9 @@ def send_email_for(person, to_addr, subject, body, reply_headers=None):
 # stashes it here (per person); the user reviews and can edit; send_pending_email only
 # fires after they say send. In-memory, so a pending draft clears on redeploy (fine —
 # an unsent draft that survives a restart would be a surprise, not a feature).
-_PENDING_EMAIL = {}   # person -> {to, subject, body, reply_headers}
+_PENDING_EMAIL = {}   # person -> {to, subject, body, reply_headers, turn_id}
+_CURRENT_TURN = {}    # person -> id of the message turn currently being processed
+_LAST_USER_TEXT = {}  # person -> their most recent raw message (for send-confirmation check)
 
 def tool_draft_email(person, to_addr, subject, body, reply_headers=None):
     """Prepare an email draft and show it to the user for approval. Does NOT send. The
@@ -1451,7 +1543,8 @@ def tool_draft_email(person, to_addr, subject, body, reply_headers=None):
         return ("I need a valid email address to send to. Who should this go to?")
     _PENDING_EMAIL[person] = {
         "to": to_addr, "subject": subject or "(no subject)",
-        "body": body, "reply_headers": reply_headers}
+        "body": body, "reply_headers": reply_headers,
+        "turn_id": _CURRENT_TURN.get(person)}   # H4: remember which turn drafted it
     preview = (f"Here's the draft — say \"send it\" to send, or tell me what to change:\n\n"
                f"To: {to_addr}\n"
                f"Subject: {subject or '(no subject)'}\n\n"
@@ -1459,19 +1552,41 @@ def tool_draft_email(person, to_addr, subject, body, reply_headers=None):
     return preview
 
 
-def tool_send_pending_email(person):
-    """Send the draft the user just approved. Only works if there's a pending draft AND
-    the user has confirmed — Guppi must have shown the draft first via draft_email."""
+def _looks_like_send_confirmation(text):
+    """Does the human's own message actually approve sending? Code-level gate (H4) so a
+    model can't draft-and-send in one turn on its own — a real human 'send it' is required."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    # Must be a short, affirmative send instruction — not a long new request.
+    confirmations = ("send it", "send that", "send the email", "send", "yes send",
+                     "go ahead and send", "send now", "yes, send", "ok send", "please send",
+                     "confirm", "yes", "yep", "yes please", "go ahead", "do it", "sounds good",
+                     "looks good", "perfect send")
+    return any(t == c or t.startswith(c) for c in confirmations) and len(t) <= 40
+
+
+def tool_send_pending_email(person, confirming_text=None):
+    """Send the draft the user approved. Two code-level gates (not just prompt): a pending
+    draft must exist AND have been shown in a PRIOR turn, and the human's current message
+    must actually read as a send-confirmation. This makes 'never send without confirmation'
+    a guarantee, not a suggestion."""
     pending = _PENDING_EMAIL.get(person)
     if not pending:
         return ("I don't have a draft ready to send. Tell me what you'd like to say and "
                 "who it's for, and I'll draft it first.")
+    # H4 gate 1: the draft must have been shown in an EARLIER turn, not this same one.
+    if pending.get("turn_id") == _CURRENT_TURN.get(person):
+        return ("Here's the draft above - tell me to \"send it\" and I will. (I won't send "
+                "in the same breath as drafting.)")
+    # H4 gate 2: the human's actual message must approve sending.
+    if not _looks_like_send_confirmation(confirming_text):
+        return ("Just to confirm before I send - reply \"send it\" and it'll go out, or "
+                "tell me what to change.")
     ok, info = send_email_for(person, pending["to"], pending["subject"],
                               pending["body"], pending.get("reply_headers"))
     if ok:
         _PENDING_EMAIL.pop(person, None)
-        # Record that an email was sent (feeds the priority signal later, and lets the
-        # user verify). Not the full body — just that it happened, to whom.
         print(f"[send] {person} -> {pending['to']} via {info}")
         return f"Sent to {pending['to']}. ✓"
     _PENDING_EMAIL.pop(person, None)
@@ -2914,7 +3029,7 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "send_pending_email":
         if not perms["email"]:
             return "You don't have email access."
-        return tool_send_pending_email(sender_name)
+        return tool_send_pending_email(sender_name, _LAST_USER_TEXT.get(sender_name))
     if name == "discard_draft":
         return tool_discard_draft(sender_name)
 
@@ -3473,6 +3588,31 @@ def claude_call_allowed():
     return True
 
 
+# Per-sender interactive rate limit (H1: the reply path is otherwise uncapped, so a
+# stranger who finds the bot could run up unlimited API cost). In-memory sliding window.
+_RATE = {}   # chat_id -> [timestamps]
+_RATE_WINDOW_SEC = 60
+_RATE_MAX_KNOWN = 20      # a known family member: generous
+_RATE_MAX_UNKNOWN = 5     # an unrecognized sender: tight (they get almost nothing anyway)
+
+def interactive_rate_ok(chat_id, is_known):
+    """Sliding-window per-sender limit on interactive (reply-path) messages. Returns False
+    when the sender is over their limit for the last minute."""
+    now = time.time()
+    hits = [t for t in _RATE.get(str(chat_id), []) if now - t < _RATE_WINDOW_SEC]
+    limit = _RATE_MAX_KNOWN if is_known else _RATE_MAX_UNKNOWN
+    if len(hits) >= limit:
+        return False
+    hits.append(now)
+    _RATE[str(chat_id)] = hits
+    # Opportunistic cleanup so the dict can't grow forever.
+    if len(_RATE) > 500:
+        for k in [k for k, v in _RATE.items()
+                  if not any(now - t < _RATE_WINDOW_SEC for t in v)]:
+            _RATE.pop(k, None)
+    return True
+
+
 _WEATHER_CODES = {
     0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Cloudy",
     45: "Foggy", 48: "Foggy", 51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
@@ -3650,6 +3790,12 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
             _resolve_acted_outcomes(sender_name, user_message)
         except Exception as e:
             print(f"[learning] outcome resolve failed: {e}")
+
+    # H4: mark a new processing turn for this person, so email drafting and sending can
+    # tell they're separate turns (a draft can't be sent in the same turn it was made).
+    if sender_name:
+        _CURRENT_TURN[sender_name] = f"{who_id}:{time.time()}"
+        _LAST_USER_TEXT[sender_name] = user_message
 
     # Give Claude the current DATE AND TIME, with the timezone offset. Date alone is
     # not enough: "in 2 minutes", "in an hour", "tonight" all need a clock to anchor
@@ -3870,6 +4016,12 @@ async def telegram_webhook(request: Request):
         if not hmac.compare_digest(got, TELEGRAM_WEBHOOK_SECRET):
             print("[security] webhook secret mismatch; ignoring")
             return {"ok": True}
+    else:
+        # M1: without a webhook secret, ANYONE who can POST here can forge a message as any
+        # bound chat_id and use that person's full permissions. Refuse rather than run open.
+        print("[security] TELEGRAM_WEBHOOK_SECRET is not set — refusing webhook. Set it in "
+              "Railway and re-run /set-webhook.")
+        return {"ok": True}
 
     try:
         update = await request.json()
@@ -3968,6 +4120,26 @@ async def telegram_webhook(request: Request):
             group_offer = True   # a schedulable task was mentioned; offer to help
         else:
             return {"ok": True}  # ordinary chatter — stay quiet
+
+    # ---- Cost/abuse gate (H1): before ANY Claude call or attachment download ---------
+    # An unknown sender never reaches Claude via the interactive path — they get a static
+    # reply, so a stranger who finds the bot can't run up API cost or use us as a search
+    # proxy. Known senders are rate-limited per minute as a backstop.
+    _gate_name, _gate_role = identify_sender(sender_chat_id)
+    is_known = _gate_role in ("adult", "caregiver", "child")
+    if not is_known:
+        # Unknown: no Claude, no attachment fetch. One cheap static reply, rate-limited so
+        # even that can't be spammed.
+        if interactive_rate_ok(sender_chat_id, is_known=False):
+            send_message(chat_id,
+                "Hi - I'm Guppi, a private family assistant. I only work for one family. "
+                "If you're a parent, send /start followed by your setup code; otherwise "
+                "ask a parent to add you.")
+        return {"ok": True}
+    if not interactive_rate_ok(sender_chat_id, is_known=True):
+        send_message(chat_id, "You're sending messages very quickly - give me a moment and "
+                              "try again.")
+        return {"ok": True}
 
     # ---- Photos -----------------------------------------------------------------
     image_data = image_media_type = None
@@ -4253,22 +4425,37 @@ def job_reminders():
     cheap; still respects the text cap and quiet hours."""
     if not proactive_on():
         return
-    now_iso = now_local().isoformat()
+    now = now_local()
     conn = db()
-    due = conn.execute(
-        "SELECT id, text, for_chat, due_at, repeat FROM reminders "
-        "WHERE fired = 0 AND due_at <= ?", (now_iso,)).fetchall()
+    # Pull unfired reminders and compare as PARSED aware datetimes, not as SQL strings —
+    # string comparison breaks across DST offset changes or if a timestamp lacks seconds
+    # or uses 'Z'. (M2)
+    rows = conn.execute(
+        "SELECT id, text, for_chat, due_at, repeat FROM reminders WHERE fired = 0").fetchall()
     conn.close()
-    for r in due:
+    due = []
+    for r in rows:
+        try:
+            dt = datetime.datetime.fromisoformat(r["due_at"])
+        except (ValueError, TypeError):
+            continue
+        # Treat a naive timestamp as local time so it can be compared with `now` (aware).
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TIMEZONE)
+        if dt <= now:
+            due.append((r, dt))
+    for r, due_dt in due:
         target = r["for_chat"] or _first_parent_chat()
         if not (target and send_message(target, f"Reminder: {r['text']}", proactive=True)):
             continue
-        # Sent. If recurring, reschedule to the next occurrence; else mark fired.
-        try:
-            due_dt = datetime.datetime.fromisoformat(r["due_at"])
-        except ValueError:
-            due_dt = now_local()
+        # Sent. If recurring, roll forward to the NEXT occurrence that's actually in the
+        # future — after downtime a single +1 step could still be in the past and would
+        # re-fire every minute ("storm"). Loop until it's past now. (M6)
         nxt = _next_occurrence(due_dt, r["repeat"])
+        guard = 0
+        while nxt and nxt <= now and guard < 400:
+            nxt = _next_occurrence(nxt, r["repeat"])
+            guard += 1
         conn = db()
         if nxt:
             conn.execute("UPDATE reminders SET due_at = ? WHERE id = ?",
