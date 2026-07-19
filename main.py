@@ -483,16 +483,17 @@ def welcome_message(name, role):
     intro = f"You're all set, {name}! I'm Guppi, the family assistant. "
     if role == "adult":
         body = ("Here's what I can do for you:\n"
-                "• Calendar — \"what's on this week?\", \"add Reese's game Saturday 10am\", "
-                "\"move the dentist to 3pm\", \"cancel Friday's meeting\"\n"
-                "• Reminders — \"remind me to call the plumber tomorrow at 9\", including "
-                "recurring ones\n"
-                "• Lists — \"add milk to the grocery list\", \"what lists do I have?\"\n"
-                "• Email — connect your inbox and I'll search it and flag deadlines and "
-                "invoices for you\n"
-                "• Photos — send me a flyer and I'll offer to add it to the calendar\n\n"
-                "I'll also send a short briefing each morning. Say \"help\" anytime, or "
-                "just ask me something.")
+                "• Calendar — check, add, move, or cancel events\n"
+                "• Reminders — one-time or recurring, for you or others\n"
+                "• Occasions — tell me a birthday/anniversary/trip and I'll remind you "
+                "ahead of time with gift or packing help\n"
+                "• Lists — shared grocery/to-do lists and reusable templates\n"
+                "• Email — connect your inbox and I'll search it, flag deadlines, and even "
+                "draft & send replies (I always show you first)\n"
+                "• Travel — give me a flight number and I'll build the trip on your calendar\n"
+                "• Photos & PDFs — send a school flyer and I'll pull out the events\n\n"
+                "I'll also send a morning briefing. Say \"what can you do?\" for the full "
+                "rundown with setup steps, \"help\" anytime, or just ask me something.")
     elif role == "caregiver":
         body = ("Here's what I can help with:\n"
                 "• Calendar — \"what's on the kids' schedule today?\", \"add gymnastics "
@@ -3004,35 +3005,70 @@ def capabilities_for_role(role, is_group=False):
 
     common = [
         "Calendar: \"what's on the calendar this week?\", and I can change things too - "
-        "\"move the dentist to 3pm\", \"cancel Saturday's game\".",
+        "\"move the dentist to 3pm\", \"cancel Saturday's game\". (Needs a Google Calendar "
+        "connected - a parent sets this up once.)",
         "Reminders for yourself: \"remind me to call the dentist Thursday at 10am\". "
-        "Recurring works: \"every Sunday at 7pm remind me to take out recycling\".",
+        "Recurring works: \"every Sunday at 7pm remind me to take out recycling\". You can "
+        "list and delete them too. (Nothing to set up.)",
         "Shared lists: \"add milk to the grocery list\", \"what lists do I have?\", "
         "\"check off the milk\", \"clear the grocery list\". Save a reusable one: "
-        "\"save this as my travel list\", then \"start my travel list\".",
-        "Send me a photo of a flyer or a handwritten list and I'll read it and offer to "
-        "add the event (with location and details) or save the list.",
-        "General questions and quick web lookups.",
+        "\"save this as my travel list\", then \"start my travel list\". (Nothing to set up.)",
+        "Send me a photo OR a PDF - a school flyer, permission slip, or handwritten list - "
+        "and I'll read it (even scanned ones), pull out any events/dates, check them against "
+        "the calendar, and offer to add them or save the list. (Just send the file.)",
+        "General questions and quick web lookups. (Nothing to set up.)",
     ]
     adult = [
         "Add or change calendar events: \"add Reese's game Saturday 10am\", \"move it to "
-        "11\", \"delete it\".",
+        "11\", \"delete it\". Say \"just for me\" / \"my work thing\" and I'll color it sage "
+        "so your own stuff stands out from family events.",
         "Remind other people: \"remind the girls about permission slips tomorrow 7:30am\".",
-        "Invite a family member: \"invite Breanna\" - then they send me /start.",
+        "Special occasions with early warnings: \"remember Mom's birthday is March 5\", "
+        "\"our anniversary is June 12\", \"we're going to Disney July 20-27\", \"car "
+        "registration renews in October\". I'll nudge you 30/7/1 days ahead (90/30/7/1 for "
+        "trips) and offer gift ideas or a packing list. Say \"just me\" to keep it private; "
+        "otherwise both parents get reminded. (Nothing to set up - just tell me the date.)",
+        "Travel: give me a flight number and date - \"I'm on AA1234 July 22, back AA1428 "
+        "the 29th\" - and I'll look up the real times and put the trip and both flights on "
+        "the calendar, colored sage. (A parent adds a flight-lookup key once; I'll say if "
+        "it's not set up.)",
+        "Invite a family member: \"invite Breanna\" - then they send me /start. (This is how "
+        "kids and a caregiver get added, without the setup secret.)",
     ]
-    caregiver = ["Add or change calendar events for the kids' schedule."]
-    child = ["You can check the calendar and set reminders for yourself."]
+    caregiver = [
+        "Add or change calendar events for the kids' schedule: \"add gymnastics Tuesday 4pm\".",
+        "Reminders for yourself, and shared lists.",
+    ]
+    child = ["You can check the calendar and set reminders for yourself, send me photos, "
+             "and ask me questions."]
 
     # Private-chat-only capabilities. In the group these would leak to everyone.
     private_only_adult = [
-        "Email: \"any important emails today?\", \"find the invoice from Mark\" - I search "
-        "only YOUR own inbox(es), Gmail and/or Outlook/live.com.",
-        "I watch your email and proactively flag deadlines and invoices, offering to set "
-        "reminders or add them to the calendar.",
-        "I send you a short briefing each morning and can flag urgent email.",
+        "Email search & reading: \"any important emails today?\", \"find the invoice from "
+        "Mark\", \"what does the email from the school say?\" - I search only YOUR own "
+        "inbox(es). (Needs your inbox connected: open the Google or Microsoft sign-in link "
+        "once. I'll give you the link if you're not connected.)",
+        "Email sending & replies: \"reply to the coach that we'll be late\", \"email Kim the "
+        "grocery list\". I ALWAYS draft it and show you first - nothing sends until you say "
+        "\"send it\". (Needs your inbox connected WITH send access - if you connected before "
+        "sending existed, reconnect once to grant it.)",
+        "I watch your new email and proactively flag deadlines, invoices, and RSVPs, "
+        "offering to set reminders or add them to the calendar. I skip marketing and "
+        "newsletters. (Works automatically once email is connected.)",
+        "Email priorities: \"always flag emails from the school\", \"never flag "
+        "newsletters\", \"what are my email priorities?\". I also quietly learn from what "
+        "you act on vs. ignore and will OFFER to adjust - but I only suggest, your rules "
+        "always win. (Optional - I work fine without any rules.)",
+        "A short briefing each morning - today's schedule, reminders due today, and detailed "
+        "weather. (Automatic; adjust with settings.)",
         "Check your setup: \"are my accounts connected?\"",
-        "Memory: \"remember that...\", \"what do you remember?\", \"forget that\".",
-        "Settings: \"set the daily message cap to 15\", \"turn off proactive\".",
+        "Back up the data: \"back up now\" and I'll send you the database file. I also back "
+        "up automatically every night. (Automatic.)",
+        "Memory: \"remember that Charlotte is allergic to peanuts\", \"what do you "
+        "remember?\", \"forget that\". (For facts - birthdays/dates I track as occasions "
+        "instead so they get reminders.)",
+        "Settings: \"set the daily message cap to 15\", \"turn off proactive messages\", "
+        "\"quiet hours from 9pm\".",
     ]
     private_only_all = ["Memory: \"what do you remember?\" / \"forget that\"."]
 
@@ -3052,13 +3088,20 @@ def capabilities_for_role(role, is_group=False):
 
     where = ("You are in the family GROUP chat, so only mention things that are safe for "
              "everyone to see. If someone wants email, memory, or settings, tell them to "
-             "message you privately.\n"
+             "message you privately. In the group I can also track who's doing what: "
+             "\"I'll grab Charlotte at 3\" (I'll note it), \"what's on our plate?\" (I'll "
+             "list who's got what), and I'll quietly offer to add things I overhear to the "
+             "calendar.\n"
              if is_group else "")
 
-    return (where + "When asked what you can do or for help, give a SHORT, friendly "
-            "summary of the most relevant items below - don't dump the whole list unless "
-            "asked for everything, and offer to say more. Only mention things this person "
-            "can actually do here:\n- " + "\n- ".join(lines))
+    return (where + "When asked what you can do or for help, give a friendly summary of the "
+            "most relevant items below - for a general 'what can you do?' keep it to the "
+            "highlights grouped sensibly and offer to go deeper on any area. If they ask "
+            "about EVERYTHING or a specific feature, give the full detail including what (if "
+            "anything) they need to set up first - people need to know how to actually use a "
+            "feature, not just that it exists. Be honest when something needs a one-time "
+            "setup (like connecting email) and offer to walk them through it. Only mention "
+            "things this person can actually do here:\n- " + "\n- ".join(lines))
 
 
 def build_system_prompt(sender_name, sender_role, is_group=False):
