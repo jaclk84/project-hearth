@@ -1524,7 +1524,7 @@ def _imap_connect(person):
         return None
 
 
-def _imap_snippet(msg, limit=120):
+def _imap_snippet(msg, limit=250):
     """Best-effort short preview of the plain-text body."""
     try:
         if msg.is_multipart():
@@ -1830,7 +1830,7 @@ def _gmail_search(person, query, max_results):
             h = {x["name"]: x["value"] for x in msg["payload"]["headers"]}
             out.append({"from": h.get("From", "?"),
                         "subject": h.get("Subject", "(no subject)"),
-                        "snippet": msg.get("snippet", "")[:120],
+                        "snippet": msg.get("snippet", "")[:250],
                         "id": m["id"], "provider": "google"})
         except Exception as e:
             print(f"[email:google] fetch failed: {e}")
@@ -3274,6 +3274,19 @@ tone that fits the relationship and situation - a note to a coach is casual, a n
 teacher is polite. For a reply, use read_email first to get the thread's context (recipient,
 subject, and the reply_headers so it threads). If you don't know the recipient's address,
 ask - never guess an email address. Keep drafts concise unless asked for more.
+
+WHEN YOU LIST EMAILS, don't just echo subject lines - that makes the person do all the work.
+Sort what you found into what matters and what doesn't. For each email that matters (a
+deadline, invoice, RSVP, appointment, something from a priority sender, or anything clearly
+personal/important), give a ONE-LINE gist AND the takeaway - what it's about and what it
+means for them or what they'd need to do. For example, instead of "From school | Field trip",
+say "School: permission slip for the May 3 zoo trip - due back Friday." For anything you're
+unsure is important, or where the snippet is too thin to tell, briefly read it with
+read_email so your summary is accurate rather than a guess - especially before telling
+someone an email is or isn't important. Then group the rest as a quick "and a few routine
+ones (newsletters, receipts)" line rather than listing each. Always offer to open any in full
+or act on them. The goal: they should understand what's in their inbox from your summary
+without opening anything themselves.
 
 HOW YOU DECIDE WHICH EMAILS MATTER (be able to explain this honestly if asked). You flag an
 email for someone when any of these apply: (1) it has time-sensitive content - a due date,
