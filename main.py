@@ -869,9 +869,14 @@ def tool_check_calendar(days_ahead=7, person=None):
         return "The Google account isn't connected yet."
     now = now_local()
     later = now + datetime.timedelta(days=days_ahead)
+    # Look slightly BACK as well, so an event that started earlier and is still ongoing
+    # (e.g. an overnight sleepover ending this morning) is included and can be recognized
+    # as in-progress — the action there is pickup/completion, not preparation.
+    window_start = now - datetime.timedelta(hours=18)
     try:
         result = service.events().list(
-            calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(), timeMax=later.isoformat(),
+            calendarId=FAMILY_CALENDAR_ID, timeMin=window_start.isoformat(),
+            timeMax=later.isoformat(),
             singleEvents=True, orderBy="startTime", maxResults=20).execute()
     except Exception as e:
         print(f"[cal] events.list failed: {e}")
@@ -880,9 +885,33 @@ def tool_check_calendar(days_ahead=7, person=None):
     events = result.get("items", [])
     if not events:
         return f"No events in the next {days_ahead} days."
-    return "\n".join(
-        f"{e['start'].get('dateTime', e['start'].get('date'))}: {e.get('summary','(no title)')}"
-        for e in events)
+
+    lines = []
+    for e in events:
+        start_raw = e["start"].get("dateTime", e["start"].get("date"))
+        end_raw = e.get("end", {}).get("dateTime", e.get("end", {}).get("date"))
+        summary = e.get("summary", "(no title)")
+        status = ""
+        # Work out whether the event is happening RIGHT NOW, already ended, or upcoming,
+        # so the briefing can act sensibly (pick up vs. pack for vs. head to).
+        try:
+            sdt = datetime.datetime.fromisoformat(start_raw)
+            edt = datetime.datetime.fromisoformat(end_raw) if end_raw else None
+            if sdt.tzinfo is None:
+                sdt = sdt.replace(tzinfo=TIMEZONE)
+            if edt and edt.tzinfo is None:
+                edt = edt.replace(tzinfo=TIMEZONE)
+            if edt and sdt <= now < edt:
+                status = " [IN PROGRESS NOW — started earlier, ends " + \
+                         edt.strftime("%a %-I:%M %p") + "; likely action is pickup/finish, " \
+                         "not prep]"
+            elif sdt < now and (not edt or edt <= now):
+                status = " [already ended]"
+        except (ValueError, TypeError):
+            pass
+        when = start_raw + (f" to {end_raw}" if end_raw else "")
+        lines.append(f"{when}: {summary}{status}")
+    return "\n".join(lines)
 
 
 def _cal_guard(service, person):
@@ -3629,16 +3658,29 @@ def get_weather_line():
     """A useful one-line forecast from open-meteo (no API key): condition, high/low, WHEN
     precipitation is likely (morning/afternoon/evening), and notable-weather flags (heat,
     cold, wind, storms). Best-effort; never fatal."""
+    url = (f"https://api.open-meteo.com/v1/forecast?latitude={WEATHER_LAT}"
+           f"&longitude={WEATHER_LON}"
+           f"&daily=temperature_2m_max,temperature_2m_min,weather_code,"
+           f"precipitation_probability_max,wind_speed_10m_max"
+           f"&hourly=precipitation_probability,weather_code"
+           f"&temperature_unit=fahrenheit&wind_speed_unit=mph"
+           f"&timezone=auto&forecast_days=1")
+    # A single transient 503/timeout shouldn't wipe the weather line — retry a couple
+    # times with a short backoff before giving up (this is why a briefing recently went
+    # out with no weather at all).
+    data = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                data = json.loads(r.read())
+            break
+        except Exception as e:
+            print(f"[weather] attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    if data is None:
+        return None
     try:
-        url = (f"https://api.open-meteo.com/v1/forecast?latitude={WEATHER_LAT}"
-               f"&longitude={WEATHER_LON}"
-               f"&daily=temperature_2m_max,temperature_2m_min,weather_code,"
-               f"precipitation_probability_max,wind_speed_10m_max"
-               f"&hourly=precipitation_probability,weather_code"
-               f"&temperature_unit=fahrenheit&wind_speed_unit=mph"
-               f"&timezone=auto&forecast_days=1")
-        with urllib.request.urlopen(url, timeout=8) as r:
-            data = json.loads(r.read())
         d = data["daily"]
         hi = round(d["temperature_2m_max"][0])
         lo = round(d["temperature_2m_min"][0])
@@ -4515,8 +4557,14 @@ def job_morning_briefing():
                 system=("You are Guppi. Write ONE short, plain-text good-morning briefing "
                         "for a parent, summarizing today's schedule, any reminders DUE "
                         "TODAY, and the weather. Only mention reminders that are actually "
-                        "due today or imminent - do not list far-off ones. No markdown, no "
-                        "emoji, under 300 characters. Warm but efficient."),
+                        "due today or imminent - do not list far-off ones. Reason about the "
+                        "TIMING of each event, don't just announce it: if an event is "
+                        "marked in-progress or spans overnight into today (like a sleepover "
+                        "that started yesterday), the relevant action is finishing it - a "
+                        "PICKUP or wrap-up - not preparing or packing for it. If it already "
+                        "ended, don't tell them to get ready for it. Only suggest packing/"
+                        "prep for events that haven't started yet. No markdown, no emoji, "
+                        "under 300 characters. Warm but efficient."),
                 messages=[{"role": "user", "content": context}])
             text = "".join(b.text for b in resp.content if b.type == "text").strip()
         except Exception as e:
