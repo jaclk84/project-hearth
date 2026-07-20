@@ -170,6 +170,40 @@ FLIGHT_API_HOST = os.environ.get("FLIGHT_API_HOST", "aerodatabox.p.rapidapi.com"
 TRAVEL_COLOR_ID = os.environ.get("TRAVEL_COLOR_ID", "2")
 
 
+# ---- A3: transient API failures must not throw a user's request away -----------
+# A 529 "overloaded" dropped one of Kim's messages entirely and she had to ask four times.
+# open-meteo already retried this exact class of failure; the model call - which every
+# single message depends on - had no retry at all.
+_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+_RETRYABLE_TEXT = ("overloaded", "rate limit", "rate_limit", "timeout", "timed out",
+                   "connection", "temporarily unavailable", "service unavailable")
+
+
+def claude_create(**kwargs):
+    """claude.messages.create with backoff on transient failures.
+
+    Retries 429/5xx/529 and network blips up to 4 attempts (~1.5s, 3s, 6s). A genuine
+    error - bad request, auth, context length - raises immediately rather than being
+    retried pointlessly."""
+    for attempt in range(4):
+        try:
+            return claude.messages.create(**kwargs)
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            text = str(e).lower()
+            transient = (status in _RETRYABLE_STATUS
+                         or any(t in text for t in _RETRYABLE_TEXT))
+            if not transient or attempt == 3:
+                if transient:
+                    print(f"[claude] giving up after {attempt + 1} attempts: {e}")
+                raise
+            wait = 1.5 * (2 ** attempt)
+            print(f"[claude] transient error "
+                  f"({status or type(e).__name__}) attempt {attempt + 1}/4; "
+                  f"retrying in {wait:.1f}s")
+            time.sleep(wait)
+
+
 def now_local():
     """Current time in the family's timezone — always use this, never datetime.now()."""
     return datetime.datetime.now(TIMEZONE)
@@ -423,6 +457,43 @@ def _verify_access_token(token, purpose):
         return False
     set_setting(_used_token_key(nonce), "1")
     return True
+
+
+def _connect_purpose(person):
+    """Token purpose for a connect link, bound to ONE person so a link minted for Kim can
+    never be replayed to attach somebody else's account under a different name."""
+    safe = "".join(ch for ch in (person or "").lower() if ch.isalnum())
+    return f"connect-{safe}"
+
+
+def tool_connect_link(person, kind="google"):
+    """A private, working link for one person to connect or reconnect an account.
+
+    A1: the H2 security fix made the setup secret mandatory on /connect and
+    /connect-microsoft, but every place that HANDED OUT those links kept emitting the old
+    secret-less URL. Kim clicked one and got 403 Forbidden, which is why she still can't
+    reconnect. Pasting the raw secret instead would be worse - it must never land in a
+    group chat - so the link carries a signed, single-use, person-bound token, exactly
+    like the backup link.
+
+    30 minutes rather than 15: signing in to Google or Microsoft takes longer than
+    clicking a download."""
+    if not person:
+        return "Tell me WHO is connecting (a first name) and I'll make them a link."
+    token = _make_access_token(_connect_purpose(person), minutes=30)
+    if not token:
+        return ("I can't make a secure link - the setup secret isn't configured on the "
+                "server, and that's what signs the link.")
+    k = (kind or "google").strip().lower()
+    if k in ("microsoft", "outlook", "live", "hotmail", "ms"):
+        url = f"{BASE_URL}/connect-microsoft?person={urllib.parse.quote(person)}&token={token}"
+        which = "Outlook/live.com email"
+    else:
+        url = f"{BASE_URL}/connect?person={urllib.parse.quote(person)}&token={token}"
+        which = "Google (calendar + Gmail)"
+    return (f"Here's {person}'s link to connect {which}. It works once and expires in 30 "
+            f"minutes:\n\n{url}\n\nOpen it in a browser, sign in, and approve access. "
+            f"Send this in a PRIVATE chat only - never in the family group.")
 
 
 def tool_backup_link(kind="download"):
@@ -782,6 +853,9 @@ def load_google_token(person):
     except Exception as e:
         print(f"[gtoken] {person}: could not build creds: {e}")
         return None
+    # Don't hammer a token already known to be dead - same short-circuit Microsoft has.
+    if google_needs_reconnect(person):
+        return None
     if creds and not creds.valid and creds.refresh_token:
         # Refresh whenever the creds aren't currently valid (covers 'expired' AND other
         # not-valid states), not only when flagged expired.
@@ -790,9 +864,20 @@ def load_google_token(person):
             save_google_token(person, creds)
             set_setting(f"google_dead_{person}", "")   # healthy again
         except Exception as e:
-            print(f"Token refresh failed for {person}: {e}")
-            if "invalid_grant" in str(e):
+            # A2: only invalid_grant used to count as dead, so Kim's token - which fails
+            # with invalid_scope because SCOPES gained gmail.send after she connected -
+            # retried on every scheduler tick forever (~15 times in one evening) and
+            # google_needs_reconnect() kept reporting she was fine.
+            txt = str(e).lower()
+            dead = any(k in txt for k in (
+                "invalid_grant", "invalid_scope", "invalid_client",
+                "unauthorized_client", "expired or revoked", "token has been revoked"))
+            if dead:
                 set_setting(f"google_dead_{person}", "1")
+                print(f"[gtoken] {person}: token is DEAD ({e}) - needs a reconnect; "
+                      f"staying quiet until it is fixed")
+            else:
+                print(f"Token refresh failed for {person} (transient?): {e}")
             return None
     return creds
 
@@ -846,16 +931,20 @@ def _verify_oauth_state(state):
 
 
 @app.get("/connect")
-def connect(person: str = "", secret: str = ""):
+def connect(person: str = "", secret: str = "", token: str = ""):
     """Connect a Google account. Visit /connect?person=Jason&secret=<SETUP_SECRET>.
 
     Requires the setup secret so a stranger who finds the URL can't bind their OWN account
     under a family member's name (which would make Guppi read the attacker's inbox). The
     name rides in a SIGNED 'state' value, verified at the callback (CSRF protection)."""
-    if not _secret_ok(secret):
+    # Accept EITHER the raw setup secret (bootstrapping, and older bookmarks) or a signed
+    # per-person token minted by the connect_link tool (A1).
+    if not (_secret_ok(secret) or
+            (person and _verify_access_token(token, _connect_purpose(person)))):
         return HTMLResponse(
-            "<h2>Setup code required</h2><p>To connect an account, use the link a parent "
-            "set up, which includes the setup code.</p>", status_code=403)
+            "<h2>This sign-in link is invalid or expired</h2><p>Ask Guppi for a new "
+            "connect link in a private chat - they expire after 30 minutes and work "
+            "once.</p>", status_code=403)
     if not person:
         return HTMLResponse(
             "<h2>Who is connecting?</h2>"
@@ -1244,12 +1333,19 @@ def _lookup_flight(flight_number, date_iso, _retry=False):
             offset = offset[:3] + ":" + offset[3:]
         return stamp + offset
 
-    return {
+    result = {
         "number": fn,
         "dep_airport": _airport(dep), "arr_airport": _airport(arr),
         "dep_time": _sched_time(dep), "arr_time": _sched_time(arr),
         "airline": (f.get("airline", {}) or {}).get("name", ""),
     }
+    # A5: the ONLY flight logging was on failure, so when AA5121 came back with the
+    # wrong time there was no way to tell whether the API was wrong, our timezone handling
+    # was wrong, or the model invented it. Log what we actually received.
+    print(f"[flight] {fn} {date_iso} -> dep {result.get('dep_airport')} "
+          f"{result.get('dep_time')} / arr {result.get('arr_airport')} "
+          f"{result.get('arr_time')}")
+    return result
 
 
 def tool_add_flight(outbound_number, outbound_date, person=None,
@@ -1633,17 +1729,19 @@ def ms_needs_reconnect(person):
 
 
 @app.get("/connect-microsoft")
-def connect_microsoft(person: str = "", secret: str = ""):
+def connect_microsoft(person: str = "", secret: str = "", token: str = ""):
     """Connect a live.com/outlook account:
     /connect-microsoft?person=Jason&secret=<SETUP_SECRET>. Requires the setup secret (H2)
     so a stranger can't bind their own account under a family name."""
     if not MS_CLIENT_ID:
         return HTMLResponse("<h2>Microsoft isn't configured yet.</h2>"
                             "<p>MS_CLIENT_ID and MS_CLIENT_SECRET need to be set in Railway.</p>")
-    if not _secret_ok(secret):
+    if not (_secret_ok(secret) or
+            (person and _verify_access_token(token, _connect_purpose(person)))):
         return HTMLResponse(
-            "<h2>Setup code required</h2><p>Use the link a parent set up, which includes "
-            "the setup code.</p>", status_code=403)
+            "<h2>This sign-in link is invalid or expired</h2><p>Ask Guppi for a new "
+            "connect link in a private chat - they expire after 30 minutes and work "
+            "once.</p>", status_code=403)
     if not person:
         return HTMLResponse("<h2>Who is connecting?</h2>"
                             "<p>e.g. <code>/connect-microsoft?person=Jason&secret=YOUR_CODE</code></p>")
@@ -2168,7 +2266,13 @@ def imap_unread(person, max_results=5):
     out = []
     try:
         M.select("INBOX")
-        typ, data = M.search(None, "UNSEEN")
+        # A7: UNSEEN alone matches mail from any date - anything never opened stays
+        # "new" indefinitely. SINCE bounds it to genuinely recent mail.
+        since = (now_local() - datetime.timedelta(days=3)).strftime("%d-%b-%Y")
+        typ, data = M.search(None, "UNSEEN", "SINCE", since)
+        if typ != "OK":
+            print(f"[imap] UNSEEN SINCE {since} search returned {typ}; falling back")
+            typ, data = M.search(None, "UNSEEN")
         if typ != "OK":
             return []
         ids = data[0].split()
@@ -2212,14 +2316,14 @@ def tool_connection_health(person):
         if creds:
             lines.append("Google (calendar + Gmail): connected and working.")
         elif google_needs_reconnect(person):
-            lines.append("Google (calendar + Gmail): EXPIRED - needs reconnecting at "
-                         f"{BASE_URL}/connect?person={person}")
+            lines.append("Google (calendar + Gmail): EXPIRED - needs reconnecting. Use "
+                         "the connect_link tool to give them a working link.")
         else:
             lines.append("Google (calendar + Gmail): connected but not responding right "
                          "now.")
     else:
-        lines.append("Google (calendar + Gmail): not connected. Connect at "
-                     f"{BASE_URL}/connect?person={person}")
+        lines.append("Google (calendar + Gmail): not connected. Use the connect_link "
+                     "tool to give them a working link.")
 
     # --- Microsoft / live.com ---
     conn = db()
@@ -2236,8 +2340,8 @@ def tool_connection_health(person):
             addr = has_ms["email_addr"] or "your account"
             lines.append(f"Microsoft ({addr}): connected and working.")
         elif ms_needs_reconnect(person):
-            lines.append("Microsoft (live.com): EXPIRED - needs reconnecting at "
-                         f"{BASE_URL}/connect-microsoft?person={person}")
+            lines.append("Microsoft (live.com): EXPIRED - needs reconnecting. Use the "
+                         "connect_link tool with kind='microsoft'.")
         else:
             lines.append("Microsoft (live.com): connected but not responding right now.")
 
@@ -2306,9 +2410,9 @@ def tool_read_email(query, person, max_results=3):
     or wants an event or reminder created from an email."""
     providers = connected_providers(person)
     if not providers:
-        return (f"{person} hasn't connected an email account yet. For Gmail, open "
-                f"{BASE_URL}/connect?person={person}; for Outlook/live.com, "
-                f"{BASE_URL}/connect-microsoft?person={person}.")
+        return (f"{person} hasn't connected an email account yet. Use the connect_link "
+                f"tool to give them a working link (a bare /connect URL will be refused - "
+                f"it needs the signed token that tool provides).")
 
     # Fix a malformed from: in CODE rather than trusting the description (Trap 48).
     query = _normalize_email_query(query)
@@ -2427,10 +2531,10 @@ def tool_search_email(query, person, max_results=5):
     'you have no emails', is worse than useless. Enforced in CODE, not the prompt."""
     providers = connected_providers(person)
     if not providers:
-        return (f"{person} hasn't connected an email account yet. For Gmail, open "
-                f"{BASE_URL}/connect?person={person} in a browser and sign in (this also "
-                f"connects the calendar). For Outlook/live.com, open "
-                f"{BASE_URL}/connect-microsoft?person={person} and sign in.")
+        return (f"{person} hasn't connected an email account yet. Use the connect_link "
+                f"tool to give them a working link - one for 'google' (calendar + Gmail) "
+                f"and/or one for 'microsoft' (live.com/outlook). A bare /connect URL will "
+                f"be refused; it needs the signed token that tool provides.")
 
     query = _normalize_email_query(query)
 
@@ -2542,6 +2646,54 @@ def resolve_targets(target):
     return out
 
 
+def _norm_reminder_text(t):
+    """Lowercase, strip punctuation and filler so two phrasings of the same errand match."""
+    t = re.sub(r"[^a-z0-9 ]+", " ", (t or "").lower())
+    drop = {"the", "a", "an", "to", "at", "on", "for", "and", "please", "pls",
+            "today", "tonight", "tomorrow", "remind", "reminder", "me", "us"}
+    return " ".join(w for w in t.split() if w not in drop)
+
+
+def _find_duplicate_reminder(conn, text, due_iso, chat, window_minutes=30):
+    """An unfired reminder for the same person, at ~the same time, about the same thing.
+
+    A4: Kim had to ask four times to get one pharmacy reminder set (a 529 ate the first
+    attempt), and Guppi cheerfully created it twice - same person, same 5pm, same errand.
+    Nothing checked. Matching is fuzzy because the two texts differed by one word
+    ("Stop at pharmacy..." vs "Stop at the pharmacy...")."""
+    try:
+        due = datetime.datetime.fromisoformat(due_iso)
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=TIMEZONE)
+    except (ValueError, TypeError):
+        return None
+    want = _norm_reminder_text(text)
+    if not want:
+        return None
+    want_set = set(want.split())
+    rows = conn.execute(
+        "SELECT id, text, due_at FROM reminders WHERE fired = 0 AND "
+        "(for_chat = ? OR (for_chat IS NULL AND ? IS NULL))",
+        (str(chat) if chat else None, str(chat) if chat else None)).fetchall()
+    for r in rows:
+        try:
+            other = datetime.datetime.fromisoformat(r["due_at"])
+            if other.tzinfo is None:
+                other = other.replace(tzinfo=TIMEZONE)
+        except (ValueError, TypeError):
+            continue
+        if abs((other - due).total_seconds()) > window_minutes * 60:
+            continue
+        have = _norm_reminder_text(r["text"])
+        have_set = set(have.split())
+        if not have_set:
+            continue
+        overlap = len(want_set & have_set) / max(1, min(len(want_set), len(have_set)))
+        if want == have or want in have or have in want or overlap >= 0.7:
+            return r
+    return None
+
+
 def tool_add_reminder(text, due_iso, for_chat, created_by, repeat="none"):
     # Guard: a one-time reminder set in the past fires instantly, which looks broken.
     # It almost always means the model mis-computed the time. Reject it rather than
@@ -2558,6 +2710,18 @@ def tool_add_reminder(text, due_iso, for_chat, created_by, repeat="none"):
                         f"time from that and try again.")
         except ValueError:
             return f"I couldn't read '{due_iso}' as a date and time. Use ISO 8601."
+
+    if (repeat or "none").lower() == "none":
+        _c = db()
+        try:
+            dup = _find_duplicate_reminder(_c, text, due_iso, for_chat)
+        finally:
+            _c.close()
+        if dup:
+            print(f"[reminder] duplicate suppressed (matches id={dup['id']})")
+            return (f"There's already a reminder for that at the same time: "
+                    f"'{dup['text']}' (id {dup['id']}). I did NOT add a second one - tell "
+                    f"the user it was already set rather than claiming you made a new one.")
 
     repeat = (repeat or "none").lower()
     valid = {"none", "daily", "weekly", "monthly",
@@ -2586,6 +2750,18 @@ def tool_nudge(target, text, due_iso, created_by, sender_role, repeat="none"):
                 f"send me /start.")
     repeat = (repeat or "none").lower()
     conn = db()
+    # A4: the duplicate pharmacy reminder came through THIS path, not add_reminder.
+    if repeat == "none":
+        already = []
+        for name, chat in people:
+            if _find_duplicate_reminder(conn, text, due_iso, chat):
+                already.append(name)
+        if already and len(already) == len(people):
+            conn.close()
+            print(f"[nudge] duplicate suppressed for {', '.join(already)}")
+            return (f"{' and '.join(already)} already has a reminder for that at the same "
+                    f"time - I did NOT add a second one. Say it was already set rather "
+                    f"than claiming you just made it.")
     for name, chat in people:
         conn.execute(
             "INSERT INTO reminders (text, due_at, for_chat, created_by, repeat) "
@@ -3425,6 +3601,21 @@ def tools_for_role(role, is_group=False):
                                 "replaces the previous backup in the chat."),
                 "input_schema": {"type": "object", "properties": {}}})
             tools.append({
+                "name": "connect_link",
+                "description": ("Create a working sign-in link so someone can CONNECT or "
+                                "RECONNECT an account. Use whenever anyone needs to link "
+                                "or re-link Google (calendar + Gmail) or Microsoft/"
+                                "live.com/Outlook email, or when a connection has expired. "
+                                "You CANNOT write these links yourself - a hand-typed "
+                                "/connect URL is refused by the server. person is whose "
+                                "account it is; kind is 'google' or 'microsoft'. If they "
+                                "need both, call it twice."),
+                "input_schema": {"type": "object", "properties": {
+                    "person": {"type": "string",
+                               "description": "Whose account, e.g. 'Kim'."},
+                    "kind": {"type": "string", "enum": ["google", "microsoft"]}},
+                    "required": ["person"]}})
+            tools.append({
                 "name": "backup_link",
                 "description": ("Give this parent a private, single-use, 15-minute link to "
                                 "DOWNLOAD the backup file to their own device (kind="
@@ -3481,7 +3672,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
                        "discard_draft", "recall", "remember", "forget",
                        "show_settings", "update_setting", "list_calendars",
                        "connection_health", "manage_deadline_ignores",
-                       "manage_email_priorities", "backup_now", "backup_link"}
+                       "manage_email_priorities", "backup_now", "backup_link",
+                       "connect_link"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -3565,6 +3757,9 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return run_backup(reason="you asked")
     if name == "backup_link":
         return tool_backup_link(tool_input.get("kind", "download"))
+    if name == "connect_link":
+        return tool_connect_link(tool_input.get("person") or sender_name,
+                                 tool_input.get("kind", "google"))
     if name == "connection_health":
         return tool_connection_health(sender_name)
     if name == "manage_deadline_ignores":
@@ -3841,6 +4036,12 @@ at 3"). When one person offers to do a task ("I'll grab Charlotte") and another 
 remember it, set the reminder for the person who committed and name them. Never assume a
 "remind me" belongs to anyone but the person who said it.
 
+DON'T ASK WHAT YOU'VE ALREADY BEEN TOLD. If the person, the time and the task are all
+present ("remind Jason at 5 today to pick up the prescription"), just do it and confirm.
+Ask a clarifying question ONLY when something needed is genuinely missing or ambiguous -
+not to double-check a request that was already complete. Someone who has to repeat
+themselves stops trusting you, and asking again is not the same as being careful.
+
 CLOSING THE LOOP: when you set a reminder or add an event from a group conversation,
 confirm it plainly so both people see it's handled and who owns it. If a task was raised
 but nobody has clearly taken it, you may offer once to set a reminder - but do not nag or
@@ -4050,19 +4251,23 @@ If someone wants to CONNECT their calendar or email, the steps depend on the pro
 The EASY path is a secure sign-in link they open in a browser - prefer it, and never send
 someone hunting for app passwords when a link will do.
 
-- Google (Calendar AND Gmail together - ONE sign-in covers both, because they share the
-  same Google account): tell them to open this link in a browser and sign in (replace NAME
-  with their first name):
-  "https://web-production-5fa1fd.up.railway.app/connect?person=NAME"
-  They may see a "Google hasn't verified this app" screen - that's expected for a private
-  family app; they click Advanced, then "Go to Guppi..." then Allow. This single link
-  connects BOTH their calendar and their Gmail. Do NOT tell a Google/Gmail user to create
-  an app password - that is not needed and sends them in circles.
+NEVER TYPE A CONNECT URL YOURSELF. A hand-written /connect link is REFUSED by the server
+(403) because it lacks the signed token - someone was sent one and it simply didn't work.
+Call the connect_link tool instead and send exactly the link it returns.
 
-- Outlook / live.com / hotmail: a secure Microsoft sign-in. Tell them to open this link in
-  a browser and sign in (replace NAME with their first name):
-  "https://web-production-5fa1fd.up.railway.app/connect-microsoft?person=NAME". Do NOT ask
-  for a Microsoft password in chat - personal Microsoft accounts no longer allow that.
+- Google (Calendar AND Gmail together - ONE sign-in covers both, because they share the
+  same Google account): call connect_link with kind='google' for that person and give them
+  the link it returns. They may see a "Google hasn't verified this app" screen - that's
+  expected for a private family app; they click Advanced, then "Go to Guppi..." then Allow.
+  Do NOT tell a Google/Gmail user to create an app password - it isn't needed and sends
+  them in circles.
+
+- Outlook / live.com / hotmail: call connect_link with kind='microsoft'. Do NOT ask for a
+  Microsoft password in chat - personal Microsoft accounts no longer allow that.
+
+- These links are PRIVATE: they are single-use and person-bound, but still never post one
+  in the family group. If someone asks in the group how to reconnect, say you'll send it to
+  them directly and use their private chat.
 
 - App passwords are a LAST RESORT, only for a non-Google, non-Microsoft IMAP provider (or
   if someone truly can't use the Google link). Only then: /connectemail their@email.com
@@ -4281,15 +4486,17 @@ def _fetch_weather(days=1):
            f"&hourly=precipitation_probability,weather_code"
            f"&temperature_unit=fahrenheit&wind_speed_unit=mph"
            f"&timezone=auto&forecast_days={days}")
-    for attempt in range(3):
+    # C2: two of three attempts failed on 2026-07-19 and the briefing only just survived.
+    # open-meteo 503s in bursts, so give it a fourth try and a longer tail.
+    for attempt in range(4):
         try:
             with urllib.request.urlopen(url, timeout=8) as r:
                 return json.loads(r.read())
         except Exception as e:
             print(f"[weather] attempt {attempt + 1} failed: {e}")
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-    print(f"[weather] gave up after 3 attempts (lat={WEATHER_LAT} lon={WEATHER_LON})")
+            if attempt < 3:
+                time.sleep(1.5 * (2 ** attempt))
+    print(f"[weather] gave up after 4 attempts (lat={WEATHER_LAT} lon={WEATHER_LON})")
     return None
 
 
@@ -4550,6 +4757,12 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     messages = history + [this_turn]
 
     tools = tools_for_role(sender_role, is_group)
+    # B4: in overheard mode the prompt says "do NOT record or add anything - just offer",
+    # and it added things anyway, twice. The mode exists so a passing remark can't become
+    # a real calendar event, so enforce it the only way that actually holds: hand over no
+    # tools at all. An offer is one sentence; it needs none.
+    if group_offer:
+        tools = []
     system = build_system_prompt(sender_name, sender_role, is_group)
 
     tools_ran = []
@@ -4562,7 +4775,7 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     # short replies and rescues the few long ones.
     max_out = 3000
     for _ in range(6):
-        response = claude.messages.create(
+        response = claude_create(
             model=MODEL, max_tokens=max_out, system=system, tools=tools, messages=messages)
 
         if response.stop_reason not in ("end_turn", "tool_use", "stop_sequence"):
@@ -4698,7 +4911,7 @@ def _group_scheduling_intent(text):
     if not claude_call_allowed():
         return False
     try:
-        resp = claude.messages.create(
+        resp = claude_create(
             model=MODEL, max_tokens=5,
             system=("Decide if this ONE message from a family group chat is either (a) a "
                     "specific event/appointment/task with a time someone might want on a "
@@ -4730,10 +4943,32 @@ def _in_reply_window(group_chat_id, person_id):
     return bool(ts) and (time.time() - ts) < _GROUP_REPLY_SECONDS
 
 
+# B1/B2: the bot's name was matched with startswith("guppi"), so "Guppy" (Kim's spelling)
+# was ignored outright and "Also guppi can you..." was demoted to overheard mode. Match
+# the name ANYWHERE in the message, and accept the obvious misspellings of a made-up word.
+_BOT_NAMES = ("guppi", "guppy", "gupi", "guppie", "gupppi", "guppii")
+
+
+def _mentions_bot_name(text):
+    t = (text or "").lower()
+    return any(re.search(rf"\b{n}\b", t) for n in _BOT_NAMES)
+
+
+# B3: things only an assistant would be asked about. Used ONLY to promote a QUESTION to
+# "addressed" - never on its own - so ordinary family chatter still doesn't wake Guppi.
+_ASSISTANT_TOPICS = (
+    "calendar", "remind", "reminder", "schedule", "appointment", "event",
+    "reconnect", "connect", "my email", "our email", "inbox", "grocery list",
+    "shopping list", "the list", "weather", "forecast", "backup", "back up")
+
+
 def _is_question_for_guppi(text):
-    """A direct question the assistant should answer even without being named — the kind
-    only Guppi would field in a family group ('what's on our plate?', 'what's on the
-    calendar?', 'who's got what?', 'any reminders?')."""
+    """A direct question the assistant should answer even without being named.
+
+    Two ways in: a stock phrase only Guppi would field ("what's on our plate?"), or a
+    QUESTION that mentions something only Guppi does ("can you tell Kim how to reconnect
+    her calendar?" - which was ignored until Jason shouted the name). Requiring both
+    question-shape AND an assistant topic keeps Guppi out of ordinary conversation."""
     if not text:
         return False
     t = text.strip().lower()
@@ -4743,7 +4978,13 @@ def _is_question_for_guppi(text):
                 "what are our", "what's on our", "whats on our", "our reminders",
                 "our schedule", "what's scheduled", "whats scheduled",
                 "what's on my", "whats on my", "what do we have")
-    return any(g in t for g in triggers)
+    if any(g in t for g in triggers):
+        return True
+    looks_like_question = (
+        t.endswith("?")
+        or t.startswith(("can you", "could you", "would you", "will you", "are you able",
+                         "can u", "please can", "do you know", "are you")))
+    return looks_like_question and any(k in t for k in _ASSISTANT_TOPICS)
 
 
 def _is_addressed(text, message, bot_username):
@@ -4761,7 +5002,7 @@ def _is_addressed(text, message, bot_username):
     reply_to = message.get("reply_to_message") or {}
     if (reply_to.get("from") or {}).get("is_bot"):
         return True
-    if t.lower().startswith("guppi"):
+    if _mentions_bot_name(t):
         return True
     if _is_question_for_guppi(t):
         return True
@@ -4880,7 +5121,9 @@ async def telegram_webhook(request: Request):
         elif _group_scheduling_intent(text):
             group_offer = True   # a schedulable task was mentioned; offer to help
         else:
-            return {"ok": True}  # ordinary chatter — stay quiet
+            print(f"[tg] group chatter from {sender_chat_id} - not addressed, staying "
+                  f"quiet: {text[:50]!r}")
+            return {"ok": True}
 
     # ---- Cost/abuse gate (H1): before ANY Claude call or attachment download ---------
     # An unknown sender never reaches Claude via the interactive path — they get a static
@@ -4891,6 +5134,7 @@ async def telegram_webhook(request: Request):
     if not is_known:
         # Unknown: no Claude, no attachment fetch. One cheap static reply, rate-limited so
         # even that can't be spammed.
+        print(f"[security] unknown sender {sender_chat_id}; static reply only")
         if interactive_rate_ok(sender_chat_id, is_known=False):
             send_message(chat_id,
                 "Hi - I'm Guppi, a private family assistant. I only work for one family. "
@@ -4898,6 +5142,7 @@ async def telegram_webhook(request: Request):
                 "ask a parent to add you.")
         return {"ok": True}
     if not interactive_rate_ok(sender_chat_id, is_known=True):
+        print(f"[tg] RATE LIMITED {sender_chat_id} - told them to slow down")
         send_message(chat_id, "You're sending messages very quickly - give me a moment and "
                               "try again.")
         return {"ok": True}
@@ -4955,6 +5200,18 @@ async def telegram_webhook(request: Request):
     # "yes"/"actually 4:40") is treated as a reply to Guppi and won't be dropped.
     if is_group and reply:
         _open_reply_window(chat_id, sender_chat_id)
+        # B5: the window was opened ONLY for the person who spoke. Kim asked Guppi to
+        # remind Jason, Guppi asked a clarifying question, JASON answered "Yes I'm here" -
+        # and it was dropped, because the window belonged to Kim. If the reply names other
+        # family members, they are part of the conversation too.
+        try:
+            for _n, _c in _adults_with_chats():
+                if _c and str(_c) != str(sender_chat_id) and \
+                        re.search(rf"\b{re.escape(_n)}\b", reply, re.I):
+                    _open_reply_window(chat_id, _c)
+                    print(f"[tg] reply window also opened for {_n} (named in the reply)")
+        except Exception as e:
+            print(f"[tg] could not widen reply window: {e}")
     return {"ok": True}
 
 
@@ -5255,43 +5512,174 @@ def reminders_for_briefing(for_chat=None, horizon_hours=36):
     return "\n".join(out) if out else "None due today."
 
 
+def _briefing_calendar():
+    """The calendar for a briefing, grouped under explicit day headings.
+
+    A6b: the briefing used to be handed tool_check_calendar(days_ahead=1), whose window is
+    (now - 18h) to (now + 1 day) - at a 6am Monday briefing that is SUNDAY NOON through
+    TUESDAY 6AM, roughly 42 hours, printed under the heading "Today's calendar" with raw
+    ISO timestamps and no day boundaries. No wonder it "hit various timeframes": nothing
+    in its input distinguished yesterday from today from tomorrow.
+
+    The 18-hour lookback stays - it is what lets an overnight sleepover be recognised as
+    in-progress - but events are now labelled by day, and anything already finished is
+    dropped rather than left as noise."""
+    service = get_calendar_service()
+    if not service:
+        return "CALENDAR: not available right now."
+    now = now_local()
+    today = now.date()
+    tomorrow = today + datetime.timedelta(days=1)
+    try:
+        result = service.events().list(
+            calendarId=FAMILY_CALENDAR_ID,
+            timeMin=(now - datetime.timedelta(hours=18)).isoformat(),
+            timeMax=(now + datetime.timedelta(days=2)).isoformat(),
+            singleEvents=True, orderBy="startTime", maxResults=40).execute()
+    except Exception as e:
+        print(f"[briefing] calendar read failed: {e}")
+        return "CALENDAR: could not be read this morning."
+
+    buckets = {"IN PROGRESS RIGHT NOW": [], "TODAY": [], "TOMORROW": []}
+    for e in result.get("items", []):
+        start_raw = e["start"].get("dateTime", e["start"].get("date"))
+        end_raw = e.get("end", {}).get("dateTime", e.get("end", {}).get("date"))
+        summary = e.get("summary", "(no title)")
+        loc = f" @ {e['location']}" if e.get("location") else ""
+        try:
+            sdt = datetime.datetime.fromisoformat(start_raw)
+            if sdt.tzinfo is None:
+                sdt = sdt.replace(tzinfo=TIMEZONE)
+            edt = None
+            if end_raw:
+                edt = datetime.datetime.fromisoformat(end_raw)
+                if edt.tzinfo is None:
+                    edt = edt.replace(tzinfo=TIMEZONE)
+        except (ValueError, TypeError):
+            continue
+
+        if edt and edt <= now:
+            continue                       # already over - not briefing material
+        span = sdt.strftime("%-I:%M %p") + (f" to {edt.strftime('%-I:%M %p')}" if edt else "")
+        if edt and sdt <= now < edt:
+            buckets["IN PROGRESS RIGHT NOW"].append(
+                f"  - {summary}{loc} (started {sdt.strftime('%a %-I:%M %p')}, ends "
+                f"{edt.strftime('%a %-I:%M %p')}) - it is ALREADY UNDERWAY, so the action "
+                f"is finishing or collecting, never preparing")
+        elif sdt.date() == today:
+            buckets["TODAY"].append(f"  - {span}: {summary}{loc}")
+        elif sdt.date() == tomorrow:
+            buckets["TOMORROW"].append(f"  - {span}: {summary}{loc}")
+
+    out = []
+    for head in ("IN PROGRESS RIGHT NOW", "TODAY", "TOMORROW"):
+        items = buckets[head]
+        if head == "TODAY" and not items:
+            out.append("TODAY: nothing on the calendar.")
+        elif items:
+            out.append(f"{head}:\n" + "\n".join(items))
+    return "\n\n".join(out) if out else "TODAY: nothing on the calendar."
+
+
+def _briefing_reminders(chat):
+    """Reminders split into today and tomorrow, instead of 36 hours labelled 'due today'.
+
+    A6c: reminders_for_briefing(horizon_hours=36) at 6am Monday reaches 6pm TUESDAY, and
+    every one of them was printed under the heading "Reminders due today" - so tomorrow's
+    reminders were announced as today's."""
+    now = now_local()
+    today = now.date()
+    tomorrow = today + datetime.timedelta(days=1)
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT text, due_at FROM reminders WHERE fired = 0 "
+            "AND (for_chat = ? OR for_chat IS NULL) ORDER BY due_at",
+            (str(chat),)).fetchall()
+    finally:
+        conn.close()
+    today_l, tom_l = [], []
+    for r in rows:
+        try:
+            due = datetime.datetime.fromisoformat(r["due_at"])
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=TIMEZONE)
+        except (ValueError, TypeError):
+            continue
+        if due < now:
+            continue
+        if due.date() == today:
+            today_l.append(f"  - {due.strftime('%-I:%M %p')}: {r['text']}")
+        elif due.date() == tomorrow:
+            tom_l.append(f"  - {due.strftime('%-I:%M %p')}: {r['text']}")
+    parts = []
+    parts.append("REMINDERS DUE TODAY:\n" + "\n".join(today_l) if today_l
+                 else "REMINDERS DUE TODAY: none.")
+    if tom_l:
+        parts.append("REMINDERS DUE TOMORROW (mention only if it needs prep today):\n"
+                     + "\n".join(tom_l))
+    return "\n\n".join(parts)
+
+
 def job_morning_briefing():
-    """6am: one short briefing to each parent — calendar + TODAY's reminders + weather.
-    Reminders are scoped to today/imminent so a Saturday briefing doesn't list Tuesday's
-    recurring recycling."""
+    """6am: one short briefing to each parent.
+
+    Rebuilt after 2026-07-19, where it "hit various timeframes" and couldn't work out what
+    events actually were. Four causes, all in what it was FED rather than how it reasoned:
+
+      A6a - it was never told the date or the time. ask_guppi injects a clock into every
+            interactive message precisely because "the model invents a plausible-looking
+            time" without one; the briefing, which is entirely about time, had neither.
+      A6b - "Today's calendar" actually held ~42 hours (see _briefing_calendar).
+      A6c - "Reminders due today" actually held 36 hours (see _briefing_reminders).
+      A6d - a 300-CHARACTER limit, which is about two sentences: no room to say which day
+            something falls on, let alone reason about it.
+    """
     if not proactive_on() or in_quiet_hours():
         return
-    calendar = tool_check_calendar(days_ahead=1)
+    calendar = _briefing_calendar()
     weather = get_weather_line()
+    now = now_local()
+    when = (f"Right now it is {now.strftime('%-I:%M %p')} on "
+            f"{now.strftime('%A, %B %-d, %Y')}. TODAY means {now.strftime('%A %B %-d')}; "
+            f"TOMORROW means {(now + datetime.timedelta(days=1)).strftime('%A %B %-d')}.")
 
     for name, chat in _adults_with_chats():
         if not claude_call_allowed():
             return
-        reminders = reminders_for_briefing(for_chat=chat)
-        context = (f"Today's calendar:\n{calendar}\n\nReminders due today:\n{reminders}\n\n"
+        reminders = _briefing_reminders(chat)
+        context = (f"{when}\n\n{calendar}\n\n{reminders}\n\n"
                    f"{weather or 'WEATHER: unavailable - could not be fetched.'}")
         try:
-            resp = claude.messages.create(
-                model=MODEL, max_tokens=300,
-                system=("You are Guppi. Write ONE short, plain-text good-morning briefing "
-                        "for a parent, summarizing today's schedule, any reminders DUE "
-                        "TODAY, and the weather. If the weather line says unavailable, "
-                        "omit weather from the briefing entirely - NEVER invent a "
-                        "forecast, temperature, or chance of rain. Only mention "
-                        "reminders that are actually "
-                        "due today or imminent - do not list far-off ones. Reason about the "
-                        "TIMING of each event, don't just announce it: if an event is "
-                        "marked in-progress or spans overnight into today (like a sleepover "
-                        "that started yesterday), the relevant action is finishing it - a "
-                        "PICKUP or wrap-up - not preparing or packing for it. If it already "
-                        "ended, don't tell them to get ready for it. Only suggest packing/"
-                        "prep for events that haven't started yet. No markdown, no emoji, "
-                        "under 300 characters. Warm but efficient."),
+            resp = claude_create(
+                model=MODEL, max_tokens=1000,
+                system=("You are Guppi. Write ONE good-morning briefing for a parent, in "
+                        "plain text. You are given the current date and time - use them, "
+                        "and never describe something as today when the input puts it "
+                        "under TOMORROW.\n\n"
+                        "Cover, in this order: what is happening TODAY with times; "
+                        "anything IN PROGRESS RIGHT NOW (the action there is finishing or "
+                        "collecting, never preparing - do not tell someone to pack for a "
+                        "thing their child already left for); reminders due today; and the "
+                        "weather. Mention tomorrow ONLY if it needs doing something today. "
+                        "If the weather line says unavailable, omit weather entirely - "
+                        "NEVER invent a forecast.\n\n"
+                        "Be specific and think about what each event actually MEANS for "
+                        "the day: note when things collide, when a gap is too tight to get "
+                        "between them, and what has to leave the house with someone. Say "
+                        "the useful thing rather than listing entries.\n\n"
+                        "No markdown, no emoji. Aim for 400-700 characters - short enough "
+                        "to read at a glance, long enough to be specific. Warm but "
+                        "efficient."),
                 messages=[{"role": "user", "content": context}])
             text = "".join(b.text for b in resp.content if b.type == "text").strip()
         except Exception as e:
-            print(f"[briefing] Claude failed: {e}")
+            print(f"[briefing] Claude failed for {name}: {e}")
             continue
+        if not text:
+            print(f"[briefing] empty briefing for {name}; skipping")
+            continue
+        print(f"[briefing] sent to {name} ({len(text)} chars)")
         send_message(chat, text, proactive=True)
 
 
@@ -5328,7 +5716,7 @@ def job_weekly_digest():
                      f"they need to know (their practices, events, school things). Do not "
                      f"list other family members' private appointments. No markdown/emoji.")
         try:
-            resp = claude.messages.create(
+            resp = claude_create(
                 model=MODEL, max_tokens=300,
                 system="You are Guppi. " + instr,
                 messages=[{"role": "user",
@@ -5351,8 +5739,11 @@ def _poll_unread(person):
         service = get_gmail_service(person)
         if service:
             try:
+                # A7: no date filter meant week-old unread mail was announced as "your
+                # new email" forever, along with deadlines that had already passed.
                 res = service.users().messages().list(
-                    userId="me", q="is:unread category:primary", maxResults=5).execute()
+                    userId="me", q="is:unread category:primary newer_than:3d",
+                    maxResults=5).execute()
                 for m in res.get("messages", []):
                     md = service.users().messages().get(
                         userId="me", id=m["id"], format="metadata",
@@ -5415,7 +5806,7 @@ def job_urgent_email_poll():
 
         today = now_local().strftime("%A, %B %d, %Y")
         try:
-            resp = claude.messages.create(
+            resp = claude_create(
                 model=MODEL, max_tokens=350,
                 system=(f"You are Guppi, scanning a family member's NEW unread emails. "
                         f"Today is {today}. Look for two kinds of things:\n"
