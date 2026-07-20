@@ -1081,8 +1081,17 @@ def tool_find_events(query=None, days_ahead=30, person=None):
     for e in events:
         start = e["start"].get("dateTime", e["start"].get("date"))
         loc = f" @ {e['location']}" if e.get("location") else ""
-        lines.append(f"id={e['id']} | {start} | {e.get('summary','(no title)')}{loc}")
-    return ("Matching events (use the id to edit or delete):\n" + "\n".join(lines))
+        # An instance of a repeating event has its own id: deleting it removes ONLY that
+        # day. Flag it so Guppi can ask "just this one, or the whole series?" rather than
+        # silently removing one of four camp days and reporting the job done.
+        series = " | REPEATING SERIES (this id is one occurrence)" if e.get(
+            "recurringEventId") else ""
+        lines.append(
+            f"id={e['id']} | {start} | {e.get('summary','(no title)')}{loc}{series}")
+    return ("Matching events (use the id to edit or delete). If an event is marked "
+            "REPEATING SERIES, ask whether they mean just that day or all of them - "
+            "pass whole_series=true to delete_calendar_event for all of them.\n"
+            + "\n".join(lines))
 
 
 def tool_edit_calendar_event(event_id, person=None, summary=None, start_iso=None,
@@ -1124,26 +1133,45 @@ def tool_edit_calendar_event(event_id, person=None, summary=None, start_iso=None
     return f"Updated '{updated.get('summary','(no title)')}' — now {when}."
 
 
-def tool_delete_calendar_event(event_id, person=None):
-    """Delete an event by id (from find_events)."""
+def tool_delete_calendar_event(event_id, person=None, whole_series=False):
+    """Delete an event by id (from find_events).
+
+    whole_series matters for repeating events: find_events returns one id PER OCCURRENCE,
+    so deleting that id removes a single day. Deleting the series means deleting the
+    parent event, which Google exposes as `recurringEventId` on each instance."""
     service = get_calendar_service(person)
     err = _cal_guard(service, person)
     if err:
         return err
-    # Fetch the title first so the confirmation is meaningful.
+    # Fetch the title first so the confirmation is meaningful - and, for a repeating
+    # event, find the parent id before we delete the instance that points at it.
     title = "the event"
+    parent_id = None
     try:
         ev = service.events().get(calendarId=FAMILY_CALENDAR_ID,
                                   eventId=event_id).execute()
         title = f"'{ev.get('summary','(no title)')}'"
+        parent_id = ev.get("recurringEventId")
     except Exception:
         pass
+
+    target, scope = event_id, "that event"
+    if whole_series:
+        if parent_id:
+            target, scope = parent_id, "every occurrence of that repeating event"
+        else:
+            scope = "that event (it wasn't part of a repeating series)"
+
     try:
-        service.events().delete(calendarId=FAMILY_CALENDAR_ID,
-                                eventId=event_id).execute()
+        service.events().delete(calendarId=FAMILY_CALENDAR_ID, eventId=target).execute()
     except Exception as e:
-        print(f"[cal] delete failed: {e}")
+        print(f"[cal] delete failed (target={target}, series={whole_series}): {e}")
         return "I couldn't delete that - it may already be gone. Try finding it again."
+    if whole_series and parent_id:
+        return f"Deleted {title} - the whole repeating series, not just one day."
+    if parent_id:
+        return (f"Deleted one occurrence of {title}. It repeats, so the other dates are "
+                f"still there - say so if you want the whole series gone.")
     return f"Deleted {title} from the calendar."
 
 
@@ -1305,6 +1333,58 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
     return summary_line
 
 
+# How a plain-English repeat maps to an iCalendar rule. Kept small on purpose - these
+# cover school/sport/camp patterns, which is all a family calendar needs.
+_REPEAT_RULES = {
+    "daily":    "FREQ=DAILY",
+    "weekdays": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+    "weekly":   "FREQ=WEEKLY",
+    "monthly":  "FREQ=MONTHLY",
+}
+# If the model asks for a repeat but gives no end, cap it rather than writing an event that
+# recurs forever on the family calendar. Generous enough to be useful, bounded enough that
+# a mistake is a nuisance instead of a cleanup project.
+_REPEAT_DEFAULT_COUNT = {"daily": 14, "weekdays": 20, "weekly": 52, "monthly": 12}
+
+
+def _build_recurrence(repeat, count=None, until=None):
+    """Turn a plain repeat description into a Google Calendar RRULE list, or None.
+
+    One recurring event beats N near-identical ones. A 4-day camp used to be four separate
+    add_calendar_event calls, each re-emitting the whole details block - which is what
+    pushed a single turn past the model's output ceiling (Trap 65). It also makes a
+    tidier calendar: one series instead of four unrelated-looking entries."""
+    if not repeat or str(repeat).strip().lower() in ("", "none"):
+        return None
+    key = str(repeat).strip().lower()
+    base = _REPEAT_RULES.get(key)
+    if not base:
+        print(f"[calendar] unknown repeat {repeat!r}; adding a single event instead")
+        return None
+    rule = f"RRULE:{base}"
+
+    if until:
+        try:
+            d = datetime.date.fromisoformat(str(until)[:10])
+            # UNTIL is UTC. Use end-of-day LOCAL so the final day is actually included -
+            # a bare date would cut the last occurrence off in an eastern timezone.
+            end_local = datetime.datetime(d.year, d.month, d.day, 23, 59, 59,
+                                          tzinfo=TIMEZONE)
+            return [rule + ";UNTIL=" + end_local.astimezone(
+                datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")]
+        except (ValueError, TypeError):
+            print(f"[calendar] bad repeat_until {until!r}; falling back to a count")
+
+    try:
+        n = int(count) if count is not None else 0
+    except (ValueError, TypeError):
+        n = 0
+    if n <= 0:
+        n = _REPEAT_DEFAULT_COUNT.get(key, 12)
+        print(f"[calendar] repeat with no end given; capping at {n} occurrences")
+    return [rule + f";COUNT={min(n, 365)}"]
+
+
 def _cal_insert_event(service, summary, start_iso, end_iso, tzname,
                       location=None, details=None, color_id=None):
     """Low-level: insert one event. Shared by the flight tool (and reusable elsewhere).
@@ -1325,7 +1405,8 @@ def _cal_insert_event(service, summary, start_iso, end_iso, tzname,
 
 
 def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
-                            location=None, details=None, personal=False):
+                            location=None, details=None, personal=False,
+                            repeat=None, repeat_count=None, repeat_until=None):
     service = get_calendar_service(person)
     if not service:
         if person and google_needs_reconnect(person):
@@ -1355,8 +1436,30 @@ def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
     if personal:
         body["colorId"] = TRAVEL_COLOR_ID
 
-    service.events().insert(calendarId=FAMILY_CALENDAR_ID, body=body).execute()
+    rrule = _build_recurrence(repeat, repeat_count, repeat_until)
+    if rrule:
+        body["recurrence"] = rrule
+
+    try:
+        service.events().insert(calendarId=FAMILY_CALENDAR_ID, body=body).execute()
+    except Exception as e:
+        print(f"[cal] insert failed: {e}")
+        if rrule:
+            # The usual cause: an event longer than its own repeat interval (a multi-day
+            # span set to repeat daily). Say which knob is wrong instead of "it failed".
+            return ("I couldn't add that repeating event. If it repeats daily, each "
+                    "occurrence has to start and end on the SAME day - set the start and "
+                    "end to one day's times and let the repeat cover the rest.")
+        return f"I couldn't add that to the calendar: {e}"
+
     extra = f" at {location}" if location else ""
+    if rrule:
+        how = str(repeat).lower()
+        when = (f"until {repeat_until}" if repeat_until
+                else f"{rrule[0].split('COUNT=')[-1]} times"
+                if "COUNT=" in rrule[0] else "")
+        return (f"Added '{summary}' starting {start_iso}{extra}, repeating {how} {when}. "
+                f"It's one repeating series, so the whole thing can be changed at once.")
     return f"Added '{summary}' on {start_iso}{extra}."
 
 
@@ -2962,15 +3065,20 @@ def tools_for_role(role, is_group=False):
     if perms["calendar_write"]:
         tools.append({
             "name": "add_calendar_event",
-            "description": ("Add an event to the family's Google Calendar. Capture ALL "
-                            "relevant details you know — don't drop information. Put the "
-                            "place in `location` (Google makes it tappable for "
-                            "directions), and put everything else useful in `details`: "
-                            "who's involved/attending, what to bring, cost, contact info, "
-                            "arrival instructions, dress code, links, notes from a flyer "
-                            "or email, etc. A calendar entry is only useful if it has the "
-                            "info someone needs when they open it. Times are ISO 8601 with "
-                            "timezone offset, e.g. 2026-07-12T10:00:00-04:00."),
+            "description": ("Add an event to the family's Google Calendar. Put the place "
+                            "in `location` (Google makes it tappable for directions), and "
+                            "the practical logistics in `details`: what to bring, drop-off "
+                            "and pick-up instructions, cost, who to contact, arrival "
+                            "notes. Aim for what a parent needs when they open the event "
+                            "on their phone in the car - roughly a short paragraph. Do NOT "
+                            "paste an entire email in; summarise the parts that matter at "
+                            "the event and leave out policies, refund rules and marketing. "
+                            "IF THE EVENT REPEATS (a camp running several days, a weekly "
+                            "practice), do NOT call this tool once per day - make ONE event "
+                            "and set `repeat`, with `repeat_count` or `repeat_until`. Each "
+                            "occurrence must start and end on the SAME day; the repeat "
+                            "covers the rest. Times are ISO 8601 with timezone offset, "
+                            "e.g. 2026-07-12T10:00:00-04:00."),
             "input_schema": {"type": "object", "properties": {
                 "summary": {"type": "string", "description": "Short event title."},
                 "start_iso": {"type": "string"},
@@ -2986,7 +3094,17 @@ def tools_for_role(role, is_group=False):
                                              "commitment they describe as 'for me' / 'just "
                                              "me' / 'my [work] thing', rather than a shared "
                                              "family event. Personal events are colored "
-                                             "sage on the calendar.")}},
+                                             "sage on the calendar.")},
+                "repeat": {"type": "string",
+                           "enum": ["none", "daily", "weekdays", "weekly", "monthly"],
+                           "description": ("Use for anything happening on more than one "
+                                           "day. A Mon-Thu camp is 'daily' with "
+                                           "repeat_count 4.")},
+                "repeat_count": {"type": "integer",
+                                 "description": "How many occurrences in total."},
+                "repeat_until": {"type": "string",
+                                 "description": ("Last date, YYYY-MM-DD. Use this OR "
+                                                 "repeat_count, not both.")}},
                 "required": ["summary", "start_iso", "end_iso"]}})
         tools.append({
             "name": "find_events",
@@ -3014,9 +3132,16 @@ def tools_for_role(role, is_group=False):
             "name": "delete_calendar_event",
             "description": ("Delete/cancel an event by event_id (from find_events). "
                             "Confirm with the user which event before deleting if there's "
-                            "any ambiguity."),
+                            "any ambiguity. If find_events marked the event as a REPEATING "
+                            "SERIES, the id is ONE occurrence - ask whether they mean that "
+                            "single day or the whole series, and set whole_series "
+                            "accordingly. Never delete a whole series without asking."),
             "input_schema": {"type": "object", "properties": {
-                "event_id": {"type": "string"}}, "required": ["event_id"]}})
+                "event_id": {"type": "string"},
+                "whole_series": {"type": "boolean",
+                                 "description": ("True to remove every occurrence of a "
+                                                 "repeating event, not just this one.")}},
+                "required": ["event_id"]}})
         tools.append({
             "name": "add_flight",
             "description": ("Add a work/travel trip to the calendar from flight NUMBERS. "
@@ -3376,7 +3501,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return tool_add_calendar_event(
             tool_input["summary"], tool_input["start_iso"], tool_input["end_iso"],
             sender_name, tool_input.get("location"), tool_input.get("details"),
-            tool_input.get("personal", False))
+            tool_input.get("personal", False), tool_input.get("repeat"),
+            tool_input.get("repeat_count"), tool_input.get("repeat_until"))
 
     if name == "find_events":
         if not perms["calendar_read"]:
@@ -3395,7 +3521,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "delete_calendar_event":
         if not perms["calendar_write"]:
             return "Only a parent or caregiver can delete calendar events."
-        return tool_delete_calendar_event(tool_input["event_id"], sender_name)
+        return tool_delete_calendar_event(tool_input["event_id"], sender_name,
+                                          tool_input.get("whole_series", False))
 
     if name == "add_flight":
         if not perms["calendar_write"]:
@@ -4339,9 +4466,38 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     system = build_system_prompt(sender_name, sender_role, is_group)
 
     tools_ran = []
+    # 800 was too low the moment email reading started returning real content. A request
+    # like "add the 4 camp days and include the details" has to emit four tool calls, each
+    # carrying a details block drawn from a 4,000-char email - that blows past 800 tokens
+    # mid-JSON, and a truncated tool_use block has no text in it, so the turn came back
+    # empty and the user was told "I didn't catch that" (Trap 65). You are billed for
+    # tokens GENERATED, not for the ceiling, so a higher limit costs nothing on the many
+    # short replies and rescues the few long ones.
+    max_out = 3000
     for _ in range(6):
         response = claude.messages.create(
-            model=MODEL, max_tokens=800, system=system, tools=tools, messages=messages)
+            model=MODEL, max_tokens=max_out, system=system, tools=tools, messages=messages)
+
+        if response.stop_reason not in ("end_turn", "tool_use", "stop_sequence"):
+            print(f"[guppi] stop_reason={response.stop_reason} "
+                  f"text_blocks={sum(1 for b in response.content if b.type == 'text')} "
+                  f"tool_blocks={sum(1 for b in response.content if b.type == 'tool_use')}")
+
+        if response.stop_reason == "max_tokens":
+            # Give it one real retry before admitting defeat - and never let a ceiling the
+            # MODEL hit get reported as the USER being unclear.
+            if max_out < 8000:
+                max_out = 8000
+                print("[guppi] hit the output ceiling; retrying once with more headroom")
+                continue
+            partial = "".join(b.text for b in response.content if b.type == "text").strip()
+            print("[guppi] still truncated at the higher ceiling; asking to split the task")
+            msg = ("That turned into more than I can write in one go. Ask me for it in "
+                   "smaller pieces - one day at a time, or the calendar first and the "
+                   "reminder after.")
+            reply = f"{partial}\n\n{msg}" if partial else msg
+            save_history(who_id, user_message, reply)
+            return reply
 
         if response.stop_reason == "tool_use":
             messages.append({"role": "assistant", "content": response.content})
@@ -4390,7 +4546,11 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                 print(f"[guppi] empty reply after tools ran: {tools_ran}")
                 reply = "Done - that's taken care of."
             else:
-                reply = "Sorry, I didn't catch that - can you say it another way?"
+                # Don't blame the person's phrasing for the model returning nothing.
+                print(f"[guppi] empty reply, no tools ran, "
+                      f"stop_reason={response.stop_reason}")
+                reply = ("I didn't manage to put an answer together for that one. Try "
+                         "rephrasing it, or break it into smaller steps.")
         # Remember this exchange for next time (store the raw user text, not the
         # time-hint wrapper, so history stays readable and doesn't pile up stale clocks).
         placeholder = "(sent a photo)" if image_data else ("(sent an attachment)" if doc_data else None)
