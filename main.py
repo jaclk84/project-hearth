@@ -1968,6 +1968,39 @@ def _imap_full_body(msg, limit=20000):
         return ""
 
 
+def _imap_fetch_message(M, mid):
+    """Fetch ONE COMPLETE message (headers + body) and parse it. Returns a Message or None.
+
+    This replaces a fetch of BODY.PEEK[TEXT], which was wrong in two independent ways and
+    is why every email came back with a zero-length body:
+
+      1. BODY[TEXT] is the body WITHOUT headers. Content-Type lives in the headers, so the
+         parser never learns the message is multipart or what its boundary is - it treats
+         the entire MIME source as one flat text/plain blob, and every attachment becomes
+         invisible. is_multipart() returns False on a message that plainly is multipart.
+      2. The result was read at a fixed position (md[1][1]). IMAP does not guarantee the
+         order or shape of items in a FETCH response, so when the server answered in a
+         different shape the parse silently produced None and the body came back empty.
+
+    Fetching BODY.PEEK[] gives the whole RFC822 message, and scanning the response for the
+    payload instead of indexing into it removes the positional assumption. PEEK still means
+    the message is not marked as read."""
+    try:
+        typ, md = M.fetch(mid, "(BODY.PEEK[])")
+        if typ != "OK" or not md:
+            print(f"[imap] fetch of {mid!r} returned {typ}")
+            return None
+        for item in md:
+            if (isinstance(item, tuple) and len(item) > 1
+                    and isinstance(item[1], (bytes, bytearray)) and len(item[1]) > 0):
+                return emaillib.message_from_bytes(item[1])
+        print(f"[imap] no payload found in fetch response for {mid!r}")
+        return None
+    except Exception as e:
+        print(f"[imap] fetch failed for {mid!r}: {e}")
+        return None
+
+
 def imap_search(person, keywords, max_results=5, with_attachments=False):
     """Search a person's IMAP inbox. `keywords` is plain words (Gmail-style operators are
     stripped upstream). Returns normalized dicts, newest first.
@@ -1995,20 +2028,23 @@ def imap_search(person, keywords, max_results=5, with_attachments=False):
             return []
         ids = data[0].split()
         for mid in reversed(ids[-max_results:]):  # newest first
-            typ, md = M.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)] BODY.PEEK[TEXT])")
-            if typ != "OK":
+            msg = _imap_fetch_message(M, mid)
+            if not msg:
                 continue
-            header_bytes = md[0][1]
-            body_msg = emaillib.message_from_bytes(md[1][1]) if len(md) > 1 and md[1] else None
-            hmsg = emaillib.message_from_bytes(header_bytes)
+            # Headers now come from the SAME parsed message as the body - no second fetch,
+            # and no chance of the two disagreeing about which message we're looking at.
             out.append({
-                "from": _decode(hmsg.get("From", "?")),
-                "subject": _decode(hmsg.get("Subject", "(no subject)")),
-                "snippet": _imap_snippet(body_msg) if body_msg else "",
-                "full_body": _imap_full_body(body_msg) if body_msg else "",
+                "from": _decode(msg.get("From", "?")),
+                "subject": _decode(msg.get("Subject", "(no subject)")),
+                "date": msg.get("Date", ""),
+                "snippet": _imap_snippet(msg),
+                "full_body": _imap_full_body(msg),
                 "id": mid.decode(), "provider": "imap"})
-            if with_attachments and body_msg:
-                imgs, skipped = _collect_attachments(body_msg)
+            if not out[-1]["full_body"]:
+                print(f"[imap] WARNING empty body for {out[-1]['subject'][:50]!r} "
+                      f"(multipart={msg.is_multipart()} type={msg.get_content_type()})")
+            if with_attachments:
+                imgs, skipped = _collect_attachments(msg)
                 out[-1]["images"] = imgs
                 out[-1]["skipped_attachments"] = skipped
     except Exception as e:
@@ -2198,7 +2234,7 @@ def tool_read_email(query, person, max_results=3):
                     results.append({"from": h.get("From", "?"),
                                     "subject": h.get("Subject", "(no subject)"),
                                     "date": h.get("Date", ""), "body": body,
-                                    "images": [], "skipped": []})
+                                    "images": [], "skipped": [], "provider": "google"})
             except Exception as e:
                 print(f"[read_email:google] failed: {e}")
 
@@ -2207,9 +2243,11 @@ def tool_read_email(query, person, max_results=3):
         # so asking for attachments here costs no extra round-trip.
         for m in imap_search(person, imap_q, max_results, with_attachments=True):
             results.append({"from": m["from"], "subject": m["subject"],
-                            "date": "", "body": m.get("full_body") or m.get("snippet", ""),
+                            "date": m.get("date", ""),
+                            "body": m.get("full_body") or m.get("snippet", ""),
                             "images": m.get("images", []),
-                            "skipped": m.get("skipped_attachments", [])})
+                            "skipped": m.get("skipped_attachments", []),
+                            "provider": "imap"})
 
     if not results:
         print(f"[read_email] no match for {query!r}")
@@ -2242,8 +2280,9 @@ def tool_read_email(query, person, max_results=3):
         if r.get("skipped"):
             note += (f"\n\n[This email also has attachment(s) you CANNOT read: "
                      f"{', '.join(r['skipped'])}. Mention them so the user knows to look.]")
-        print(f"[read_email] -> {r['subject'][:60]!r} body={len(body)}c "
-              f"images={len(r.get('images') or [])} skipped={len(r.get('skipped') or [])}")
+        print(f"[read_email] -> [{r.get('provider', '?')}] {r['subject'][:50]!r} "
+              f"body={len(body)}c images={len(r.get('images') or [])} "
+              f"skipped={len(r.get('skipped') or [])}")
         out.append(f"{hdr}\n\n{body}{note}")
 
     text = "\n\n----- next email -----\n\n".join(out)
