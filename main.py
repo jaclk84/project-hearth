@@ -3757,6 +3757,65 @@ def capabilities_for_role(role, is_group=False):
             "things this person can actually do here:\n- " + "\n- ".join(lines))
 
 
+def _live_state_block(sender_name, sender_role, is_group):
+    """A snapshot of what Guppi ACTUALLY has stored, read fresh from the database on every
+    turn and pasted into the system prompt.
+
+    Why this exists (Trap 69): the model kept answering questions about its own stored state
+    from the CONVERSATION rather than from the database. It told Jason "I don't have the
+    school names in memory" without calling recall - the schools were there - and replayed a
+    stale priority list from earlier in the same chat, omitting three rules he had just
+    added. Everything it said was consistent with the conversation and wrong about reality.
+
+    A prompt rule saying "always check first" is a suggestion. Handing it the current truth
+    every turn makes the stale answer impossible to give, which is the difference between
+    discouraging a bug and removing it.
+
+    PRIVACY: nothing here is injected in a GROUP chat. Memories and settings are already
+    withheld there at the tool layer, and this must not become a side door around that."""
+    if is_group or not sender_name or sender_role in ("unknown", None):
+        return ""
+    parts = []
+    try:
+        conn = db()
+        rows = conn.execute(
+            "SELECT id, fact, about FROM memories ORDER BY id").fetchall()
+        conn.close()
+        if rows:
+            lines = "\n".join(
+                f"  [{r['id']}] {r['fact']}" + (f" (about {r['about']})" if r["about"] else "")
+                for r in rows)
+            parts.append(
+                "EVERYTHING YOU CURRENTLY REMEMBER (live from the database, this turn):\n"
+                + lines +
+                "\n  The bracketed numbers are memory ids - use them with the forget tool. "
+                "This IS your memory: if something is not listed here you genuinely do not "
+                "have it, and if it IS listed you do, so never say you don't remember "
+                "something that appears above.")
+        else:
+            parts.append("YOUR MEMORY IS CURRENTLY EMPTY (live from the database).")
+    except Exception as e:
+        print(f"[state] could not load memories: {e}")
+
+    if sender_role == "adult":
+        try:
+            pri = _priority_senders(sender_name)
+            ign = _ignored_senders()
+            bits = []
+            bits.append("  Always flag: " + (", ".join(pri) if pri else "(none set)"))
+            if ign:
+                bits.append("  Never flag: " + ", ".join(ign))
+            parts.append("THIS PERSON'S EMAIL PRIORITY RULES (live from the database, this "
+                         "turn):\n" + "\n".join(bits) +
+                         "\n  These are the CURRENT rules. Answer questions about what is "
+                         "flagged from this list, not from anything said earlier in the "
+                         "conversation - it may be out of date.")
+        except Exception as e:
+            print(f"[state] could not load priority rules: {e}")
+
+    return "\n\n".join(parts)
+
+
 def build_system_prompt(sender_name, sender_role, is_group=False):
     if sender_name:
         who = f"You are talking with {sender_name}."
@@ -3833,6 +3892,10 @@ Say plainly that you only help members of one household, that you don't recogniz
 and that a parent can add them. You may answer harmless general questions, nothing more."""
 
     capabilities = capabilities_for_role(sender_role, is_group)
+    # Read the CURRENT contents of memory and the priority rules straight from the database
+    # on every turn, so the model can never answer "what do you have stored?" from a stale
+    # conversation instead of from reality (Trap 69). Empty string in group chats.
+    live_state = _live_state_block(sender_name, sender_role, is_group)
 
     return f"""You are Guppi, the family's household assistant, reachable on Telegram.
 
@@ -4021,6 +4084,30 @@ MEMORY RULES:
 {memory_rules}
 
 Anyone may ask what you remember, and may ask you to forget something. Always honor that.
+
+{live_state}
+
+CLAIMING SOMETHING IS ABSENT IS A CLAIM, AND NEEDS A LOOKUP LIKE ANY OTHER. "I don't have
+that", "I don't remember", "there's nothing saved", "your inbox is empty" and "you have no
+reminders" are all ASSERTIONS ABOUT THE WORLD, and each one needs the tool that would know
+before you say it. A negative feels like modesty rather than a fact, which is exactly why
+it slips out unchecked - it is the easiest kind of wrong answer to give confidently. If the
+live state above already answers it, use that. Otherwise call the tool. Never conclude
+something is missing because you cannot see it in the conversation.
+
+A QUESTION ABOUT WHAT IS STORED RIGHT NOW ALWAYS GETS A FRESH LOOK. "What do you remember?",
+"what are my priority rules?", "what's on the list?", "what reminders do I have?" ask about
+the CURRENT state of the database, not about what you said earlier. Answer from the live
+state above, or call the tool again. Repeating an answer you gave earlier in this
+conversation is wrong whenever anything has changed since - and something usually has,
+because the person is normally asking BECAUSE they just changed it.
+
+A CORRECTION IS AN ACTION, NOT AN ACKNOWLEDGEMENT. When someone corrects a stored fact
+("it's WSSD, not WADS", "her teacher is actually Mrs Bell"), saying "got it, corrected" is
+not correcting anything. You must call forget on the wrong memory (its id is in the live
+state above) and remember the right one, in that same turn, before you confirm. The same
+goes for corrections to lists, reminders and priority rules. Confirming a change you did
+not make is worse than refusing it, because the person stops checking.
 
 {capabilities}
 
