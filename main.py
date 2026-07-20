@@ -1019,8 +1019,23 @@ def get_gmail_service(person):
 
 # ---- Settings (adjustable by text, parents only) ----------------------------
 DEFAULT_SETTINGS = {
-    "daily_claude_calls_cap": "35",   # proactive Claude calls per day
-    "daily_messages_cap": "10",       # proactive messages per day (noise, not cost)
+    # NOTE ON WHAT THESE TWO ACTUALLY DO - they are unrelated, and the names hide it.
+    #
+    # daily_claude_calls_cap is a CIRCUIT BREAKER, not a budget. It bounds only the
+    # SCHEDULER's Claude calls (briefing, weekly digest, email poll, the overheard-intent
+    # check). Those are the cheap ones - no tool definitions attached, ~1,150 tokens, about
+    # $0.002 each - so the old value of 35 was capping roughly SEVEN CENTS of spend. What
+    # it really did was silently switch features off: the email poll alone can want ~96
+    # calls a day (2 adults x 48 half-hour windows with new mail), so on a busy mail day
+    # deadline flagging simply stopped by lunchtime with no warning. Raised to 200: still a
+    # genuine stop on a runaway loop, no longer a brake on normal use. Interactive replies
+    # are NOT counted here and never have been - they are rate-limited per minute instead.
+    #
+    # daily_messages_cap has NO cost at all. Telegram messages are free. It exists purely
+    # so Guppi can't spam the family with unprompted messages. 10 was far too low for two
+    # adults getting briefings, reminders and email flags.
+    "daily_claude_calls_cap": "200",  # scheduler Claude calls per day (circuit breaker)
+    "daily_messages_cap": "75",       # proactive messages per day (noise only, zero cost)
     "poll_minutes": "30",             # how often to check for urgent email
     "quiet_start_hour": "22",         # 10pm — stop proactive activity
     "quiet_end_hour": "6",            # 6am  — resume (briefing goes out at 6am)
@@ -1059,7 +1074,7 @@ def tool_update_setting(key, value, requester_role):
         return f"I don't have a setting called '{key}'. Known: {', '.join(DEFAULT_SETTINGS)}"
     # Numeric settings must be sane positive numbers; caps have hard ceilings so a
     # typo (or a persuasive request) can't remove the safety net entirely.
-    ceilings = {"daily_claude_calls_cap": 500, "daily_messages_cap": 50,
+    ceilings = {"daily_claude_calls_cap": 1000, "daily_messages_cap": 300,
                 "poll_minutes": 1440, "quiet_start_hour": 23, "quiet_end_hour": 23}
     if key in ceilings:
         try:
@@ -3663,7 +3678,14 @@ def tools_for_role(role, is_group=False):
             tools.append({
                 "name": "update_setting",
                 "description": ("Change a setting. Parents only, private chat only. Keys: "
-                                "daily_claude_calls_cap, daily_messages_cap, poll_minutes, "
+                                "daily_claude_calls_cap (a SAFETY STOP on scheduler "
+                                "Claude calls - it is not a spend limit, and the calls it "
+                                "counts cost about $0.002 each; raise it freely if "
+                                "briefings or email flagging stop), daily_messages_cap "
+                                "(how many messages Guppi may send UNPROMPTED per day - "
+                                "Telegram messages are free, so this is purely about not "
+                                "being annoying; replies to you are never limited), "
+                                "poll_minutes, "
                                 "quiet_start_hour, quiet_end_hour, proactive_enabled."),
                 "input_schema": {"type": "object", "properties": {
                     "key": {"type": "string"}, "value": {"type": "string"}},
@@ -4726,16 +4748,25 @@ def send_message(chat_id, body, markdown=True, proactive=False):
         return False
 
     if proactive and get_count("messages") >= cap("daily_messages_cap"):
+        # Say WHAT is being held. "cap reached; not sending" told nobody which message
+        # vanished - the same blind spot that made the email bug undiagnosable.
+        print(f"[tg] proactive cap reached ({cap('daily_messages_cap')}/day); HELD for "
+              f"{chat_id}: {body[:70]!r}")
         if not get_setting(_counter("cap_warned")):
             set_setting(_counter("cap_warned"), "1")
-            parent = _first_parent_chat()
-            if parent:
+            # Warn EVERY adult, not just the first row in the table - Kim was never told.
+            try:
+                targets = [c for _n, c in _adults_with_chats() if c]
+            except Exception:
+                targets = [p for p in [_first_parent_chat()] if p]
+            for t in targets:
                 telegram_api("sendMessage", {
-                    "chat_id": parent,
-                    "text": ("I've hit my daily limit for messages I send on my own, so "
-                             "I'll stay quiet until tomorrow. You can still talk to me "
-                             "any time — just ask me to raise the cap.")})
-        print("[tg] proactive cap reached; not sending")
+                    "chat_id": t,
+                    "text": ("I've hit my daily limit for messages I send on my own "
+                             f"({cap('daily_messages_cap')}), so I'm holding the rest — "
+                             "including any reminders due. They'll go out as soon as the "
+                             "limit resets or you raise it. Just say \"raise the message "
+                             "cap to 100\". Talking to me directly always works.")})
         return False
 
     # Telegram FETCHES every link in an outgoing message to build a preview card, from
@@ -5856,6 +5887,15 @@ def job_reminders():
         if dt <= now:
             due.append((r, dt))
     for r, due_dt in due:
+        # A reminder blocked by the message cap stays unfired and is retried every minute,
+        # which is right - it isn't lost. But the counter resets on a DATE key, so a
+        # backlog held from 7pm would all arrive at 00:01. A reminder set FOR 11pm should
+        # still fire at 11pm, so only defer ones that are already STALE and would be
+        # landing in the middle of the night.
+        if in_quiet_hours() and (now - due_dt) > datetime.timedelta(hours=2):
+            print(f"[reminders] holding stale reminder {r['id']} until quiet hours end "
+                  f"(due {due_dt.strftime('%-I:%M %p')})")
+            continue
         target = r["for_chat"] or _first_parent_chat()
         if not (target and send_message(target, f"Reminder: {r['text']}", proactive=True)):
             continue
