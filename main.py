@@ -354,6 +354,93 @@ def db():
 #  Telegram on a schedule (and on demand), so a backup lands somewhere the family
 #  controls without any new service, library, or key.
 # =============================================================================
+# ---- Short-lived signed links for /backup and /restore -----------------------
+# The setup secret used to ride in the query string (/backup?secret=...), which wrote it
+# into Railway's request logs, browser history, and any proxy in between. That same
+# secret is the HMAC key that signs the OAuth state, so leaking it was worse than losing
+# one download. Instead: ask Guppi for a link in Telegram and it mints a token that is
+#   * signed      - HMAC over the payload, so it cannot be forged;
+#   * expiring    - 15 minutes by default;
+#   * single-use  - the nonce is burned on first use;
+#   * purpose-bound - a download token is rejected by /restore, and vice versa.
+# NOTE: /set-webhook deliberately still uses the raw secret. It has to: it is what makes
+# the bot reachable in the first place, so you cannot ask Guppi for a link until after
+# it has been run. Bootstrapping beats purity for a one-time endpoint.
+BACKUP_LINK_MINUTES = 15
+
+
+def _make_access_token(purpose, minutes=BACKUP_LINK_MINUTES):
+    """Mint a signed, expiring, single-use token for one specific endpoint."""
+    import secrets as _secrets
+    if not TELEGRAM_SETUP_SECRET:
+        return None
+    exp = int(time.time()) + minutes * 60
+    nonce = _secrets.token_urlsafe(12)
+    payload = f"{purpose}:{exp}:{nonce}"
+    sig = hmac.new(TELEGRAM_SETUP_SECRET.encode(), payload.encode(),
+                   "sha256").hexdigest()[:24]
+    return f"{payload}:{sig}"
+
+
+def _used_token_key(nonce):
+    """Burned-nonce marker. The embedded date is deliberate: _prune_old_settings sweeps
+    dated keys older than 10 days, so used tokens clean themselves up instead of growing
+    the settings table forever (the same trap as M7/Trap 47)."""
+    return f"usedtok_{now_local().strftime('%Y-%m-%d')}_{nonce}"
+
+
+def _verify_access_token(token, purpose):
+    """True only for a token we signed, for THIS purpose, unexpired and not yet used.
+    Checks run cheapest-first, and the nonce is burned ONLY after the signature passes -
+    otherwise a stranger could burn valid nonces by guessing."""
+    if not TELEGRAM_SETUP_SECRET or not token:
+        return False
+    try:
+        got_purpose, exp_s, nonce, sig = token.split(":", 3)
+    except (ValueError, AttributeError):
+        return False
+    payload = f"{got_purpose}:{exp_s}:{nonce}"
+    expect = hmac.new(TELEGRAM_SETUP_SECRET.encode(), payload.encode(),
+                      "sha256").hexdigest()[:24]
+    if not hmac.compare_digest(sig, expect):
+        print("[link] rejected: bad signature")
+        return False
+    if not hmac.compare_digest(got_purpose, purpose):
+        print(f"[link] rejected: wrong purpose ({got_purpose} used on {purpose})")
+        return False
+    try:
+        if int(exp_s) < int(time.time()):
+            print("[link] rejected: expired")
+            return False
+    except ValueError:
+        return False
+    if get_setting(_used_token_key(nonce)):
+        print("[link] rejected: already used")
+        return False
+    set_setting(_used_token_key(nonce), "1")
+    return True
+
+
+def tool_backup_link(kind="download"):
+    """Give a parent a one-shot link to download a backup, or the command to restore one."""
+    purpose = "restore" if kind == "restore" else "backup"
+    token = _make_access_token(purpose)
+    if not token:
+        return ("I can't make a secure link - the setup secret isn't configured on the "
+                "server, and that's what signs the link.")
+    if purpose == "backup":
+        return (f"Here's your backup download link. It works ONCE and expires in "
+                f"{BACKUP_LINK_MINUTES} minutes:\n\n{BASE_URL}/backup?token={token}\n\n"
+                f"It saves the database file straight to whatever device you tap it on. "
+                f"Keep it somewhere safe - it contains the credentials for every "
+                f"connected account.")
+    return (f"Restore link - single use, expires in {BACKUP_LINK_MINUTES} minutes. This "
+            f"OVERWRITES everything currently stored, so only use it if the live data is "
+            f"already lost.\n\nRun this in PowerShell with your backup file's path:\n\n"
+            f'curl.exe -F "file=@C:\\path\\to\\guppi-backup.db" '
+            f'"{BASE_URL}/restore?token={token}"')
+
+
 def make_db_snapshot():
     """Make a CONSISTENT copy of the live DB. You cannot just copy the file — a copy
     taken mid-write can be corrupt. SQLite's backup API takes a proper point-in-time
@@ -375,9 +462,12 @@ def make_db_snapshot():
 
 def _tg_send_document(chat_id, file_path, caption=""):
     """Send a file to a Telegram chat via multipart/form-data (telegram_api only does
-    JSON, so document upload needs its own multipart request)."""
+    JSON, so document upload needs its own multipart request).
+
+    Returns the sent message_id, or None on failure. The id is what lets run_backup
+    delete the PREVIOUS backup once this one has landed."""
     if not TELEGRAM_BOT_TOKEN:
-        return False
+        return None
     try:
         with open(file_path, "rb") as f:
             file_bytes = f.read()
@@ -403,16 +493,52 @@ def _tg_send_document(chat_id, file_path, caption=""):
             body = json.loads(r.read())
         if not body.get("ok"):
             print(f"[backup] sendDocument failed: {body}")
-            return False
-        return True
+            return None
+        return (body.get("result") or {}).get("message_id")
     except Exception as e:
         print(f"[backup] sendDocument error: {e}")
-        return False
+        return None
+
+
+def _retire_previous_backup(chat_id, new_msg_id):
+    """Delete the previously-sent backup message, then record the new one as current.
+
+    Best-effort by design: if the old message is already gone, or is past Telegram's
+    48-hour deletion window, we log it and move on. A failed cleanup must never cost us
+    the new backup we just successfully sent."""
+    try:
+        prev = get_setting("last_backup_msg_id")
+        prev_chat = get_setting("last_backup_chat") or chat_id
+        if prev and str(prev) != str(new_msg_id):
+            res = telegram_api("deleteMessage",
+                               {"chat_id": prev_chat, "message_id": int(prev)})
+            if res is None:
+                print(f"[backup] could not delete previous backup msg {prev} "
+                      f"(past the 48h window, or already gone) - leaving it")
+            else:
+                print(f"[backup] removed previous backup msg {prev}")
+    except Exception as e:
+        print(f"[backup] retire-previous failed (non-fatal): {e}")
+    try:
+        set_setting("last_backup_msg_id", str(new_msg_id))
+        set_setting("last_backup_chat", str(chat_id))
+    except Exception as e:
+        print(f"[backup] could not record current backup id: {e}")
 
 
 def run_backup(reason="scheduled"):
-    """Snapshot the DB and push it to the primary parent's Telegram. Returns a status
-    string. Used by both the daily job and the manual 'back up now' command."""
+    """Snapshot the DB and push it to the primary parent's Telegram, then remove the
+    PREVIOUS one, so the chat holds a single current backup instead of a growing archive
+    of credential dumps (every one of those files contains every connected account's
+    tokens). Returns a status string. Used by the daily job and 'back up now'.
+
+    Order matters: the old file is deleted only AFTER the new one is confirmed sent, so
+    there is never a moment when the chat holds zero backups.
+
+    Telegram only lets a bot delete its own messages for 48 hours, so one-in-one-out is
+    the most pruning the API allows - a 'delete anything older than a week' sweep is not
+    buildable. Backups you want to KEEP should be pulled to your own machine with
+    "send me a backup link", which never leaves a copy sitting in Telegram at all."""
     target = _first_parent_chat()
     if not target:
         return "No parent is connected yet, so there's nowhere safe to send a backup."
@@ -423,14 +549,16 @@ def run_backup(reason="scheduled"):
     when = now_local().strftime("%A %b %-d, %-I:%M %p")
     caption = (f"Guppi backup ({reason}) — {when}. {size_kb} KB. "
                f"Keep this file safe; it can restore everything (accounts, reminders, "
-               f"lists, memory) if the server data is ever lost.")
-    ok = _tg_send_document(target, snap, caption)
+               f"lists, memory) if the server data is ever lost. This replaces the "
+               f"previous backup — ask me for a backup link if you want one to keep.")
+    msg_id = _tg_send_document(target, snap, caption)
     try:
         os.remove(snap)
     except Exception:
         pass
-    if ok:
-        print(f"[backup] sent ({reason}, {size_kb}KB)")
+    if msg_id:
+        _retire_previous_backup(target, msg_id)
+        print(f"[backup] sent ({reason}, {size_kb}KB, msg {msg_id})")
         return f"Backup done — I sent the database file to your chat ({size_kb} KB)."
     return "The backup was created but couldn't be sent. I'll retry next cycle."
 
@@ -2956,8 +3084,23 @@ def tools_for_role(role, is_group=False):
                 "name": "backup_now",
                 "description": ("Immediately back up Guppi's database and send the file to "
                                 "this parent's Telegram. Use when a parent says 'back up "
-                                "now', 'save a backup', or 'export the data'."),
+                                "now', 'save a backup', or 'export the data'. This "
+                                "replaces the previous backup in the chat."),
                 "input_schema": {"type": "object", "properties": {}}})
+            tools.append({
+                "name": "backup_link",
+                "description": ("Give this parent a private, single-use, 15-minute link to "
+                                "DOWNLOAD the backup file to their own device (kind="
+                                "'download'), or the command to RESTORE the database from "
+                                "a file they already have (kind='restore'). Use for 'send "
+                                "me a backup link', 'let me download the database', 'I "
+                                "want to save a copy', 'how do I restore'. Prefer this "
+                                "over backup_now when they want a copy to KEEP, since it "
+                                "goes to their device instead of leaving a credential "
+                                "file sitting in the chat. kind='restore' is destructive "
+                                "- only offer it if they clearly want to overwrite."),
+                "input_schema": {"type": "object", "properties": {
+                    "kind": {"type": "string", "enum": ["download", "restore"]}}}})
             tools.append({
                 "name": "connection_health",
                 "description": ("Check whether this person's accounts (Google calendar/"
@@ -3001,7 +3144,7 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
                        "discard_draft", "recall", "remember", "forget",
                        "show_settings", "update_setting", "list_calendars",
                        "connection_health", "manage_deadline_ignores",
-                       "manage_email_priorities", "backup_now"}
+                       "manage_email_priorities", "backup_now", "backup_link"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -3079,6 +3222,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
 
     if name == "backup_now":
         return run_backup(reason="you asked")
+    if name == "backup_link":
+        return tool_backup_link(tool_input.get("kind", "download"))
     if name == "connection_health":
         return tool_connection_health(sender_name)
     if name == "manage_deadline_ignores":
@@ -3225,7 +3370,10 @@ def capabilities_for_role(role, is_group=False):
         "weather. (Automatic; adjust with settings.)",
         "Check your setup: \"are my accounts connected?\"",
         "Back up the data: \"back up now\" and I'll send you the database file. I also back "
-        "up automatically every night. (Automatic.)",
+        "up automatically every night, and each new backup replaces the last one in the "
+        "chat so old copies of your account credentials don't pile up. For a copy to KEEP, "
+        "say \"send me a backup link\" - it downloads straight to your device and leaves "
+        "nothing behind in Telegram. (Automatic.)",
         "Memory: \"remember that Charlotte is allergic to peanuts\", \"what do you "
         "remember?\", \"forget that\". (For facts - birthdays/dates I track as occasions "
         "instead so they get reminders.)",
@@ -4846,12 +4994,18 @@ def start_scheduler():
 
 
 @app.get("/backup")
-def backup_download(secret: str = ""):
-    """Download a fresh DB snapshot on demand. Visit
-    /backup?secret=<TELEGRAM_SETUP_SECRET>. Secret-protected because this file contains
-    OAuth tokens."""
-    if not _secret_ok(secret):
-        return {"ok": False, "error": "bad or missing secret"}
+def backup_download(token: str = ""):
+    """Download a fresh DB snapshot. Ask Guppi "send me a backup link" in Telegram to get
+    a signed, single-use, 15-minute URL.
+
+    The secret no longer rides in the query string: it was landing in Railway's request
+    logs and browser history, and that same secret signs the OAuth state, so leaking it
+    cost more than one download. Tokens are short-lived, single-use, and purpose-bound."""
+    if not _verify_access_token(token, "backup"):
+        return Response(
+            content=json.dumps({"ok": False,
+                                "error": "this link is invalid, expired, or already used"}),
+            status_code=403, media_type="application/json")
     snap = make_db_snapshot()
     if not snap:
         return {"ok": False, "error": "snapshot failed"}
@@ -4860,13 +5014,16 @@ def backup_download(secret: str = ""):
 
 
 @app.post("/restore")
-async def restore_upload(request: Request, secret: str = "", file: UploadFile = File(...)):
+async def restore_upload(request: Request, token: str = "", file: UploadFile = File(...)):
     """Restore the database from a previously downloaded backup. This OVERWRITES the live
-    DB, so it's guarded by the setup secret AND makes a safety copy of the current DB
-    first. POST the backup file as multipart 'file' to
-    /restore?secret=<TELEGRAM_SETUP_SECRET>."""
-    if not _secret_ok(secret):
-        return {"ok": False, "error": "bad or missing secret"}
+    DB, so it is guarded by a single-use token AND makes a safety copy of the current DB
+    first. Ask Guppi "give me a restore link" to mint one; a /backup token will NOT work
+    here, so a leaked download link can never be turned into a data-destroying one."""
+    if not _verify_access_token(token, "restore"):
+        return Response(
+            content=json.dumps({"ok": False,
+                                "error": "this link is invalid, expired, or already used"}),
+            status_code=403, media_type="application/json")
     try:
         data = await file.read()
         # Sanity-check it's actually a SQLite file before overwriting anything.
