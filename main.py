@@ -1816,6 +1816,96 @@ def _imap_connect(person):
         return None
 
 
+def _html_to_text(html):
+    """Turn an HTML email body into readable plain text.
+
+    The old one-liner - re.sub(r"<[^>]+>", " ", html) - removed TAGS but left the CONTENTS
+    of <style>/<script> sitting in the output as text, never unescaped entities (&nbsp;,
+    &amp;, &lt; survived literally), and flattened every line break into one run-on blob.
+    On an HTML-only email that burns the length budget on stylesheet text and punctuation
+    noise, which is exactly how a camp email's DATES got truncated away before the model
+    ever saw them (Trap 58). Structure matters too: a list of pickup times is unreadable
+    as a single paragraph."""
+    if not html:
+        return ""
+    # Drop the CONTENTS of non-visible elements, not merely their tags.
+    text = re.sub(r"(?is)<(script|style|head|title)[^>]*>.*?</\1>", " ", html)
+    # Preserve the document's line structure before flattening what's left.
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|tr|li|h[1-6]|table|ul|ol)\s*>", "\n", text)
+    text = re.sub(r"(?i)</t[dh]\s*>", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = "\n".join(line.strip() for line in text.split("\n"))
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ---- Email attachments the model can actually look at ------------------------
+# A school/camp email routinely puts the important part IN a picture (a parking map, a
+# schedule graphic, a flyer). Reading only the text misses it entirely - the camp email
+# literally said "please consult the attached map".
+_READABLE_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_MIN_ATTACHMENT_BYTES = 20_000      # below this it's a signature logo or tracking pixel
+_MAX_ATTACHMENT_BYTES = 3_500_000   # keep each image well inside the API's limit
+_MAX_ATTACHMENTS = 3                # cap cost: each image is ~1.5k tokens
+
+
+def _collect_attachments(msg):
+    """Pull readable IMAGE attachments from an email message. Returns (images, skipped)
+    where images are ready-to-send base64 blocks and `skipped` names what was left out, so
+    Guppi can TELL the user something exists it couldn't read rather than silently
+    ignoring it."""
+    images, skipped = [], []
+    try:
+        for part in msg.walk():
+            ctype = (part.get_content_type() or "").lower()
+            fname = (part.get_filename() or "")
+            try:
+                fname = _decode(fname)
+            except Exception:
+                pass
+            fname = fname.replace("\x00", "").strip()
+            is_image = ctype in _READABLE_IMAGE_TYPES
+            if not is_image and not fname:
+                continue                       # an inline body part, not an attachment
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+            if not is_image:
+                skipped.append(f"{fname} ({ctype or 'unknown type'})")
+                continue
+            if len(payload) < _MIN_ATTACHMENT_BYTES:
+                continue                       # logo / tracking pixel, not a document
+            if len(payload) > _MAX_ATTACHMENT_BYTES:
+                skipped.append(f"{fname or 'an image'} (too large to read)")
+                continue
+            if len(images) >= _MAX_ATTACHMENTS:
+                skipped.append(fname or "an image")
+                continue
+            images.append({"filename": fname or "image",
+                           "media_type": ctype,
+                           "data": base64.b64encode(payload).decode()})
+    except Exception as e:
+        print(f"[email] attachment scan failed: {e}")
+    return images, skipped
+
+
+def _normalize_email_query(query):
+    """Trap 48 keeps coming back. The model writes `from:Kimberly Clark Garnet Basketball
+    Camp` - a person's NAME plus a subject phrase after an operator that only accepts an
+    address or a domain. The tool description forbids it explicitly and the model did it
+    anyway, which is the whole "prompts are suggestions, code is a guarantee" principle
+    proving itself. So fix it in CODE: if what follows from: doesn't look like an address
+    or domain, demote it to an ordinary search word."""
+    def fix(m):
+        val = m.group(1)
+        return m.group(0) if ("@" in val or "." in val) else val
+    return re.sub(r"\bfrom:(\S+)", fix, query or "")
+
+
 def _imap_snippet(msg, limit=250):
     """Best-effort short preview of the plain-text body."""
     try:
@@ -1828,11 +1918,12 @@ def _imap_snippet(msg, limit=250):
             return ""
         payload = msg.get_payload(decode=True)
         return payload.decode(errors="replace").strip().replace("\n", " ")[:limit] if payload else ""
-    except Exception:
+    except Exception as e:
+        print(f"[email] snippet extraction failed: {e}")
         return ""
 
 
-def _imap_full_body(msg, limit=4000):
+def _imap_full_body(msg, limit=20000):
     """Full-ish plain-text body of an IMAP message (for reading scheduling details).
     Prefers text/plain; falls back to a crude HTML strip. Capped so it stays sane."""
     try:
@@ -1847,20 +1938,42 @@ def _imap_full_body(msg, limit=4000):
                 text = payload.decode(errors="replace")
                 if ctype == "text/plain":
                     plain += text
-                elif ctype == "text/html" and not plain:
+                elif ctype == "text/html":
                     html += text
-            body = plain or re.sub(r"<[^>]+>", " ", html)
+            # Choosing between the two parts is where this used to throw the whole message
+            # away. A great deal of HTML mail ships a STUB text/plain part - a single "\n",
+            # or "Please enable HTML to view this message". The old test was `plain or
+            # html`, and a one-character stub is truthy, so the HTML was never even
+            # collected and the body came back effectively empty. Prefer plain text only
+            # when it actually carries the content.
+            plain_s = plain.strip()
+            html_s = _html_to_text(html)
+            if len(plain_s) >= max(40, len(html_s) // 2):
+                body = plain_s
+            else:
+                if html_s and len(plain_s) < 40:
+                    print(f"[email] text/plain was a {len(plain_s)}-char stub; "
+                          f"using the HTML part ({len(html_s)} chars)")
+                body = html_s or plain_s
         else:
             payload = msg.get_payload(decode=True)
-            body = payload.decode(errors="replace") if payload else ""
+            raw = payload.decode(errors="replace") if payload else ""
+            body = (_html_to_text(raw)
+                    if (msg.get_content_type() or "").lower() == "text/html" else raw)
         return body.strip()[:limit]
-    except Exception:
+    except Exception as e:
+        # This used to swallow the error and return "", which is indistinguishable from an
+        # empty email - the failure mode that makes a body problem invisible in the logs.
+        print(f"[email] body extraction failed: {e}")
         return ""
 
 
-def imap_search(person, keywords, max_results=5):
+def imap_search(person, keywords, max_results=5, with_attachments=False):
     """Search a person's IMAP inbox. `keywords` is plain words (Gmail-style operators are
-    stripped upstream). Returns normalized dicts, newest first."""
+    stripped upstream). Returns normalized dicts, newest first.
+
+    with_attachments is opt-in because attachment bytes are large: only read_email wants
+    them, and carrying them through every routine search would waste memory for nothing."""
     M = _imap_connect(person)
     if not M:
         return []
@@ -1894,6 +2007,10 @@ def imap_search(person, keywords, max_results=5):
                 "snippet": _imap_snippet(body_msg) if body_msg else "",
                 "full_body": _imap_full_body(body_msg) if body_msg else "",
                 "id": mid.decode(), "provider": "imap"})
+            if with_attachments and body_msg:
+                imgs, skipped = _collect_attachments(body_msg)
+                out[-1]["images"] = imgs
+                out[-1]["skipped_attachments"] = skipped
     except Exception as e:
         print(f"[imap] search failed for {person}: {e}")
     finally:
@@ -2034,7 +2151,7 @@ def _gmail_full_body(service, msg_id):
             return base64.urlsafe_b64decode(data).decode(errors="replace")
         if data and mime == "text/html":
             html = base64.urlsafe_b64decode(data).decode(errors="replace")
-            return re.sub(r"<[^>]+>", " ", html)  # crude tag strip
+            return _html_to_text(html)
         text = ""
         for p in part.get("parts", []) or []:
             text += walk(p)
@@ -2053,6 +2170,10 @@ def tool_read_email(query, person, max_results=3):
         return (f"{person} hasn't connected an email account yet. For Gmail, open "
                 f"{BASE_URL}/connect?person={person}; for Outlook/live.com, "
                 f"{BASE_URL}/connect-microsoft?person={person}.")
+
+    # Fix a malformed from: in CODE rather than trusting the description (Trap 48).
+    query = _normalize_email_query(query)
+    print(f"[read_email] {person} ({'+'.join(providers)}) query={query!r}")
 
     # Clean query for IMAP (drop Gmail operators); keep raw for Gmail.
     imap_q = re.sub(r"\b(is|in|category|label|has|filename):\S+", "", query)
@@ -2076,31 +2197,59 @@ def tool_read_email(query, person, max_results=3):
                     body = _gmail_full_body(service, m["id"])
                     results.append({"from": h.get("From", "?"),
                                     "subject": h.get("Subject", "(no subject)"),
-                                    "date": h.get("Date", ""), "body": body})
+                                    "date": h.get("Date", ""), "body": body,
+                                    "images": [], "skipped": []})
             except Exception as e:
                 print(f"[read_email:google] failed: {e}")
 
     if "imap" in providers:
-        for m in imap_search(person, imap_q, max_results):
-            # imap_search already fetched the body; but it was snippet-truncated. Re-fetch
-            # the full body for these specific ids for completeness.
+        # imap_search fetches BODY.PEEK[TEXT], which already carries the attachment bytes,
+        # so asking for attachments here costs no extra round-trip.
+        for m in imap_search(person, imap_q, max_results, with_attachments=True):
             results.append({"from": m["from"], "subject": m["subject"],
-                            "date": "", "body": m.get("full_body") or m.get("snippet", "")})
+                            "date": "", "body": m.get("full_body") or m.get("snippet", ""),
+                            "images": m.get("images", []),
+                            "skipped": m.get("skipped_attachments", [])})
 
     if not results:
-        return "I couldn't find an email matching that."
+        print(f"[read_email] no match for {query!r}")
+        return ("I couldn't find an email matching that search. Say that you didn't find "
+                "anything with THAT SEARCH - do not tell the user their inbox is empty, "
+                "and offer to try different words.")
 
-    # Cap total body length so we don't blow up the context; a scheduling email is short.
-    out = []
+    # Cap each body. The old cap was 2000 chars, which silently cut a camp email off
+    # BEFORE the section containing every date and time - so the model was asked to build
+    # calendar events from a message whose schedule it had never been shown (Trap 58).
+    # 10000 chars is ~2500 tokens, roughly 0.25c on Haiku: far cheaper than missing a date.
+    PER_EMAIL_CAP = 10000
+    out, images = [], []
     for r in results[:max_results]:
         body = (r["body"] or "").strip()
-        if len(body) > 2000:
-            body = body[:2000] + " …(truncated)"
+        if len(body) > PER_EMAIL_CAP:
+            body = (body[:PER_EMAIL_CAP] +
+                    "\n\n[TRUNCATED - this email is longer than shown. TELL THE USER you "
+                    "only read the first part, and do not assume the rest is unimportant.]")
         hdr = f"From: {r['from']}\nSubject: {r['subject']}"
         if r.get("date"):
             hdr += f"\nDate: {r['date']}"
-        out.append(f"{hdr}\n\n{body}")
-    return "\n\n----- next email -----\n\n".join(out)
+        note = ""
+        if r.get("images"):
+            names = ", ".join(i["filename"] for i in r["images"])
+            note += (f"\n\n[This email has {len(r['images'])} image attachment(s) ({names}), "
+                     f"shown to you after this text. READ THEM - a camp or school email "
+                     f"often puts the map, schedule, or key details in the picture.]")
+            images.extend(r["images"])
+        if r.get("skipped"):
+            note += (f"\n\n[This email also has attachment(s) you CANNOT read: "
+                     f"{', '.join(r['skipped'])}. Mention them so the user knows to look.]")
+        print(f"[read_email] -> {r['subject'][:60]!r} body={len(body)}c "
+              f"images={len(r.get('images') or [])} skipped={len(r.get('skipped') or [])}")
+        out.append(f"{hdr}\n\n{body}{note}")
+
+    text = "\n\n----- next email -----\n\n".join(out)
+    # A plain string when there's nothing to look at keeps every other caller unchanged;
+    # only the attachment case needs the richer shape.
+    return {"text": text, "images": images[:_MAX_ATTACHMENTS]} if images else text
 
 
 def _gmail_search(person, query, max_results):
@@ -2140,6 +2289,8 @@ def tool_search_email(query, person, max_results=5):
                 f"{BASE_URL}/connect?person={person} in a browser and sign in (this also "
                 f"connects the calendar). For Outlook/live.com, open "
                 f"{BASE_URL}/connect-microsoft?person={person} and sign in.")
+
+    query = _normalize_email_query(query)
 
     # Build queries suited to each provider. Gmail understands its own operators
     # (is:important, from:, after:); IMAP does not — to IMAP those are just literal
@@ -4170,8 +4321,23 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                         out = (f"That didn't work just now ({block.name} ran into a "
                                f"problem). Let the user know and offer to try again.")
                     tools_ran.append(block.name)
+                    # A tool normally returns a plain string. read_email may instead return
+                    # {"text": ..., "images": [...]} when the email carried a picture worth
+                    # looking at - a parking map, a schedule graphic, a flyer. The API
+                    # accepts image blocks inside a tool_result, so hand them to the model
+                    # directly rather than describing something we chose not to read.
+                    if isinstance(out, dict):
+                        content = [{"type": "text", "text": out.get("text", "")}]
+                        for img in out.get("images", []):
+                            content.append({"type": "image", "source": {
+                                "type": "base64", "media_type": img["media_type"],
+                                "data": img["data"]}})
+                            print(f"[tool] attached {img['filename']} ({img['media_type']}) "
+                                  f"to the {block.name} result")
+                    else:
+                        content = out
                     results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": out})
+                                    "content": content})
             messages.append({"role": "user", "content": results})
             continue
 
