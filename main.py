@@ -154,6 +154,10 @@ MS_IMAP_PORT = 993
 # the Philadelphia area; override with LATITUDE / LONGITUDE env vars.
 WEATHER_LAT = os.environ.get("LATITUDE", "39.95")
 WEATHER_LON = os.environ.get("LONGITUDE", "-75.16")
+# The town name shown alongside a forecast. Purely cosmetic, but it makes a WRONG location
+# VISIBLE instead of silent - the whole reason the Philadelphia-vs-Swarthmore gap went
+# unnoticed was that nothing ever said which place it was reporting on.
+WEATHER_PLACE = os.environ.get("WEATHER_PLACE", "")
 
 # AeroDataBox via RapidAPI — flight lookup by number+date. Free tier is enough for a
 # few trips a month. Set FLIGHT_API_KEY in Railway (the RapidAPI key). Without it, the
@@ -2740,6 +2744,24 @@ def tools_for_role(role, is_group=False):
 
     tools = []
 
+    # Weather is family-safe - no private data, useful to everyone, fine in the group - so
+    # every known role gets it, children included.
+    #
+    # It exists as a TOOL, not just the briefing's internal call, because of Trap 53: with
+    # no tool behind it, "what's the weather tomorrow" had no mechanism at all, and the
+    # model answered from imagination with a confident, entirely invented forecast.
+    tools.append({
+        "name": "weather",
+        "description": ("Get the REAL forecast for the family's location. You have no "
+                        "other source for weather - never state a temperature, condition, "
+                        "or chance of rain without calling this first, and never answer "
+                        "from memory. Use for 'what's the weather', 'will it rain "
+                        "tomorrow', 'do the girls need coats', or whenever a plan depends "
+                        "on conditions."),
+        "input_schema": {"type": "object", "properties": {
+            "when": {"type": "string", "enum": ["today", "tomorrow", "next_3_days"],
+                     "description": "Which day(s) to report. Defaults to today."}}}})
+
     if perms["calendar_read"]:
         tools.append({
             "name": "check_calendar",
@@ -3220,6 +3242,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
             return "You don't have calendar access."
         return tool_list_calendars(sender_name)
 
+    if name == "weather":
+        return tool_weather(tool_input.get("when", "today"))
     if name == "backup_now":
         return run_backup(reason="you asked")
     if name == "backup_link":
@@ -3368,6 +3392,8 @@ def capabilities_for_role(role, is_group=False):
         "always win. (Optional - I work fine without any rules.)",
         "A short briefing each morning - today's schedule, reminders due today, and detailed "
         "weather. (Automatic; adjust with settings.)",
+        "Weather: \"what's the weather tomorrow?\" - the real forecast for your area, "
+        "today through three days out.",
         "Check your setup: \"are my accounts connected?\"",
         "Back up the data: \"back up now\" and I'll send you the database file. I also back "
         "up automatically every night, and each new backup replaces the last one in the "
@@ -3550,6 +3576,17 @@ so honestly rather than claiming success. This includes adding to a list: "add X
 Y list" MUST call add_to_list before you say "Done" - never acknowledge a list addition
 you didn't actually make. The list name may be styled differently than stored (e.g. "GUPPI
 updates" vs "guppi updates"); match case-insensitively, don't treat it as a new list.
+
+CRITICAL, AND SEPARATE FROM THE ABOVE: never state a FACT you did not retrieve. The rule
+above is about not claiming an ACTION you didn't take; this one is about not asserting
+INFORMATION you never looked up. Weather, flight times, calendar details, email contents,
+prices, and anything else about the outside world must come from a tool result in this
+conversation. If no tool covers it, or the tool failed, say plainly that you couldn't look
+it up - do not produce a plausible-sounding answer from memory. A confident invented
+forecast or flight time is worse than "I don't know", because the person will act on it
+and has no way to tell it was made up. This applies even when you feel sure, and even when
+the person has just given you the missing detail (like a location) - having the INPUT for
+a lookup is not the same as having DONE the lookup.
 
 When a tool returns a confirmation with specific details - who will be reminded, which
 dates, any "heads up" caveat - relay those details faithfully. Don't soften "you and your
@@ -3825,51 +3862,59 @@ _WEATHER_CODES = {
     95: "Thunderstorms", 96: "Thunderstorms with hail", 99: "Severe thunderstorms",
 }
 
-def get_weather_line():
-    """A useful one-line forecast from open-meteo (no API key): condition, high/low, WHEN
-    precipitation is likely (morning/afternoon/evening), and notable-weather flags (heat,
-    cold, wind, storms). Best-effort; never fatal."""
+def _fetch_weather(days=1):
+    """Raw open-meteo fetch (no API key needed). Returns parsed JSON, or None if the
+    service can't be reached. `days` is how much forecast to pull: 1 for the morning
+    briefing, more for "what's it doing tomorrow".
+
+    A single transient 503/timeout shouldn't wipe the weather, so this retries a couple of
+    times with a short backoff before giving up (this is why a briefing once went out with
+    no weather at all)."""
     url = (f"https://api.open-meteo.com/v1/forecast?latitude={WEATHER_LAT}"
            f"&longitude={WEATHER_LON}"
            f"&daily=temperature_2m_max,temperature_2m_min,weather_code,"
            f"precipitation_probability_max,wind_speed_10m_max"
            f"&hourly=precipitation_probability,weather_code"
            f"&temperature_unit=fahrenheit&wind_speed_unit=mph"
-           f"&timezone=auto&forecast_days=1")
-    # A single transient 503/timeout shouldn't wipe the weather line — retry a couple
-    # times with a short backoff before giving up (this is why a briefing recently went
-    # out with no weather at all).
-    data = None
+           f"&timezone=auto&forecast_days={days}")
     for attempt in range(3):
         try:
             with urllib.request.urlopen(url, timeout=8) as r:
-                data = json.loads(r.read())
-            break
+                return json.loads(r.read())
         except Exception as e:
             print(f"[weather] attempt {attempt + 1} failed: {e}")
             if attempt < 2:
                 time.sleep(1.5 * (attempt + 1))
-    if data is None:
-        return None
+    print(f"[weather] gave up after 3 attempts (lat={WEATHER_LAT} lon={WEATHER_LON})")
+    return None
+
+
+def _weather_line(data, idx=0, prefix="Weather"):
+    """One useful line for day `idx` of a fetched forecast: condition, high/low, WHEN
+    precipitation is likely, and notable-weather flags (heat, cold, wind, storms).
+    Returns None if that day isn't in the data."""
     try:
         d = data["daily"]
-        hi = round(d["temperature_2m_max"][0])
-        lo = round(d["temperature_2m_min"][0])
-        code = d["weather_code"][0]
-        rain = d["precipitation_probability_max"][0]
-        wind = round(d.get("wind_speed_10m_max", [0])[0])
+        if idx >= len(d["temperature_2m_max"]):
+            return None
+        hi = round(d["temperature_2m_max"][idx])
+        lo = round(d["temperature_2m_min"][idx])
+        code = d["weather_code"][idx]
+        rain = d["precipitation_probability_max"][idx]
+        wind = round(d.get("wind_speed_10m_max", [0] * (idx + 1))[idx])
+        day_date = d["time"][idx]          # "2026-07-20"
         condition = _WEATHER_CODES.get(code, "Mixed")
 
         # Figure out WHEN precip is likely, from the hourly probabilities.
         timing = ""
         try:
             hourly = data["hourly"]
-            times = hourly["time"]
-            probs = hourly["precipitation_probability"]
-            # Bucket the day: morning (6-11), afternoon (12-17), evening (18-22).
             buckets = {"morning": [], "afternoon": [], "evening": []}
-            for t, p in zip(times, probs):
-                if p is None:
+            for t, p in zip(hourly["time"], hourly["precipitation_probability"]):
+                # Multi-day forecasts return every hour of every day in one flat list, so
+                # the hours MUST be filtered to the day being described - otherwise
+                # tomorrow's rain leaks into today's line.
+                if p is None or not t.startswith(day_date):
                     continue
                 hr = int(t[11:13])
                 if 6 <= hr <= 11:
@@ -3878,23 +3923,19 @@ def get_weather_line():
                     buckets["afternoon"].append(p)
                 elif 18 <= hr <= 22:
                     buckets["evening"].append(p)
-            # Which parts of day have a real chance (>40%)?
             wet = [name for name, ps in buckets.items() if ps and max(ps) >= 40]
             if rain >= 30 and wet:
                 timing = " in the " + " and ".join(wet) if len(wet) < 3 else " on and off"
         except Exception:
             pass
 
-        # Build the core line.
-        line = f"Weather: {condition.lower()}, high {hi} / low {lo}."
-        # Add precipitation detail when it matters.
+        line = f"{prefix}: {condition.lower()}, high {hi} / low {lo}."
         wet_conditions = code >= 51 or rain >= 30
         if wet_conditions:
             kind = ("snow" if 71 <= code <= 77 or 85 <= code <= 86 else
                     "storms" if code >= 95 else "rain")
             line += f" {rain}% chance of {kind}{timing}."
 
-        # Notable-event flags worth calling out.
         flags = []
         if hi >= 95:
             flags.append("very hot - stay hydrated")
@@ -3913,8 +3954,52 @@ def get_weather_line():
             line += " " + joined[0].upper() + joined[1:] + "."
         return line
     except Exception as e:
-        print(f"[weather] failed: {e}")
+        print(f"[weather] could not format day {idx}: {e}")
         return None
+
+
+def get_weather_line():
+    """Today's forecast line for the morning briefing. None when unavailable - and the
+    briefing must then say nothing about weather rather than fill the gap."""
+    data = _fetch_weather(days=1)
+    if not data:
+        return None
+    prefix = f"Weather in {WEATHER_PLACE}" if WEATHER_PLACE else "Weather"
+    return _weather_line(data, 0, prefix=prefix)
+
+
+# The string handed back when the lookup fails. It is written AT THE MODEL, not the user:
+# an empty or vague failure result is exactly what invites a plausible-sounding guess, so
+# the tool result itself carries the instruction not to invent one.
+_WEATHER_FAILED = ("WEATHER LOOKUP FAILED - the weather service could not be reached. "
+                   "Tell the user you couldn't get the forecast right now and offer to "
+                   "try again shortly. Do NOT state any temperature, condition, or chance "
+                   "of rain: you do not have that information, and producing a "
+                   "plausible-sounding one would be inventing data.")
+
+
+def tool_weather(when="today"):
+    """On-demand forecast for the family's location.
+
+    This tool exists because of a real failure: there was no weather tool at all, only the
+    briefing's internal call, so an interactive "what's the weather tomorrow" had no
+    mechanism behind it - and the model answered anyway, inventing a confident forecast
+    (Trap 53). A capability the model is expected to have must be a TOOL, or it will be
+    hallucinated."""
+    when = (when or "today").strip().lower().replace(" ", "_")
+    plan = {"today": [0], "tomorrow": [1], "next_3_days": [0, 1, 2]}.get(when, [0])
+    data = _fetch_weather(days=max(plan) + 1)
+    if not data:
+        return _WEATHER_FAILED
+    labels = {0: "Today", 1: "Tomorrow", 2: "Day after tomorrow"}
+    lines = [ln for ln in
+             (_weather_line(data, i, prefix=labels.get(i, f"Day +{i}")) for i in plan)
+             if ln]
+    if not lines:
+        return _WEATHER_FAILED
+    where = WEATHER_PLACE or f"{WEATHER_LAT}, {WEATHER_LON}"
+    print(f"[weather] served '{when}' for {where}")
+    return f"Forecast for {where}:\n" + "\n".join(lines)
 
 
 def fetch_telegram_document(file_id, mime_type=None, file_name=None):
@@ -4063,6 +4148,7 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     tools = tools_for_role(sender_role, is_group)
     system = build_system_prompt(sender_name, sender_role, is_group)
 
+    tools_ran = []
     for _ in range(6):
         response = claude.messages.create(
             model=MODEL, max_tokens=800, system=system, tools=tools, messages=messages)
@@ -4083,13 +4169,23 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                         print(f"[tool] ERROR in '{block.name}' input={block.input}: {e}")
                         out = (f"That didn't work just now ({block.name} ran into a "
                                f"problem). Let the user know and offer to try again.")
+                    tools_ran.append(block.name)
                     results.append({"type": "tool_result", "tool_use_id": block.id,
                                     "content": out})
             messages.append({"role": "user", "content": results})
             continue
 
-        reply = "".join(b.text for b in response.content if b.type == "text")
-        reply = reply.strip() or "Sorry, I didn't catch that - can you say it another way?"
+        reply = "".join(b.text for b in response.content if b.type == "text").strip()
+        if not reply:
+            # The model sometimes runs a tool and then returns no words at all. The old
+            # fallback said "I didn't catch that", which is a LIE when the work actually
+            # happened - a person told their location wasn't saved when it had been. Never
+            # report failure for a turn that succeeded.
+            if tools_ran:
+                print(f"[guppi] empty reply after tools ran: {tools_ran}")
+                reply = "Done - that's taken care of."
+            else:
+                reply = "Sorry, I didn't catch that - can you say it another way?"
         # Remember this exchange for next time (store the raw user text, not the
         # time-hint wrapper, so history stays readable and doesn't pile up stale clocks).
         placeholder = "(sent a photo)" if image_data else ("(sent an attachment)" if doc_data else None)
@@ -4721,13 +4817,16 @@ def job_morning_briefing():
             return
         reminders = reminders_for_briefing(for_chat=chat)
         context = (f"Today's calendar:\n{calendar}\n\nReminders due today:\n{reminders}\n\n"
-                   f"{weather or ''}")
+                   f"{weather or 'WEATHER: unavailable - could not be fetched.'}")
         try:
             resp = claude.messages.create(
                 model=MODEL, max_tokens=300,
                 system=("You are Guppi. Write ONE short, plain-text good-morning briefing "
                         "for a parent, summarizing today's schedule, any reminders DUE "
-                        "TODAY, and the weather. Only mention reminders that are actually "
+                        "TODAY, and the weather. If the weather line says unavailable, "
+                        "omit weather from the briefing entirely - NEVER invent a "
+                        "forecast, temperature, or chance of rain. Only mention "
+                        "reminders that are actually "
                         "due today or imminent - do not list far-off ones. Reason about the "
                         "TIMING of each event, don't just announce it: if an event is "
                         "marked in-progress or spans overnight into today (like a sleepover "
