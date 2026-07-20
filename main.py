@@ -763,23 +763,26 @@ def welcome_message(name, role):
                 "draft & send replies (I always show you first)\n"
                 "• Travel — give me a flight number and I'll build the trip on your calendar\n"
                 "• Photos & PDFs — send a school flyer and I'll pull out the events\n\n"
-                "I'll also send a morning briefing. Say \"what can you do?\" for the full "
-                "rundown with setup steps, \"help\" anytime, or just ask me something.")
+                "I'll also send a morning briefing.")
     elif role == "caregiver":
         body = ("Here's what I can help with:\n"
                 "• Calendar — \"what's on the kids' schedule today?\", \"add gymnastics "
                 "Tuesday at 4\"\n"
                 "• Reminders — \"remind me to pack Lillian's cleats Friday morning\"\n"
                 "• Lists — \"add snacks to the shopping list\"\n"
-                "• Photos — send me a flyer and I'll offer to add it to the calendar\n\n"
-                "Say \"help\" anytime, or just ask.")
+                "• Photos — send me a flyer and I'll offer to add it to the calendar")
     else:  # child
         body = ("I can help you with the family calendar and reminders!\n"
                 "• \"What's on the calendar this weekend?\"\n"
                 "• \"Remind me about my science project Thursday\"\n"
-                "• You can ask me questions too.\n\n"
-                "Just say \"help\" if you forget what I can do.")
-    return intro + body
+                "• You can ask me questions too.")
+    # Every new person learns on day one that a complete guide exists. This is the single
+    # highest-value line in the whole onboarding: the barrier was never the features, it
+    # was knowing what to SAY to trigger them.
+    tail = ("\n\nSay *guide* any time and I'll show you everything I can do, topic by "
+            "topic, with the exact words to use. You don't have to phrase things exactly "
+            "right - just ask me in your own words and I'll work it out.")
+    return intro + body + tail
 
 
 def welcome_for(name):
@@ -3853,6 +3856,282 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     return "Unknown tool."
 
 
+# =============================================================================
+#  THE USER GUIDE  —  one source of truth for "what can you do and how"
+# =============================================================================
+#  Written because the honest answer to "does a new person understand this?" was no.
+#  Three things were wrong, and only one of them was a missing feature list:
+#
+#   1. There were TWO help systems that could disagree - /help sent welcome_message()
+#      while "what can you do?" was answered by the MODEL from capabilities_for_role().
+#   2. capabilities_for_role is a briefing that literally instructs "keep it to the
+#      highlights", so a complete answer was impossible by construction.
+#   3. The list had drifted eight features behind the tools, and nothing detected it.
+#
+#  So: ONE structure, delivered MODEL-FREE (the model cannot summarise away what it never
+#  touches), organised by topic, and PHRASE-FIRST - the exact words to say. Knowing a
+#  feature exists is useless if you can't guess the trigger, which was the real barrier.
+#
+#  `tools` on each topic is not decoration: _audit_guide_coverage() checks at startup that
+#  every registered tool is documented somewhere here, and complains loudly otherwise. The
+#  old list drifted because nothing was watching.
+# =============================================================================
+
+GUIDE_TOPICS = [
+    {
+        "key": "calendar", "title": "Calendar",
+        "roles": ("adult", "caregiver", "child"), "private_only": False,
+        "tools": ["check_calendar", "add_calendar_event", "edit_calendar_event",
+                  "delete_calendar_event", "find_events", "list_calendars"],
+        "summary": "See, add, change and delete events on the family calendar.",
+        "body": [
+            "SEE IT: \"what's on the calendar this week?\", \"what's on today?\", "
+            "\"when is Charlotte's camp?\"",
+            "ADD: \"add Reese's game Saturday 10am at the high school\". Tell me anything "
+            "useful - what to bring, who's going, cost - and I'll put it in the event so "
+            "it's there when you open it on your phone.",
+            "JUST FOR YOU: say \"my work thing\" or \"just for me\" and I'll colour it "
+            "sage so your own commitments stand out from family ones.",
+            "CHANGE OR CANCEL: \"move the dentist to 3pm\", \"cancel Saturday's game\".",
+            "SOMETHING ON SEVERAL DAYS: \"add camp 9am to 4pm Monday through Thursday\" - "
+            "I make ONE repeating event, not four. To remove it, say whether you mean just "
+            "that day or the whole thing; I'll ask if you don't.",
+            "(Needs a Google Calendar connected - a parent does this once.)",
+        ],
+    },
+    {
+        "key": "reminders", "title": "Reminders and nudges",
+        "roles": ("adult", "caregiver", "child"), "private_only": False,
+        "tools": ["add_reminder", "list_reminders", "delete_reminder", "nudge"],
+        "summary": "Get pinged about something - yourself, or someone else in the family.",
+        "body": [
+            "FOR YOURSELF: \"remind me to call the dentist Thursday at 10am\", "
+            "\"remind me in an hour\", \"remind me tonight\".",
+            "REPEATING: \"every Sunday at 7pm remind me to take out the recycling\".",
+            "FOR SOMEONE ELSE (parents only): \"remind the girls about permission slips "
+            "tomorrow at 7:30am\", \"remind Kim at 5 to collect the prescription\".",
+            "SEE AND REMOVE: \"what reminders do I have?\", \"delete the recycling one\".",
+            "If you ask twice for the same thing at the same time I won't create a second "
+            "one - I'll tell you it's already set.",
+        ],
+    },
+    {
+        "key": "lists", "title": "Shared lists",
+        "roles": ("adult", "caregiver", "child"), "private_only": False,
+        "tools": ["add_to_list", "add_items_to_list", "show_all_lists", "show_list",
+                  "check_off_item", "clear_list", "remove_from_list", "save_template",
+                  "start_from_template", "list_templates"],
+        "summary": "Grocery, packing, to-do - shared with everyone.",
+        "body": [
+            "\"add milk to the grocery list\", \"add eggs, bread and butter\"",
+            "\"what's on the grocery list?\", \"what lists do I have?\"",
+            "\"check off the milk\", \"take eggs off the list\", \"clear the grocery list\"",
+            "REUSABLE: \"save this as my travel list\", then later \"start my travel "
+            "list\" to bring it all back.",
+        ],
+    },
+    {
+        "key": "email", "title": "Email - reading and sending",
+        "roles": ("adult",), "private_only": True,
+        "tools": ["search_email", "read_email", "draft_email", "send_pending_email",
+                  "discard_draft"],
+        "summary": "Search and read your inbox, and send replies (always shown first).",
+        "body": [
+            "FIND AND READ: \"any important emails today?\", \"find the invoice from "
+            "Mark\", \"read the email about the basketball camp\".",
+            "I read the WHOLE email, including pictures attached to it - a parking map or a "
+            "schedule graphic - so you can ask \"what does the map show?\"",
+            "SEND: \"reply to the coach that we'll be late\", \"email Kim the grocery "
+            "list\". I ALWAYS show you the draft first and send NOTHING until you say "
+            "\"send it\". You can say \"change the wording\" or \"discard that\".",
+            "This is your own inbox only, and only in a private chat - never in the group.",
+            "(Needs your email connected. Say \"connect my email\" and I'll send a link. "
+            "If you connected before sending existed, reconnect once to allow it.)",
+        ],
+    },
+    {
+        "key": "flags", "title": "What email I flag you about",
+        "roles": ("adult",), "private_only": True,
+        "tools": ["manage_email_priorities", "manage_deadline_ignores"],
+        "summary": "Control which senders I chase you about, and which I leave alone.",
+        "body": [
+            "I watch new mail and flag deadlines, invoices and RSVPs, offering to set a "
+            "reminder or add it to the calendar. I skip marketing and newsletters.",
+            "ALWAYS TELL ME: \"always flag emails from the school\", \"the coach is "
+            "important\".",
+            "NEVER TELL ME: \"never flag newsletters\", \"ignore Robinhood\".",
+            "STOP CHASING DEADLINES FROM ONE SENDER: \"stop flagging deadlines from "
+            "Todoist\" - different from ignoring them entirely.",
+            "SEE THE RULES: \"what are my email priorities?\"",
+            "I also quietly notice what you act on versus ignore, and will OFFER to adjust. "
+            "I only ever suggest - your rules always win.",
+        ],
+    },
+    {
+        "key": "occasions", "title": "Birthdays, anniversaries and renewals",
+        "roles": ("adult",), "private_only": False,
+        "tools": ["add_occasion", "list_occasions", "delete_occasion"],
+        "summary": "Dates I warn you about well in advance, not on the day.",
+        "body": [
+            "\"remember Mom's birthday is March 5\", \"our anniversary is June 12\", "
+            "\"we're going to Disney July 20-27\", \"the car registration renews in "
+            "October\".",
+            "I nudge you 30, 7 and 1 days ahead (90/30/7/1 for trips) and offer gift ideas "
+            "or a packing list - early enough to actually do something.",
+            "\"what occasions are you tracking?\", \"stop tracking the registration\".",
+            "Say \"just me\" to keep one private; otherwise both parents get the warnings.",
+        ],
+    },
+    {
+        "key": "memory", "title": "What I remember",
+        "roles": ("adult", "caregiver", "child"), "private_only": True,
+        "tools": ["remember", "recall", "forget"],
+        "summary": "Facts I keep about the family - and how to change or delete them.",
+        "body": [
+            "\"remember that Charlotte is allergic to peanuts\", \"remember Lillian's "
+            "teacher is Mrs Bell\".",
+            "\"what do you remember?\" - the full list, any time.",
+            "\"forget that\", \"forget the bit about the teacher\".",
+            "CORRECT ME: \"it's WSSD, not WADS\" - I replace the old fact, I don't keep both.",
+            "I save durable things: names, relationships, allergies, standing arrangements. "
+            "I deliberately DON'T save anything sensitive - health details, arguments, money, "
+            "or how someone is doing. Dates go to occasions instead, so they get warnings.",
+        ],
+    },
+    {
+        "key": "group", "title": "Talking to me in the family group",
+        "roles": ("adult", "caregiver", "child"), "private_only": False,
+        "tools": ["add_commitment", "list_commitments", "complete_commitment"],
+        "summary": "How to get my attention there, and what I keep out of it.",
+        "body": [
+            "In the group I stay quiet unless you're talking TO me - otherwise I'd interrupt "
+            "every conversation. Say my name anywhere in the message (\"Guppi, add...\", "
+            "\"can you check the calendar, Guppi?\"), or just reply to one of my messages.",
+            "WHO'S DOING WHAT: say \"I'll grab Charlotte at 3\" and I'll note it. Ask "
+            "\"what's on our plate?\" and I'll list who has what. \"I've got Charlotte\" "
+            "marks it done.",
+            "If I overhear something schedulable I'll OFFER once - I never add it unless you "
+            "say yes.",
+            "NEVER in the group: your email, saved memories, settings, backups. Ask me those "
+            "privately and I'll answer properly.",
+        ],
+    },
+    {
+        "key": "settings", "title": "Settings and your accounts",
+        "roles": ("adult",), "private_only": True,
+        "tools": ["show_settings", "update_setting", "connection_health", "connect_link",
+                  "invite_person", "backup_now", "backup_link"],
+        "summary": "Everything you can turn up, down or off.",
+        "body": [
+            "SEE EVERYTHING: \"show me your settings\".",
+            "HOW CHATTY I AM: \"set the daily message cap to 15\" - this limits messages I "
+            "send on my OWN. Answers to you are never limited.",
+            "QUIET HOURS: \"quiet hours from 9pm to 7am\" - I won't message unprompted then.",
+            "TURN OFF UNPROMPTED MESSAGES: \"turn off proactive messages\" (and \"turn "
+            "them back on\").",
+            "HOW OFTEN I CHECK EMAIL: \"check email every 15 minutes\".",
+            "ACCOUNTS: \"are my accounts connected?\", \"connect my email\", \"send me "
+            "a reconnect link\". I'll tell you honestly if something has expired.",
+            "ADD A PERSON: \"invite Breanna\" - then they message me /start. That's how "
+            "kids and a caregiver join without the setup code.",
+            "BACKUPS: I back up nightly and each one replaces the last. \"back up now\" "
+            "for one on demand, or \"send me a backup link\" to save a copy to your own "
+            "device.",
+        ],
+    },
+    {
+        "key": "extras", "title": "Travel, weather, photos and questions",
+        "roles": ("adult", "caregiver", "child"), "private_only": False,
+        "tools": ["add_flight", "weather", "web_search"],
+        "summary": "Flights, forecasts, reading documents, general questions.",
+        "body": [
+            "FLIGHTS (parents): \"I'm on AA1234 July 22, back AA1428 the 29th\" - I look "
+            "up the real times and put the trip and both flights on the calendar.",
+            "WEATHER: \"what's the weather tomorrow?\" - today through three days out, "
+            "for your town.",
+            "PHOTOS AND PDFs: send me a school flyer, permission slip or handwritten list - "
+            "even a scan - and I'll read it, pull out the dates, check them against the "
+            "calendar and offer to add them.",
+            "Or just ask me things. I can look something up on the web if I need to.",
+        ],
+    },
+]
+
+
+def _guide_for(role, is_group):
+    """The topics this person can actually use, here."""
+    return [t for t in GUIDE_TOPICS
+            if role in t["roles"] and not (is_group and t["private_only"])]
+
+
+def guide_menu(name, role, is_group=False):
+    """The short, scannable menu. Model-free: this text is sent verbatim."""
+    topics = _guide_for(role, is_group)
+    if not topics:
+        return "I don't have a guide for you yet - ask a parent to add you."
+    lines = [f"Here's everything I can do{', ' + name if name else ''}. "
+             f"Say \"guide <topic>\" for the detail and the exact words to use:", ""]
+    for t in topics:
+        lines.append(f"• *{t['title']}* - {t['summary']}\n   → \"guide {t['key']}\"")
+    lines.append("")
+    lines.append("Or just ask me for something in your own words - you don't have to get "
+                 "the phrasing exactly right.")
+    if is_group:
+        lines.append("Some things (email, memory, settings) only work in a private chat "
+                     "with me - message me directly for those.")
+    return "\n".join(lines)
+
+
+def guide_section(topic_key, role, is_group=False):
+    """One topic in full. Model-free."""
+    key = (topic_key or "").strip().lower()
+    topics = _guide_for(role, is_group)
+    match = next((t for t in topics if t["key"] == key), None)
+    if not match:
+        match = next((t for t in topics
+                      if key and (key in t["key"] or key in t["title"].lower()
+                                  or key in t["summary"].lower())), None)
+    if not match:
+        names = ", ".join(t["key"] for t in topics)
+        return (f"I don't have a guide section called that. Try one of: {names} - "
+                f"or say \"guide\" for the menu.")
+    out = [f"*{match['title']}*", ""]
+    out += [f"• {line}" for line in match["body"]]
+    out.append("")
+    out.append("Say \"guide\" for the other topics.")
+    return "\n".join(out)
+
+
+def _audit_guide_coverage():
+    """Fail loudly if a tool exists that the guide never mentions.
+
+    The previous capabilities list drifted EIGHT features behind the tools - deadline
+    ignores, commitments, connect links, recurrence and more were all undocumented -
+    because nothing checked. This runs at startup so the gap shows up in the logs the
+    first time someone adds a tool and forgets the guide."""
+    documented = {name for t in GUIDE_TOPICS for name in t["tools"]}
+    # Internal/administrative tools a user never needs to be taught.
+    exempt = {"list_calendars"}
+    registered = set()
+    for role in ("adult", "caregiver", "child"):
+        for grp in (False, True):
+            for t in tools_for_role(role, grp):
+                n = t.get("name")
+                if n:
+                    registered.add(n)
+    missing = registered - documented - exempt
+    stale = documented - registered
+    if missing:
+        print(f"[guide] WARNING {len(missing)} tool(s) are NOT in the user guide: "
+              f"{sorted(missing)}")
+    if stale:
+        print(f"[guide] note: guide mentions tools that no longer exist: {sorted(stale)}")
+    if not missing and not stale:
+        print(f"[guide] coverage OK - {len(registered)} tools across "
+              f"{len(GUIDE_TOPICS)} topics")
+    return missing, stale
+
+
 def capabilities_for_role(role, is_group=False):
     """An accurate 'what I can do' rundown, tailored to who's asking AND to where.
     Never offers a feature the person can't use, or one that's private in a group."""
@@ -3955,7 +4234,15 @@ def capabilities_for_role(role, is_group=False):
              "calendar.\n"
              if is_group else "")
 
-    return (where + "When asked what you can do or for help, give a friendly summary of the "
+    return (where + "There is a COMPLETE, accurate user guide built in: the person can say "
+            "\"guide\" for a topic menu or \"guide email\" (calendar / reminders / lists / "
+            "email / flags / occasions / memory / group / settings / extras) for the full "
+            "detail and the exact phrases. After you answer a question about ANY feature "
+            "area, offer that guide ONCE - 'say \"guide\" and I'll show you everything I "
+            "can do' - and do not repeat the offer later in the same conversation. If "
+            "someone seems unsure what's possible, point them there rather than trying to "
+            "list everything yourself.\n\n"
+            "When asked what you can do or for help, give a friendly summary of the "
             "most relevant items below - for a general 'what can you do?' keep it to the "
             "highlights grouped sensibly and offer to go deeper on any area. If they ask "
             "about EVERYTHING or a specific feature, give the full detail including what (if "
@@ -5179,6 +5466,31 @@ async def telegram_webhook(request: Request):
     # ---- /help: a reliable, model-free help message, tailored to the person -------
     # The slash-command works anywhere. The bare words "help"/"menu" only count in a
     # private chat, so a casual "help" in the group doesn't wake Guppi.
+    # ---- The user guide. Model-FREE on purpose: the old "what can you do?" answer was
+    # improvised by the model from a briefing that told it to "keep it to the highlights",
+    # so a complete answer was impossible. These are sent verbatim.
+    _t = text.strip().lower().strip("?!.")
+    _t = re.sub(rf"^(hey |ok )?({'|'.join(_BOT_NAMES)})[,: ]+", "", _t).strip()
+    _GUIDE_TRIGGERS = (
+        "what can you do", "what else can you do", "what can u do", "how do i use you",
+        "how do you work", "what do you do", "can you explain how to use",
+        "explain how to use", "how do i use this", "what are you able to do",
+        "show me what you can do", "full guide", "user guide")
+    if _t.startswith("/guide") or _t.startswith("guide"):
+        name, role = identify_sender(sender_chat_id)
+        arg = _t.split(maxsplit=1)[1].strip() if len(_t.split(maxsplit=1)) > 1 else ""
+        send_message(chat_id,
+                     guide_section(arg, role, is_group) if arg
+                     else guide_menu(name, role, is_group))
+        print(f"[guide] served {'section ' + arg if arg else 'menu'} to {name or 'unknown'}")
+        return {"ok": True}
+    if any(g in _t for g in _GUIDE_TRIGGERS):
+        name, role = identify_sender(sender_chat_id)
+        if role in ("adult", "caregiver", "child"):
+            send_message(chat_id, guide_menu(name, role, is_group))
+            print(f"[guide] served menu to {name} (natural-language ask)")
+            return {"ok": True}
+
     _t = text.strip().lower()
     if _t in ("/help", "/menu") or (not is_group and _t in ("help", "menu")):
         name, role = identify_sender(sender_chat_id)
@@ -6099,4 +6411,8 @@ def set_webhook(secret: str = ""):
 
 
 init_db()
+try:
+    _audit_guide_coverage()
+except Exception as e:
+    print(f"[guide] coverage audit failed: {e}")
 start_scheduler()
