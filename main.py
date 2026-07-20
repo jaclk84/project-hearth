@@ -413,7 +413,11 @@ def _make_access_token(purpose, minutes=BACKUP_LINK_MINUTES):
     if not TELEGRAM_SETUP_SECRET:
         return None
     exp = int(time.time()) + minutes * 60
-    nonce = _secrets.token_urlsafe(12)
+    # token_hex, NOT token_urlsafe: urlsafe emits "_" and "-", and an underscore inside a
+    # link makes Telegram's Markdown parser reject the whole message (HTTP 400). The
+    # plain-text retry rescued it every time, but it logged an error on every send and
+    # would have silently degraded formatting. Hex is 0-9a-f - nothing Markdown reacts to.
+    nonce = _secrets.token_hex(12)
     payload = f"{purpose}:{exp}:{nonce}"
     sig = hmac.new(TELEGRAM_SETUP_SECRET.encode(), payload.encode(),
                    "sha256").hexdigest()[:24]
@@ -4002,6 +4006,38 @@ def _live_state_block(sender_name, sender_role, is_group):
         print(f"[state] could not load memories: {e}")
 
     if sender_role == "adult":
+        # Whether THIS person's own accounts are alive. Cheap (settings + one row each,
+        # no network), and it closes a real hole: Kim asked "why do you think it needs to
+        # reconnect?" and Guppi, having no idea, told her the connection seemed fine -
+        # actively talking her out of the reconnect she needed.
+        try:
+            conn = db()
+            has_g = conn.execute("SELECT 1 FROM google_tokens WHERE person = ?",
+                                 (sender_name,)).fetchone()
+            has_m = conn.execute("SELECT 1 FROM ms_tokens WHERE person = ?",
+                                 (sender_name,)).fetchone()
+            conn.close()
+            bits = []
+            if not has_g:
+                bits.append("  Google (calendar + Gmail): NOT CONNECTED")
+            elif google_needs_reconnect(sender_name):
+                bits.append("  Google (calendar + Gmail): DEAD - NEEDS RECONNECTING")
+            else:
+                bits.append("  Google (calendar + Gmail): connected")
+            if has_m:
+                bits.append("  Microsoft (live.com email): "
+                            + ("DEAD - NEEDS RECONNECTING"
+                               if ms_needs_reconnect(sender_name) else "connected"))
+            parts.append(
+                "THIS PERSON'S ACCOUNT CONNECTIONS (live from the database, this turn):\n"
+                + "\n".join(bits) +
+                "\n  If anything says NEEDS RECONNECTING, say so plainly and offer the "
+                "connect_link tool. IMPORTANT: adding to the FAMILY CALENDAR can succeed "
+                "using ANOTHER parent's account, so 'the calendar worked' is NOT evidence "
+                "that THIS person's connection is healthy - trust this list, not what "
+                "appeared to work.")
+        except Exception as e:
+            print(f"[state] could not load connection health: {e}")
         try:
             pri = _priority_senders(sender_name)
             ign = _ignored_senders()
@@ -4308,6 +4344,12 @@ before you say it. A negative feels like modesty rather than a fact, which is ex
 it slips out unchecked - it is the easiest kind of wrong answer to give confidently. If the
 live state above already answers it, use that. Otherwise call the tool. Never conclude
 something is missing because you cannot see it in the conversation.
+
+NEVER JUDGE WHETHER AN ACCOUNT IS CONNECTED FROM INDIRECT EVIDENCE. "It worked when I
+added a calendar event" does NOT mean that person's own account is healthy - the family
+calendar can be written using a different parent's account entirely. Use the connection
+list above, or call connection_health. Telling someone their connection is fine when it is
+dead stops them fixing it, which is worse than saying nothing.
 
 A QUESTION ABOUT WHAT IS STORED RIGHT NOW ALWAYS GETS A FRESH LOOK. "What do you remember?",
 "what are my priority rules?", "what's on the list?", "what reminders do I have?" ask about
