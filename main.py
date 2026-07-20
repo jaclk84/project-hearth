@@ -1353,11 +1353,19 @@ def save_ms_token(person, tok, email_addr=None):
                  (person, email_addr, refresh, tok.get("access_token"), expires_at))
     conn.commit()
     conn.close()
+    # A successful save (fresh connect OR a working refresh) means the token is alive again
+    # — clear any dead flag so the short-circuit in get_ms_access_token stops blocking it.
+    set_setting(f"ms_dead_{person}", "")
 
 
 def get_ms_access_token(person):
     """A valid access token for this person, refreshing if needed. None if not connected."""
     if not person or not MS_CLIENT_ID:
+        return None
+    # If this token is already known-dead (a prior refresh failed and it needs a manual
+    # reconnect), don't keep hammering Microsoft on every scheduler job — that just spams
+    # the logs and the endpoint. Stay quiet until the reconnect clears the flag.
+    if get_setting(f"ms_dead_{person}") == "1":
         return None
     conn = db()
     row = conn.execute("SELECT refresh_token, access_token, expires_at FROM ms_tokens "
@@ -2698,8 +2706,10 @@ def tools_for_role(role, is_group=False):
                             "Use this - not search_email - whenever someone asks what an "
                             "email says, or wants an event or reminder created from an "
                             "email. It returns the whole message so you can pull out the "
-                            "who / what / when / where. `query` finds the email (e.g. "
-                            "'from:school field trip', 'Azie appointment')."),
+                            "who / what / when / where. `query` finds the email: use plain "
+                            "topic words (e.g. 'field trip permission', 'Azie appointment') "
+                            "or from:<address-or-domain> (e.g. 'from:swarthmore') - never "
+                            "put a subject phrase after from:."),
             "input_schema": {"type": "object", "properties": {
                 "query": {"type": "string"}}, "required": ["query"]}})
         tools.append({
@@ -3404,8 +3414,21 @@ even when the user says "remember" - e.g. "remember Lillian's birthday is April 
 add_occasion call, not a remember call. Only use remember for non-date facts (preferences,
 allergies, standing details).
 
-When searching email, build broad queries. Senders rarely match a plain name - mail
-"from Google" comes from addresses like no-reply@accounts.google.com.
+When searching email, build broad queries and use search operators CORRECTLY. Senders
+rarely match a plain name - mail "from Google" comes from addresses like
+no-reply@accounts.google.com. IMPORTANT: `from:` takes an email address or domain fragment
+ONLY (e.g. from:swarthmore, from:coach@team.com), NEVER a subject phrase - `from:Spring
+Lacrosse Update` is wrong and finds nothing. To search by topic or subject words, just use
+the words as plain search terms (e.g. "lacrosse schedule", "spring camp"), with no operator.
+To search by time, use one operator like newer_than:7d. Don't stack many OR'd operators into
+one long query - run a couple of simple, broad searches instead. If a search returns nothing,
+consider that the QUERY may be wrong, not that the mail doesn't exist - say you didn't find
+anything with that search rather than asserting the inbox is empty.
+
+If someone asks "what emails are flagged?", "what am I flagging?", or "what senders are
+priority?", they're asking about their PRIORITY RULES, not asking you to search the inbox -
+call manage_email_priorities (action list) to show their rules. Only search the inbox if they
+clearly want you to look at actual messages.
 
 When someone asks about a specific email, or asks you to schedule something from an email,
 use read_email (not search_email) so you see the FULL message. Read it for the scheduling
