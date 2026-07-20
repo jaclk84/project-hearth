@@ -427,10 +427,18 @@ def _used_token_key(nonce):
     return f"usedtok_{now_local().strftime('%Y-%m-%d')}_{nonce}"
 
 
-def _verify_access_token(token, purpose):
+def _verify_access_token(token, purpose, single_use=True):
     """True only for a token we signed, for THIS purpose, unexpired and not yet used.
     Checks run cheapest-first, and the nonce is burned ONLY after the signature passes -
-    otherwise a stranger could burn valid nonces by guessing."""
+    otherwise a stranger could burn valid nonces by guessing.
+
+    single_use=False for the CONNECT links. Single-use cannot survive that flow: the first
+    request only redirects to Google/Microsoft, and anything that pre-fetches a URL - a
+    link-preview crawler, a browser, an antivirus scanner, or the person simply hitting
+    back and trying again - consumes the token before the real sign-in happens. Those
+    links stay signed, person-bound and 30-minute, which is what actually protects them;
+    burning them on first touch only guaranteed they never worked.
+    The backup/restore links stay single-use: there the first request IS the download."""
     if not TELEGRAM_SETUP_SECRET or not token:
         return False
     try:
@@ -452,10 +460,11 @@ def _verify_access_token(token, purpose):
             return False
     except ValueError:
         return False
-    if get_setting(_used_token_key(nonce)):
-        print("[link] rejected: already used")
-        return False
-    set_setting(_used_token_key(nonce), "1")
+    if single_use:
+        if get_setting(_used_token_key(nonce)):
+            print("[link] rejected: already used")
+            return False
+        set_setting(_used_token_key(nonce), "1")
     return True
 
 
@@ -940,7 +949,7 @@ def connect(person: str = "", secret: str = "", token: str = ""):
     # Accept EITHER the raw setup secret (bootstrapping, and older bookmarks) or a signed
     # per-person token minted by the connect_link tool (A1).
     if not (_secret_ok(secret) or
-            (person and _verify_access_token(token, _connect_purpose(person)))):
+            (person and _verify_access_token(token, _connect_purpose(person), single_use=False))):
         return HTMLResponse(
             "<h2>This sign-in link is invalid or expired</h2><p>Ask Guppi for a new "
             "connect link in a private chat - they expire after 30 minutes and work "
@@ -1737,7 +1746,7 @@ def connect_microsoft(person: str = "", secret: str = "", token: str = ""):
         return HTMLResponse("<h2>Microsoft isn't configured yet.</h2>"
                             "<p>MS_CLIENT_ID and MS_CLIENT_SECRET need to be set in Railway.</p>")
     if not (_secret_ok(secret) or
-            (person and _verify_access_token(token, _connect_purpose(person)))):
+            (person and _verify_access_token(token, _connect_purpose(person), single_use=False))):
         return HTMLResponse(
             "<h2>This sign-in link is invalid or expired</h2><p>Ask Guppi for a new "
             "connect link in a private chat - they expire after 30 minutes and work "
@@ -4400,14 +4409,26 @@ def send_message(chat_id, body, markdown=True, proactive=False):
         print("[tg] proactive cap reached; not sending")
         return False
 
-    payload = {"chat_id": str(chat_id), "text": body}
+    # Telegram FETCHES every link in an outgoing message to build a preview card, from
+    # its own servers, the moment the message is sent. That prefetch burned Kim's
+    # single-use connect token before she could click it (307 from Telegram's crawler,
+    # then 403 "already used" from her browser). It is also a data-leak risk: a preview
+    # fetch of a /backup link would pull the whole database onto Telegram's servers.
+    # link_preview_options is the current field; disable_web_page_preview is the older
+    # one. Sending both is harmless and covers whichever the API honours.
+    payload = {"chat_id": str(chat_id), "text": body,
+               "disable_web_page_preview": True,
+               "link_preview_options": {"is_disabled": True}}
     if markdown:
         payload["parse_mode"] = "Markdown"
     res = telegram_api("sendMessage", payload)
     if res is None and markdown:
         # Markdown can fail on stray characters; retry as plain text rather than
         # silently dropping the message.
-        res = telegram_api("sendMessage", {"chat_id": str(chat_id), "text": body})
+        res = telegram_api("sendMessage", {
+            "chat_id": str(chat_id), "text": body,
+            "disable_web_page_preview": True,
+            "link_preview_options": {"is_disabled": True}})
     if res is not None:
         if proactive:
             bump_count("messages")   # only unprompted messages count toward the cap
@@ -4934,6 +4955,24 @@ def _group_scheduling_intent(text):
 _GROUP_REPLY_WINDOW = {}
 _GROUP_REPLY_SECONDS = 150   # ~2.5 minutes to answer Guppi's offer/question
 
+def _reply_invites_an_answer(reply):
+    """Did Guppi actually open a loop, or just answer and stop?
+
+    The reply window was opened after EVERY group reply, so for 2.5 minutes afterwards any
+    message from that person counted as addressed. That is how "Beware the milk is off"
+    got answered: Jason had been talking to Guppi moments earlier, so his window was still
+    open and ordinary chatter was treated as a reply. A window should only exist when
+    there is a question waiting to be answered."""
+    if not reply:
+        return False
+    r = reply.lower()
+    if "?" in r:
+        return True
+    return any(p in r for p in (
+        "want me to", "shall i", "should i", "would you like", "let me know",
+        "just say the word", "tell me and i", "if you want me to"))
+
+
 def _open_reply_window(group_chat_id, person_id):
     if group_chat_id and person_id:
         _GROUP_REPLY_WINDOW[(str(group_chat_id), str(person_id))] = time.time()
@@ -5198,7 +5237,7 @@ async def telegram_webhook(request: Request):
     send_message(chat_id, reply)
     # In a group, opening a short reply window means the person's NEXT message (their
     # "yes"/"actually 4:40") is treated as a reply to Guppi and won't be dropped.
-    if is_group and reply:
+    if is_group and reply and _reply_invites_an_answer(reply):
         _open_reply_window(chat_id, sender_chat_id)
         # B5: the window was opened ONLY for the person who spoke. Kim asked Guppi to
         # remind Jason, Guppi asked a clarifying question, JASON answered "Yes I'm here" -
