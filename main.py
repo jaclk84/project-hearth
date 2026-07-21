@@ -194,10 +194,16 @@ def _log_cache_usage(resp, had_tools):
         read = getattr(u, "cache_read_input_tokens", 0) or 0
         write = getattr(u, "cache_creation_input_tokens", 0) or 0
         fresh = getattr(u, "input_tokens", 0) or 0
-        if read or write:
+        if read:
             saved = read * 0.9 / 1_000_000        # reads cost 10% of base input
-            print(f"[cache] {'HIT' if read else 'write'} read={read} write={write} "
-                  f"uncached={fresh} (saved ~${saved:.5f} on this call)")
+            print(f"[cache] HIT read={read} write={write} uncached={fresh} "
+                  f"(saved ~${saved:.5f} on this call)")
+        elif write:
+            # A write is the investment, not a failure - "saved $0.00000" read like
+            # something had gone wrong. Report the premium paid and what it buys.
+            print(f"[cache] WRITE {write} tokens cached (cost ~"
+                  f"${write * 0.25 / 1_000_000:.5f} extra now; each later hit saves ~"
+                  f"${write * 0.9 / 1_000_000:.5f})")
         elif had_tools:
             # An interactive call carries ~7,800 tokens of tools+system. If that isn't
             # caching, something has broken the prefix and every call is at full price.
@@ -400,6 +406,18 @@ def init_db():
         notes TEXT,
         created_by TEXT,
         created_at TEXT NOT NULL)""")
+    # Things someone asked Guppi to WATCH their inbox for. Built because Guppi promised
+    # three times to "keep an eye out" for a movie-ticket confirmation with no mechanism
+    # whatsoever behind it, then predictably missed it (Trap 91). A promise about the
+    # future needs machinery just as much as a claim about the past.
+    conn.execute("""CREATE TABLE IF NOT EXISTS email_watches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        person TEXT NOT NULL,
+        description TEXT NOT NULL,
+        keywords TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        fired INTEGER NOT NULL DEFAULT 0)""")
     conn.commit()
     for name, role in SEEDED_PEOPLE:
         conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
@@ -3157,16 +3175,51 @@ def tool_show_all_lists():
     return "Your lists:\n- " + "\n- ".join(lines)
 
 
+def _canon_list(name):
+    """Collapse a list name to letters and digits, so 'to do', 'to-do' and 'todo' are the
+    same list. Jason was told his to-do list was EMPTY twice - once for 'todo', once for
+    'to-do' - while it actually held items under 'to do'."""
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def _resolve_list_name(conn, list_name):
+    """The stored name matching what the user said, or None if there is no such list."""
+    want = _canon_list(list_name)
+    if not want:
+        return None
+    rows = conn.execute("SELECT DISTINCT list_name FROM list_items").fetchall()
+    for r in rows:
+        if _canon_list(r["list_name"]) == want:
+            return r["list_name"]
+    return None
+
+
 def tool_show_list(list_name):
     conn = db()
+    actual = _resolve_list_name(conn, list_name)
+    if actual is None:
+        # A list that does not exist is NOT an empty list. Reporting "it's empty" for a
+        # name that was never created is the same failure as reporting an empty inbox for
+        # a broken search (Trap 48) - the user believes a true thing about a false object.
+        names = [r["list_name"] for r in
+                 conn.execute("SELECT DISTINCT list_name FROM list_items "
+                              "ORDER BY list_name").fetchall()]
+        conn.close()
+        if not names:
+            return ("There are no lists at all yet. Tell the user that, and offer to start "
+                    "one - do NOT say a particular list is empty.")
+        return (f"There is no list called '{list_name}'. The lists that exist are: "
+                f"{', '.join(names)}. Tell the user THAT - do not say the list is empty, "
+                f"because it does not exist. Offer the closest match if one looks right.")
     rows = conn.execute(
         "SELECT id, item, added_by FROM list_items WHERE list_name = ? ORDER BY id",
-        (list_name.lower(),)).fetchall()
+        (actual,)).fetchall()
     conn.close()
     if not rows:
-        return f"The {list_name} list is empty."
-    return "\n".join(f"[{r['id']}] {r['item']}" +
-                     (f" (added by {r['added_by']})" if r["added_by"] else "") for r in rows)
+        return f"The {actual} list exists but has nothing on it right now."
+    return f"The {actual} list:\n" + "\n".join(
+        f"[{r['id']}] {r['item']}" +
+        (f" (added by {r['added_by']})" if r["added_by"] else "") for r in rows)
 
 
 def tool_clear_list(list_name):
@@ -3663,6 +3716,33 @@ def tools_for_role(role, is_group=False):
                                 "replaces the previous backup in the chat."),
                 "input_schema": {"type": "object", "properties": {}}})
             tools.append({
+                "name": "watch_for_email",
+                "description": ("Watch this person's inbox for an email they are EXPECTING, "
+                                "and tell them when it arrives. Use whenever someone says "
+                                "'keep an eye out for', 'let me know when X arrives', "
+                                "'watch for the confirmation'. You have NO other way to do "
+                                "this - without calling this tool you cannot monitor "
+                                "anything, so never promise to watch for something unless "
+                                "you have called it. It only sees the inbox of the person "
+                                "who asked; say so."),
+                "input_schema": {"type": "object", "properties": {
+                    "description": {"type": "string",
+                                    "description": ("What to look for, including any "
+                                                    "sender or company name.")},
+                    "days": {"type": "integer",
+                             "description": "How long to watch. Default 14."}},
+                    "required": ["description"]}})
+            tools.append({
+                "name": "list_email_watches",
+                "description": "Show what this person has asked Guppi to watch their inbox for.",
+                "input_schema": {"type": "object", "properties": {}}})
+            tools.append({
+                "name": "cancel_email_watch",
+                "description": ("Stop watching for something. watch_id comes from "
+                                "list_email_watches."),
+                "input_schema": {"type": "object", "properties": {
+                    "watch_id": {"type": "integer"}}, "required": ["watch_id"]}})
+            tools.append({
                 "name": "connect_link",
                 "description": ("Create a working sign-in link so someone can CONNECT or "
                                 "RECONNECT an account. Use whenever anyone needs to link "
@@ -3742,7 +3822,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
                        "show_settings", "update_setting", "list_calendars",
                        "connection_health", "manage_deadline_ignores",
                        "manage_email_priorities", "backup_now", "backup_link",
-                       "connect_link"}
+                       "connect_link", "watch_for_email", "list_email_watches",
+                       "cancel_email_watch"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -3826,6 +3907,13 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return run_backup(reason="you asked")
     if name == "backup_link":
         return tool_backup_link(tool_input.get("kind", "download"))
+    if name == "watch_for_email":
+        return tool_watch_for_email(tool_input["description"], sender_name,
+                                    tool_input.get("days", 14))
+    if name == "list_email_watches":
+        return tool_list_email_watches(sender_name)
+    if name == "cancel_email_watch":
+        return tool_cancel_email_watch(tool_input["watch_id"], sender_name)
     if name == "connect_link":
         return tool_connect_link(tool_input.get("person") or sender_name,
                                  tool_input.get("kind", "google"))
@@ -4005,8 +4093,9 @@ GUIDE_TOPICS = [
     {
         "key": "flags", "title": "What email I flag you about",
         "roles": ("adult",), "private_only": True,
-        "tools": ["manage_email_priorities", "manage_deadline_ignores"],
-        "summary": "Control which senders I chase you about, and which I leave alone.",
+        "tools": ["manage_email_priorities", "manage_deadline_ignores",
+                  "watch_for_email", "list_email_watches", "cancel_email_watch"],
+        "summary": "Control which senders I chase you about, and watch for mail you expect.",
         "body": [
             "I watch new mail and flag deadlines, invoices and RSVPs, offering to set a "
             "reminder or add it to the calendar. I skip marketing and newsletters.",
@@ -4018,6 +4107,14 @@ GUIDE_TOPICS = [
             "SEE THE RULES: \"what are my email priorities?\"",
             "I also quietly notice what you act on versus ignore, and will OFFER to adjust. "
             "I only ever suggest - your rules always win.",
+            "WATCH FOR SOMETHING YOU'RE EXPECTING: \"keep an eye out for the Fandango "
+            "confirmation\", \"tell me when the school's field trip email arrives\". I'll "
+            "message you as soon as anything matching turns up, and offer to put it on the "
+            "calendar. \"What are you watching for?\" lists them; \"stop watching for the "
+            "tickets\" cancels one.",
+            "IMPORTANT: a watch only sees the inbox of the person who asked. If the email "
+            "might land in the other parent's account, they need to ask me in their own "
+            "private chat.",
         ],
     },
     {
@@ -4686,6 +4783,15 @@ MEMORY RULES:
 {memory_rules}
 
 Anyone may ask what you remember, and may ask you to forget something. Always honor that.
+
+NEVER PROMISE A FUTURE ACTION YOU HAVE NO MECHANISM FOR. The rules above cover facts you
+did not look up and actions you did not take; this one covers COMMITMENTS. "I'll keep an eye
+out", "I'll watch for that email", "I'll let you know when it arrives", "I'll remember to
+check" - each of those is a promise, and you can only make it if a tool actually implements
+it. To watch for an email you MUST call watch_for_email; there is no background monitoring
+otherwise. If someone asks for something you cannot mechanically do, say so plainly and
+offer what you CAN do instead. A broken promise costs more trust than an honest "I can't" -
+and the person will stop checking, which is how a missed deadline happens.
 
 CLAIMING SOMETHING IS ABSENT IS A CLAIM, AND NEEDS A LOOKUP LIKE ANY OTHER. "I don't have
 that", "I don't remember", "there's nothing saved", "your inbox is empty" and "you have no
@@ -5792,6 +5898,122 @@ def _learned_suggestion(person):
     return None
 
 
+_WATCH_STOPWORDS = {
+    "a", "an", "the", "for", "from", "to", "of", "in", "on", "at", "my", "our", "your",
+    "me", "us", "it", "that", "this", "and", "or", "if", "is", "are", "be", "when", "keep",
+    "eye", "out", "watch", "look", "see", "email", "emails", "mail", "message", "confirm",
+    "please", "get", "gets", "let", "know", "tell", "picked", "up", "comes", "come", "any",
+}
+
+
+def _watch_keywords(description):
+    """The distinctive words to match an incoming email against.
+
+    Stopwords are dropped so "keep an eye out for the movie ticket confirmation from
+    Fandango" reduces to {movie, ticket, confirmation, fandango} - the words that actually
+    identify the message."""
+    words = re.findall(r"[a-z0-9]+", (description or "").lower())
+    return [w for w in words if w not in _WATCH_STOPWORDS and len(w) > 2]
+
+
+def tool_watch_for_email(description, person, days=14):
+    """Watch THIS PERSON'S inbox for an email they're expecting.
+
+    Deliberately explicit about the boundary: a watch can only see the inbox of the person
+    who set it. Guppi once promised Jason it would catch a confirmation that landed in
+    Kim's Outlook - unfulfillable twice over, since no watch existed AND it would have been
+    looking in the wrong mailbox."""
+    if not person:
+        return "I need to know whose inbox to watch."
+    if not connected_providers(person):
+        return (f"{person} hasn't connected an email account, so there's no inbox for me "
+                f"to watch. Use the connect_link tool to give them a link.")
+    kw = _watch_keywords(description)
+    if not kw:
+        return ("Tell me something distinctive to look for - a sender, a company, or what "
+                "the email is about (e.g. 'the Fandango movie ticket confirmation').")
+    try:
+        n = max(1, min(int(days or 14), 60))
+    except (TypeError, ValueError):
+        n = 14
+    expires = (now_local() + datetime.timedelta(days=n)).isoformat()
+    conn = db()
+    conn.execute("INSERT INTO email_watches "
+                 "(person, description, keywords, created_at, expires_at, fired) "
+                 "VALUES (?,?,?,?,?,0)",
+                 (person, description, "|".join(kw), now_local().isoformat(), expires))
+    conn.commit(); conn.close()
+    print(f"[watch] {person} watching for {kw} until {expires[:10]}")
+    return (f"Watching {person}'s inbox for that ({', '.join(kw[:4])}) for the next {n} "
+            f"days. I'll message them as soon as something matching arrives.\n\n"
+            f"IMPORTANT - tell the user this plainly: I can only watch the inbox of the "
+            f"person who asked. If it might arrive in someone else's account instead, they "
+            f"need to ask me in their OWN private chat and I'll watch theirs too.")
+
+
+def tool_list_email_watches(person):
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, description, expires_at FROM email_watches "
+        "WHERE person = ? AND fired = 0 ORDER BY id", (person,)).fetchall()
+    conn.close()
+    live = []
+    for r in rows:
+        try:
+            if datetime.datetime.fromisoformat(r["expires_at"]) < now_local():
+                continue
+        except (ValueError, TypeError):
+            pass
+        live.append(f"[{r['id']}] {r['description']} (until {r['expires_at'][:10]})")
+    if not live:
+        return "I'm not watching for any emails right now."
+    return "I'm watching your inbox for:\n" + "\n".join(live)
+
+
+def tool_cancel_email_watch(watch_id, person):
+    conn = db()
+    cur = conn.execute("DELETE FROM email_watches WHERE id = ? AND person = ?",
+                       (watch_id, person))
+    conn.commit(); gone = cur.rowcount; conn.close()
+    return ("Stopped watching for that." if gone
+            else "I couldn't find that watch - use list_email_watches to see the ids.")
+
+
+def _check_email_watches(person, msgs):
+    """Fire any watch matched by this batch of new mail. Model-free on purpose: a promise
+    Guppi made must not depend on a model deciding to mention it."""
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT id, description, keywords, expires_at FROM email_watches "
+            "WHERE person = ? AND fired = 0", (person,)).fetchall()
+    except Exception as e:
+        conn.close(); print(f"[watch] could not read watches: {e}"); return []
+    hits = []
+    now = now_local()
+    for r in rows:
+        try:
+            if datetime.datetime.fromisoformat(r["expires_at"]) < now:
+                conn.execute("UPDATE email_watches SET fired = 1 WHERE id = ?", (r["id"],))
+                print(f"[watch] expired watch {r['id']}: {r['description'][:40]}")
+                continue
+        except (ValueError, TypeError):
+            pass
+        kw = [k for k in (r["keywords"] or "").split("|") if k]
+        if not kw:
+            continue
+        need = min(2, len(kw))          # one distinctive word is enough if that's all we have
+        for m in msgs:
+            hay = f"{m.get('from','')} {m.get('subject','')} {m.get('snippet','')}".lower()
+            if sum(1 for k in kw if k in hay) >= need:
+                hits.append((r["id"], r["description"], m))
+                conn.execute("UPDATE email_watches SET fired = 1 WHERE id = ?", (r["id"],))
+                print(f"[watch] MATCH watch {r['id']} -> {m.get('subject','')[:50]!r}")
+                break
+    conn.commit(); conn.close()
+    return hits
+
+
 def tool_manage_email_priorities(action, sender=None, person=None):
     """Manage which senders are PRIORITY (always flag) or IGNORED (never flag) for this
     person, and view learned patterns.
@@ -6262,6 +6484,16 @@ def job_urgent_email_poll():
         msgs = _poll_unread(name)
         if not msgs:
             continue
+        # Watches fire model-free and BEFORE the de-dupe below: a thing Guppi promised to
+        # look out for must not depend on a model choosing to mention it, nor be skipped
+        # because the newest id happens to be unchanged.
+        for _wid, _desc, _m in _check_email_watches(name, msgs):
+            send_message(chat,
+                         f"That thing you asked me to watch for has arrived: "
+                         f"*{_m.get('subject', '(no subject)')}* from "
+                         f"{_m.get('from', 'someone')}.\n\n(You asked me to look out for: "
+                         f"{_desc}.) Want me to add anything from it to the calendar?",
+                         proactive=True)
         newest = msgs[0]["id"]
         last_id = get_setting(f"last_email_id_{name}")
         if newest == last_id:
