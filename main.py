@@ -1189,9 +1189,29 @@ def tool_check_calendar(days_ahead=7, person=None):
 
     lines = []
     for e in events:
+        # Same classification the briefing uses - check_calendar had an identical
+        # in-progress test and therefore the identical two bugs.
+        kind, sdt2, edt2 = _classify_event(e, now)
+        owner = _event_owner(e)
+        who = f" [{owner}'s]" if owner else ""
+        notes = _event_notes(e, limit=200)
+        if kind == "all_day":
+            lines.append(f"{sdt2.date()}: {e.get('summary','(no title)')}{who} [ALL DAY - "
+                         f"no specific time; never say it ends at midnight]"
+                         + (f" | notes: {notes}" if notes else ""))
+            continue
+        if kind == "multi_day":
+            total = (edt2.date() - sdt2.date()).days + 1
+            day_n = (now.date() - sdt2.date()).days + 1
+            lines.append(
+                f"{sdt2.date()} to {edt2.date()}: {e.get('summary','(no title)')}{who} "
+                f"[RUNS {total} DAYS - today is day {day_n}; each day has its own start "
+                f"and finish, it does NOT run continuously or overnight]"
+                + (f" | notes: {notes}" if notes else ""))
+            continue
         start_raw = e["start"].get("dateTime", e["start"].get("date"))
         end_raw = e.get("end", {}).get("dateTime", e.get("end", {}).get("date"))
-        summary = e.get("summary", "(no title)")
+        summary = e.get("summary", "(no title)") + who
         status = ""
         # Work out whether the event is happening RIGHT NOW, already ended, or upcoming,
         # so the briefing can act sensibly (pick up vs. pack for vs. head to).
@@ -1582,7 +1602,8 @@ def _cal_insert_event(service, summary, start_iso, end_iso, tzname,
 
 def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
                             location=None, details=None, personal=False,
-                            repeat=None, repeat_count=None, repeat_until=None):
+                            repeat=None, repeat_count=None, repeat_until=None,
+                            for_person=None):
     service = get_calendar_service(person)
     if not service:
         if person and google_needs_reconnect(person):
@@ -1605,6 +1626,10 @@ def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
         "start": {"dateTime": start_iso, "timeZone": tzname},
         "end": {"dateTime": end_iso, "timeZone": tzname},
     }
+    # WHOSE event this is. Without it a briefing has only the title to go on, and
+    # "Garnet Basketball Camp" became a person called Garnet rather than Charlotte's camp.
+    if for_person:
+        body["extendedProperties"]["private"]["for_person"] = str(for_person)
     if location:
         body["location"] = location   # Google makes this tappable -> maps/directions
     # Personal / just-for-me events (usually a work obligation) get the sage color, the
@@ -3412,7 +3437,14 @@ def tools_for_role(role, is_group=False):
                                  "description": "How many occurrences in total."},
                 "repeat_until": {"type": "string",
                                  "description": ("Last date, YYYY-MM-DD. Use this OR "
-                                                 "repeat_count, not both.")}},
+                                                 "repeat_count, not both.")},
+                "for_person": {"type": "string",
+                               "description": ("WHOSE event this is - a family member's "
+                                               "first name. Set it whenever you know: it "
+                                               "is what lets a briefing say 'Charlotte's "
+                                               "camp' instead of guessing from the title. "
+                                               "Leave empty for something involving the "
+                                               "whole family.")}},
                 "required": ["summary", "start_iso", "end_iso"]}})
         tools.append({
             "name": "find_events",
@@ -3861,7 +3893,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
             tool_input["summary"], tool_input["start_iso"], tool_input["end_iso"],
             sender_name, tool_input.get("location"), tool_input.get("details"),
             tool_input.get("personal", False), tool_input.get("repeat"),
-            tool_input.get("repeat_count"), tool_input.get("repeat_until"))
+            tool_input.get("repeat_count"), tool_input.get("repeat_until"),
+            tool_input.get("for_person"))
 
     if name == "find_events":
         if not perms["calendar_read"]:
@@ -4824,6 +4857,16 @@ MEMORY RULES:
 {memory_rules}
 
 Anyone may ask what you remember, and may ask you to forget something. Always honor that.
+
+READING THE CALENDAR. An event title is a title, not a person. "Garnet Basketball Camp" is
+the name of a camp; there is no one called Garnet. NEVER infer who an event belongs to from
+its title - if an entry is marked [Charlotte's] that is whose it is, and if it is not
+marked, describe it without an owner rather than guessing. Equally: an entry marked ALL DAY
+has no time at all, so never give it one and never say it "ends at midnight"; and an entry
+marked as RUNNING ACROSS SEVERAL DAYS is a thing that happens on each of those days, NOT one
+continuous session - today still needs its normal drop-off or start, and the real daily
+times are usually in that entry's notes. Prefer the notes over the block's own start and
+end whenever they disagree.
 
 NEVER PROMISE A FUTURE ACTION YOU HAVE NO MECHANISM FOR. The rules above cover facts you
 did not look up and actions you did not take; this one covers COMMITMENTS. "I'll keep an eye
@@ -6262,24 +6305,103 @@ def reminders_for_briefing(for_chat=None, horizon_hours=36):
     return "\n".join(out) if out else "None due today."
 
 
+def _event_notes(e, limit=280):
+    """The event's own description, minus Guppi's provenance marker.
+
+    This was being thrown away. The camp entry's description says "camp 9am-4pm DAILY" -
+    the one word that would have stopped the briefing describing a four-day block as a
+    single continuous session. The information was in the event all along; the briefing
+    just never saw it."""
+    desc = (e.get("description") or "").strip()
+    if not desc:
+        return ""
+    desc = re.split(r"—\s*(?:Added|Edited) by Guppi", desc)[0].strip()
+    desc = re.sub(r"\s+", " ", desc)
+    if not desc:
+        return ""
+    return desc[:limit] + ("…" if len(desc) > limit else "")
+
+
+def _event_owner(e):
+    """Whose event this is, if Guppi was told when it was created. Empty otherwise -
+    and an empty owner must stay empty rather than be guessed at. "Garnet Basketball Camp"
+    with no owner became "Garnet" the person in a briefing, because the model had nothing
+    to go on and filled the gap."""
+    try:
+        return ((e.get("extendedProperties") or {}).get("private") or {}).get("for_person", "")
+    except Exception:
+        return ""
+
+
+def _classify_event(e, now):
+    """Work out what KIND of calendar entry this is before describing it.
+
+    One in-progress test used to cover everything, which produced two wrong answers in the
+    same briefing:
+      * a Mon 9am -> Thu 4:15pm camp satisfied `start <= now < end`, so the model was told
+        it was "already underway - the action is finishing, never preparing" on a Tuesday
+        morning when a child needed dropping off;
+      * an all-day entry parses to midnight->midnight, so the model faithfully reported
+        that it "wraps up at midnight tonight".
+    Neither was the model inventing anything. Both were exactly what we handed it.
+
+    Returns (kind, sdt, edt) where kind is one of:
+      all_day | multi_day | overnight | today | tomorrow | later | past
+    """
+    is_all_day = "dateTime" not in (e.get("start") or {})
+    start_raw = e["start"].get("dateTime", e["start"].get("date"))
+    end_raw = (e.get("end") or {}).get("dateTime", (e.get("end") or {}).get("date"))
+    try:
+        sdt = datetime.datetime.fromisoformat(start_raw)
+        if sdt.tzinfo is None:
+            sdt = sdt.replace(tzinfo=TIMEZONE)
+        edt = None
+        if end_raw:
+            edt = datetime.datetime.fromisoformat(end_raw)
+            if edt.tzinfo is None:
+                edt = edt.replace(tzinfo=TIMEZONE)
+    except (ValueError, TypeError):
+        return None, None, None
+
+    today = now.date()
+    if is_all_day:
+        # Google gives all-day events an EXCLUSIVE end date, so a one-day event ends
+        # "tomorrow". Treat the last real day as end_date - 1.
+        last = (edt.date() - datetime.timedelta(days=1)) if edt else sdt.date()
+        if last < today:
+            return "past", sdt, edt
+        if sdt.date() > today + datetime.timedelta(days=1):
+            return "later", sdt, edt
+        return "all_day", sdt, edt
+
+    if edt and edt <= now:
+        return "past", sdt, edt
+
+    # A genuine overnight (sleepover) crosses ONE night. Anything spanning two or more
+    # nights is a multi-day activity entered as one block - camp, a holiday - and its real
+    # daily times live in the description, not in the block's start and end.
+    if edt and (edt.date() - sdt.date()).days >= 2:
+        return "multi_day", sdt, edt
+    if edt and sdt <= now < edt and sdt.date() != now.date():
+        return "overnight", sdt, edt
+    if sdt.date() == today:
+        return "today", sdt, edt
+    if sdt.date() == today + datetime.timedelta(days=1):
+        return "tomorrow", sdt, edt
+    return "later", sdt, edt
+
+
 def _briefing_calendar():
-    """The calendar for a briefing, grouped under explicit day headings.
+    """The calendar for a briefing, grouped by what each entry actually IS.
 
-    A6b: the briefing used to be handed tool_check_calendar(days_ahead=1), whose window is
-    (now - 18h) to (now + 1 day) - at a 6am Monday briefing that is SUNDAY NOON through
-    TUESDAY 6AM, roughly 42 hours, printed under the heading "Today's calendar" with raw
-    ISO timestamps and no day boundaries. No wonder it "hit various timeframes": nothing
-    in its input distinguished yesterday from today from tomorrow.
-
-    The 18-hour lookback stays - it is what lets an overnight sleepover be recognised as
-    in-progress - but events are now labelled by day, and anything already finished is
-    dropped rather than left as noise."""
+    Buckets are by kind, not just by day, because "9am to 4pm today" and "day 2 of a
+    four-day camp" and "all day, no particular time" need different handling and produced
+    confidently wrong briefings when they shared one code path."""
     service = get_calendar_service()
     if not service:
         return "CALENDAR: not available right now."
     now = now_local()
     today = now.date()
-    tomorrow = today + datetime.timedelta(days=1)
     try:
         result = service.events().list(
             calendarId=FAMILY_CALENDAR_ID,
@@ -6290,44 +6412,54 @@ def _briefing_calendar():
         print(f"[briefing] calendar read failed: {e}")
         return "CALENDAR: could not be read this morning."
 
-    buckets = {"IN PROGRESS RIGHT NOW": [], "TODAY": [], "TOMORROW": []}
+    order = ["HAPPENING NOW", "TODAY", "ALL DAY TODAY", "RUNNING ACROSS SEVERAL DAYS",
+             "TOMORROW"]
+    buckets = {k: [] for k in order}
     for e in result.get("items", []):
-        start_raw = e["start"].get("dateTime", e["start"].get("date"))
-        end_raw = e.get("end", {}).get("dateTime", e.get("end", {}).get("date"))
-        summary = e.get("summary", "(no title)")
-        loc = f" @ {e['location']}" if e.get("location") else ""
-        try:
-            sdt = datetime.datetime.fromisoformat(start_raw)
-            if sdt.tzinfo is None:
-                sdt = sdt.replace(tzinfo=TIMEZONE)
-            edt = None
-            if end_raw:
-                edt = datetime.datetime.fromisoformat(end_raw)
-                if edt.tzinfo is None:
-                    edt = edt.replace(tzinfo=TIMEZONE)
-        except (ValueError, TypeError):
+        kind, sdt, edt = _classify_event(e, now)
+        if kind in (None, "past", "later"):
             continue
+        summary = e.get("summary", "(no title)")
+        owner = _event_owner(e)
+        who = f" [{owner}'s]" if owner else ""
+        loc = f" @ {e['location']}" if e.get("location") else ""
+        notes = _event_notes(e)
+        tail = f"\n      notes: {notes}" if notes else ""
 
-        if edt and edt <= now:
-            continue                       # already over - not briefing material
-        span = sdt.strftime("%-I:%M %p") + (f" to {edt.strftime('%-I:%M %p')}" if edt else "")
-        if edt and sdt <= now < edt:
-            buckets["IN PROGRESS RIGHT NOW"].append(
-                f"  - {summary}{loc} (started {sdt.strftime('%a %-I:%M %p')}, ends "
-                f"{edt.strftime('%a %-I:%M %p')}) - it is ALREADY UNDERWAY, so the action "
-                f"is finishing or collecting, never preparing")
-        elif sdt.date() == today:
-            buckets["TODAY"].append(f"  - {span}: {summary}{loc}")
-        elif sdt.date() == tomorrow:
-            buckets["TOMORROW"].append(f"  - {span}: {summary}{loc}")
+        if kind == "all_day":
+            last = (edt.date() - datetime.timedelta(days=1)) if edt else sdt.date()
+            more = "" if last <= today else f" (runs through {last.strftime('%a %b %-d')})"
+            buckets["ALL DAY TODAY"].append(
+                f"  - {summary}{who}{loc}{more} - this is an ALL-DAY entry with NO specific "
+                f"time. Do not invent one, and never say it ends at midnight.{tail}")
+        elif kind == "multi_day":
+            total = (edt.date() - sdt.date()).days + 1
+            day_n = (today - sdt.date()).days + 1
+            buckets["RUNNING ACROSS SEVERAL DAYS"].append(
+                f"  - {summary}{who}{loc} - runs {sdt.strftime('%a %b %-d')} to "
+                f"{edt.strftime('%a %b %-d')}; TODAY IS DAY {day_n} OF {total}. It is NOT "
+                f"one continuous session and it does NOT run overnight - each day has its "
+                f"own start and finish, usually given in the notes. Today still needs "
+                f"whatever the normal daily drop-off or start is.{tail}")
+        elif kind == "overnight":
+            buckets["HAPPENING NOW"].append(
+                f"  - {summary}{who}{loc} (started {sdt.strftime('%a %-I:%M %p')}, ends "
+                f"{edt.strftime('%a %-I:%M %p')}) - ALREADY UNDERWAY since yesterday, so "
+                f"the action is collecting or finishing, not preparing.{tail}")
+        elif kind == "today":
+            span = sdt.strftime("%-I:%M %p") + (f" to {edt.strftime('%-I:%M %p')}" if edt else "")
+            buckets["TODAY"].append(f"  - {span}: {summary}{who}{loc}{tail}")
+        elif kind == "tomorrow":
+            span = sdt.strftime("%-I:%M %p") + (f" to {edt.strftime('%-I:%M %p')}" if edt else "")
+            buckets["TOMORROW"].append(f"  - {span}: {summary}{who}{loc}{tail}")
 
     out = []
-    for head in ("IN PROGRESS RIGHT NOW", "TODAY", "TOMORROW"):
-        items = buckets[head]
-        if head == "TODAY" and not items:
-            out.append("TODAY: nothing on the calendar.")
-        elif items:
-            out.append(f"{head}:\n" + "\n".join(items))
+    for head in order:
+        if buckets[head]:
+            out.append(f"{head}:\n" + "\n".join(buckets[head]))
+    if not any(buckets[k] for k in ("TODAY", "ALL DAY TODAY",
+                                    "RUNNING ACROSS SEVERAL DAYS", "HAPPENING NOW")):
+        out.insert(0, "TODAY: nothing on the calendar.")
     return "\n\n".join(out) if out else "TODAY: nothing on the calendar."
 
 
