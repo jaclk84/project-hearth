@@ -2349,19 +2349,36 @@ def imap_unread(person, max_results=5):
         # A7: UNSEEN alone matches mail from any date - anything never opened stays
         # "new" indefinitely. SINCE bounds it to genuinely recent mail.
         since = (now_local() - datetime.timedelta(days=3)).strftime("%d-%b-%Y")
-        typ, data = M.search(None, "UNSEEN", "SINCE", since)
+        # UID search, not plain search. A plain search returns SEQUENCE NUMBERS, which the
+        # server renumbers whenever a message is deleted or moved - so an id remembered
+        # between polls ("last seen i:1234") can silently come to mean a different message.
+        # UIDs are stable for the life of the mailbox.
+        typ, data = M.uid("search", None, "UNSEEN", "SINCE", since)
         if typ != "OK":
-            print(f"[imap] UNSEEN SINCE {since} search returned {typ}; falling back")
-            typ, data = M.search(None, "UNSEEN")
+            print(f"[imap] UID UNSEEN SINCE {since} returned {typ}; falling back")
+            typ, data = M.uid("search", None, "UNSEEN")
         if typ != "OK":
             return []
         ids = data[0].split()
         for mid in reversed(ids[-max_results:]):
             # PEEK so we don't mark the mail as read just by checking it.
-            typ, md = M.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+            typ, md = M.uid("fetch", mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
             if typ != "OK":
                 continue
-            hmsg = emaillib.message_from_bytes(md[0][1])
+            # Scan for the payload instead of indexing md[0][1]. IMAP does not guarantee
+            # the order or shape of FETCH response items, and a flags-only item arriving
+            # first makes md[0][1] an int - the same defect already fixed in
+            # _imap_fetch_message and left here in its sibling.
+            raw = None
+            for item in md or []:
+                if (isinstance(item, tuple) and len(item) > 1
+                        and isinstance(item[1], (bytes, bytearray)) and item[1]):
+                    raw = item[1]
+                    break
+            if raw is None:
+                print(f"[imap] no header payload for uid {mid!r}")
+                continue
+            hmsg = emaillib.message_from_bytes(raw)
             out.append({
                 "id": f"i:{mid.decode()}",
                 "from": _decode(hmsg.get("From", "?")),
@@ -4427,16 +4444,40 @@ def _live_state_block(sender_name, sender_role, is_group):
             "SELECT id, fact, about FROM memories ORDER BY id").fetchall()
         conn.close()
         if rows:
-            lines = "\n".join(
-                f"  [{r['id']}] {r['fact']}" + (f" (about {r['about']})" if r["about"] else "")
-                for r in rows)
-            parts.append(
-                "EVERYTHING YOU CURRENTLY REMEMBER (live from the database, this turn):\n"
-                + lines +
-                "\n  The bracketed numbers are memory ids - use them with the forget tool. "
-                "This IS your memory: if something is not listed here you genuinely do not "
-                "have it, and if it IS listed you do, so never say you don't remember "
-                "something that appears above.")
+            # BOUND THIS. Every memory used to go into every prompt, unlimited - and this
+            # block sits AFTER the cache breakpoint, so it is billed fresh on every single
+            # call. At 20 memories that's ~270 tokens; at 200 it would be ~3,000 uncached
+            # tokens per call, costing more than the cached prefix saves.
+            budget, lines, shown = 3000, [], 0
+            for r in rows:
+                line = (f"  [{r['id']}] {r['fact']}"
+                        + (f" (about {r['about']})" if r["about"] else ""))
+                if budget - len(line) < 0:
+                    break
+                budget -= len(line)
+                lines.append(line)
+                shown += 1
+            body = "\n".join(lines)
+            if shown == len(rows):
+                parts.append(
+                    "EVERYTHING YOU CURRENTLY REMEMBER (live from the database, this "
+                    "turn):\n" + body +
+                    "\n  The bracketed numbers are memory ids - use them with the forget "
+                    "tool. This IS your memory: if something is not listed here you "
+                    "genuinely do not have it, and if it IS listed you do, so never say "
+                    "you don't remember something that appears above.")
+            else:
+                # CRITICAL: with a partial list the "not listed = don't have it" rule
+                # becomes FALSE, and would recreate the exact false-absence bug this block
+                # was built to kill (Trap 69). Say plainly that it is partial.
+                parts.append(
+                    f"SOME OF WHAT YOU REMEMBER ({shown} of {len(rows)} saved facts - this "
+                    f"list is INCOMPLETE):\n" + body +
+                    f"\n  The bracketed numbers are memory ids for the forget tool. "
+                    f"WARNING: this is NOT everything you know - {len(rows) - shown} more "
+                    f"facts are stored. If something is not listed here you must call the "
+                    f"recall tool before saying you don't have it. Never tell someone you "
+                    f"don't remember something on the strength of this partial list.")
         else:
             parts.append("YOUR MEMORY IS CURRENTLY EMPTY (live from the database).")
     except Exception as e:
@@ -6494,19 +6535,46 @@ def job_urgent_email_poll():
                          f"{_m.get('from', 'someone')}.\n\n(You asked me to look out for: "
                          f"{_desc}.) Want me to add anything from it to the calendar?",
                          proactive=True)
-        newest = msgs[0]["id"]
-        last_id = get_setting(f"last_email_id_{name}")
-        if newest == last_id:
-            continue  # nothing new -> no Claude call, no cost
-        set_setting(f"last_email_id_{name}", newest)
+        # PER-PROVIDER de-dupe. This used to key off msgs[0] alone - and _poll_unread
+        # returns Gmail first with IMAP appended, so msgs[0] was ALWAYS a Gmail id whenever
+        # Gmail had any unread. Two consequences, both silent: an unchanged newest Gmail
+        # made the whole poll return before Outlook was examined, and the "stop at last_id"
+        # loop below broke inside the Gmail section before reaching the IMAP entries. For
+        # anyone whose main inbox is Outlook, deadline flagging only worked during windows
+        # when Gmail happened to have no recent unread.
+        fresh = []
+        for prov, prefix in (("google", "g:"), ("imap", "i:")):
+            stream = [m for m in msgs if str(m.get("id", "")).startswith(prefix)]
+            if not stream:
+                continue
+            key = f"last_email_id_{name}_{prov}"
+            seen = get_setting(key)
+            # Migrate the single old key so the first run after this change doesn't
+            # re-announce everything already dealt with.
+            if not seen:
+                old = get_setting(f"last_email_id_{name}")
+                if old and str(old).startswith(prefix):
+                    seen = old
+            if stream[0]["id"] == seen:
+                continue                      # this inbox genuinely has nothing new
+            for m in stream:
+                if m["id"] == seen:
+                    break
+                fresh.append(m)
+            set_setting(key, stream[0]["id"])
+        if not fresh:
+            continue  # nothing new in EITHER inbox -> no Claude call, no cost
+        print(f"[poll] {name}: {len(fresh)} new "
+              f"({sum(1 for m in fresh if m['id'].startswith('g:'))} gmail, "
+              f"{sum(1 for m in fresh if m['id'].startswith('i:'))} outlook)")
 
         ignore = _ignored_senders()
         priority = _priority_senders(name)
         summaries = []
         priority_hits = []      # senders on this person's always-flag list that showed up
-        for m in msgs:
-            if m["id"] == last_id:
-                break
+        # Walk `fresh` - the new messages from BOTH inboxes - not the raw concatenated
+        # list with a break on a single marker id.
+        for m in fresh:
             frm = (m.get("from") or "").lower()
             is_priority = any(p in frm for p in priority)
             # Ignore filter applies UNLESS the sender is explicitly a priority (explicit
