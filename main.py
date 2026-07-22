@@ -1303,18 +1303,48 @@ def tool_find_events(query=None, days_ahead=30, person=None):
         return err
     now = now_local()
     later = now + datetime.timedelta(days=days_ahead)
+    # Fetch the WHOLE window (no server-side q). Google's q is an all-terms full-text match,
+    # so "Lillian Laura appointment" found NOTHING when the event was titled "Lily / Laura"
+    # - and Guppi then told Kim the appointment wasn't on the calendar, contradicting the
+    # briefing (which lists everything, unfiltered). Match locally instead, so find_events
+    # sees exactly what the briefing sees.
     try:
         result = service.events().list(
             calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(),
             timeMax=later.isoformat(), singleEvents=True, orderBy="startTime",
-            maxResults=50, q=query if query else None).execute()
+            maxResults=50).execute()
     except Exception as e:
         print(f"[cal] find_events failed: {e}")
         return f"Couldn't search the calendar: {e}"
-    events = result.get("items", [])
-    if not events:
-        return "No matching events found."
+    all_events = result.get("items", [])
+    if not all_events:
+        return "There's nothing at all on the calendar in that range."
+
+    events = all_events
+    matched = False
+    if query:
+        terms = [t for t in re.findall(r"[a-z0-9]+", query.lower())
+                 if t not in _WATCH_STOPWORDS and len(t) > 1]
+        def _hay(e):
+            return (f"{e.get('summary','')} {e.get('location','')} "
+                    f"{e.get('description','')}").lower()
+        # A match is any event containing ANY significant term - forgiving on purpose, so a
+        # near-miss on wording still surfaces the event rather than denying it exists.
+        scored = [(sum(1 for t in terms if t in _hay(e)), e) for e in all_events]
+        hits = [e for sc, e in scored if sc > 0]
+        if hits:
+            events = hits
+            matched = True
+        else:
+            # Nothing matched the words. Do NOT say "no such event" - that reads as "it
+            # isn't on the calendar" when it may simply be titled differently. Show what IS
+            # there so the user (and Guppi) can see the real entry, whatever it's called.
+            events = all_events[:12]
     lines = []
+    if query and not matched:
+        lines.append(f"I didn't find an event whose wording matches \"{query}\", but here's "
+                     f"what IS on the calendar - the one they mean is likely here under a "
+                     f"different name; use its details, don't tell them it doesn't exist:")
     for e in events:
         start = e["start"].get("dateTime", e["start"].get("date"))
         loc = f" @ {e['location']}" if e.get("location") else ""
@@ -1325,10 +1355,11 @@ def tool_find_events(query=None, days_ahead=30, person=None):
             "recurringEventId") else ""
         lines.append(
             f"id={e['id']} | {start} | {e.get('summary','(no title)')}{loc}{series}")
-    return ("Matching events (use the id to edit or delete). If an event is marked "
-            "REPEATING SERIES, ask whether they mean just that day or all of them - "
-            "pass whole_series=true to delete_calendar_event for all of them.\n"
-            + "\n".join(lines))
+    header = ("" if (query and not matched) else
+              "Matching events (use the id to edit or delete). If an event is marked "
+              "REPEATING SERIES, ask whether they mean just that day or all of them - "
+              "pass whole_series=true to delete_calendar_event for all of them.\n")
+    return header + "\n".join(lines)
 
 
 def tool_edit_calendar_event(event_id, person=None, summary=None, start_iso=None,
@@ -6691,6 +6722,60 @@ def _briefing_reminders(chat):
     return "\n\n".join(parts)
 
 
+def _briefing_occasions():
+    """Occasions landing today or in the next day or two - so the briefing knows a real
+    birthday/anniversary instead of inventing one (it has no other source for these) or
+    staying silent about them."""
+    today = now_local().date()
+    conn = db()
+    try:
+        rows = conn.execute("SELECT title, kind, month, day, year FROM occasions").fetchall()
+    except Exception:
+        conn.close(); return ""
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            nd = _occasion_next_date(r["month"], r["day"], r["year"], today)
+        except Exception:
+            nd = None
+        if not nd:
+            continue
+        days = (nd - today).days
+        if days == 0:
+            out.append(f"  - TODAY is {r['title']} ({r['kind']})")
+        elif days == 1:
+            out.append(f"  - TOMORROW is {r['title']} ({r['kind']})")
+    if not out:
+        return ""
+    return ("OCCASIONS (from the family's tracked dates - these are REAL; never state a "
+            "birthday or anniversary that is not listed here):\n" + "\n".join(out))
+
+
+def _briefing_memory():
+    """A compact digest of stored family facts, so the briefing can interpret the
+    household's own shorthand ('Kim remote' = working from home, 'Kim at NJIT' = commuting
+    to Newark) and apply what it's been taught. Without this the briefing reads calendar
+    labels literally and guesses at what they mean."""
+    conn = db()
+    try:
+        rows = conn.execute("SELECT fact, about FROM memories ORDER BY id").fetchall()
+    except Exception:
+        conn.close(); return ""
+    conn.close()
+    if not rows:
+        return ""
+    budget, lines = 1400, []
+    for r in rows:
+        line = f"  - {r['fact']}" + (f" (about {r['about']})" if r["about"] else "")
+        if budget - len(line) < 0:
+            break
+        budget -= len(line); lines.append(line)
+    return ("WHAT YOU KNOW ABOUT THIS FAMILY (use it to interpret the calendar - e.g. their "
+            "shorthand for a place or a work arrangement - but never contradict the "
+            "calendar's own times):\n" + "\n".join(lines))
+
+
 def job_morning_briefing():
     """6am: one short briefing to each parent.
 
@@ -6709,17 +6794,24 @@ def job_morning_briefing():
         return  # scheduled digest fires at its set time; quiet hours only gates ad-hoc proactivity
     calendar = _briefing_calendar()
     weather = get_weather_line()
+    occasions = _briefing_occasions()
+    memory = _briefing_memory()
     now = now_local()
     when = (f"Right now it is {now.strftime('%-I:%M %p')} on "
             f"{now.strftime('%A, %B %-d, %Y')}. TODAY means {now.strftime('%A %B %-d')}; "
             f"TOMORROW means {(now + datetime.timedelta(days=1)).strftime('%A %B %-d')}.")
+    # Log the EXACT calendar block the model is given, so an error like "said 5pm, calendar
+    # says 6pm" can be pinned on the data vs. the model instead of guessed at.
+    print(f"[briefing] calendar block:\n{calendar}")
 
     for name, chat in _adults_with_chats():
         if not claude_call_allowed():
             return
         reminders = _briefing_reminders(chat)
-        context = (f"{when}\n\n{calendar}\n\n{reminders}\n\n"
-                   f"{weather or 'WEATHER: unavailable - could not be fetched.'}")
+        context = "\n\n".join(x for x in
+                                (when, occasions, memory, calendar, reminders,
+                                 weather or "WEATHER: unavailable - could not be fetched.")
+                                if x)
         try:
             resp = claude_create(
                 model=MODEL, max_tokens=1000,
@@ -6734,10 +6826,20 @@ def job_morning_briefing():
                         "weather. Mention tomorrow ONLY if it needs doing something today. "
                         "If the weather line says unavailable, omit weather entirely - "
                         "NEVER invent a forecast.\n\n"
-                        "Be specific and think about what each event actually MEANS for "
-                        "the day: note when things collide, when a gap is too tight to get "
-                        "between them, and what has to leave the house with someone. Say "
-                        "the useful thing rather than listing entries.\n\n"
+                        "ACCURACY BEFORE INSIGHT. Report every time and detail EXACTLY as "
+                        "the calendar gives it - never shift, round, or invent a time, and "
+                        "if you're unsure of one, quote it rather than paraphrase. Keep "
+                        "each day separate: today's entries are today's, tomorrow's are "
+                        "tomorrow's - never merge an entry from one day into another or say "
+                        "something runs 'through tomorrow' unless a single event genuinely "
+                        "spans both. An all-day entry describes that person's whole day; "
+                        "read its meaning from WHAT YOU KNOW ABOUT THIS FAMILY above if it's "
+                        "the household's shorthand, and state it plainly for the right day. "
+                        "THEN, being accurate, add insight: note a genuine time collision or "
+                        "a too-tight gap, and what has to leave the house with someone. Only "
+                        "flag a conflict when two events actually overlap - do not invent "
+                        "one. Never state a birthday or fact that isn't in the context "
+                        "above.\n\n"
                         "No markdown, no emoji. Aim for 400-700 characters - short enough "
                         "to read at a glance, long enough to be specific. Warm but "
                         "efficient."),
