@@ -401,6 +401,16 @@ def init_db():
         item TEXT NOT NULL,
         added_by TEXT,
         created_at TEXT NOT NULL)""")
+    # Family glossary: shared shorthand for reading the calendar and emails. NOT personal
+    # memory - it's "how to read our calendar" ("JA = Joseph Anthony salon at ...", "Kim
+    # remote = working from home"). Small, shared, injected wherever the calendar/email is
+    # interpreted, so every context reads the family's own abbreviations correctly.
+    conn.execute("""CREATE TABLE IF NOT EXISTS glossary (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        term TEXT NOT NULL,
+        meaning TEXT NOT NULL,
+        created_by TEXT,
+        created_at TEXT NOT NULL)""")
     # Saved list templates, e.g. a reusable "travel" packing list.
     conn.execute("""CREATE TABLE IF NOT EXISTS list_templates (
         name TEXT PRIMARY KEY,
@@ -2794,6 +2804,72 @@ def tool_search_email(query, person, max_results=5):
 
 
 # ---- Memory -----------------------------------------------------------------
+def tool_add_glossary_term(term, meaning, added_by):
+    """Teach Guppi a piece of the family's calendar/email shorthand. Adults only (gated in
+    run_tool). Shared: the meaning is applied for everyone, everywhere the calendar or email
+    is read - so 'JA 2pm' on the calendar is understood as the Joseph Anthony salon."""
+    term = (term or "").strip()
+    meaning = (meaning or "").strip()
+    if not term or not meaning:
+        return "Tell me the shorthand and what it means, e.g. 'JA means Joseph Anthony salon.'"
+    conn = db()
+    # Replace an existing definition of the same term (case-insensitive) rather than dupe.
+    row = conn.execute("SELECT id FROM glossary WHERE LOWER(term) = LOWER(?)",
+                       (term,)).fetchone()
+    if row:
+        conn.execute("UPDATE glossary SET meaning = ?, created_by = ?, created_at = ? "
+                     "WHERE id = ?", (meaning, added_by, now_local().isoformat(), row["id"]))
+        verb = "Updated"
+    else:
+        conn.execute("INSERT INTO glossary (term, meaning, created_by, created_at) "
+                     "VALUES (?,?,?,?)", (term, meaning, added_by, now_local().isoformat()))
+        verb = "Got it - I'll remember"
+    conn.commit(); conn.close()
+    return (f"{verb}: on the calendar or in email, \"{term}\" means {meaning}. "
+            f"I'll read it that way for everyone from now on.")
+
+
+def tool_list_glossary():
+    conn = db()
+    rows = conn.execute("SELECT id, term, meaning FROM glossary ORDER BY term").fetchall()
+    conn.close()
+    if not rows:
+        return ("I don't have any calendar shorthand saved yet. Teach me by saying e.g. "
+                "\"JA on the calendar means Joseph Anthony salon at [address]\".")
+    return ("Here's the calendar/email shorthand I know:\n"
+            + "\n".join(f"[{r['id']}] {r['term']} = {r['meaning']}" for r in rows))
+
+
+def tool_remove_glossary_term(term_or_id):
+    conn = db()
+    key = str(term_or_id).strip()
+    if key.isdigit():
+        cur = conn.execute("DELETE FROM glossary WHERE id = ?", (int(key),))
+    else:
+        cur = conn.execute("DELETE FROM glossary WHERE LOWER(term) = LOWER(?)", (key,))
+    conn.commit(); gone = cur.rowcount; conn.close()
+    return (f"Forgotten - I'll no longer expand \"{term_or_id}\"." if gone
+            else "I couldn't find that in the glossary - ask me what shorthand I know.")
+
+
+def _glossary_block(header="THE FAMILY'S CALENDAR/EMAIL SHORTHAND"):
+    """The whole glossary as a compact block. Small and shared, so it's cheap to include in
+    every context that reads the calendar or email. '' when empty."""
+    try:
+        conn = db()
+        rows = conn.execute("SELECT term, meaning FROM glossary ORDER BY term").fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[glossary] read failed: {e}")
+        return ""
+    if not rows:
+        return ""
+    lines = "\n".join(f"  - \"{r['term']}\" means {r['meaning']}" for r in rows)
+    return (f"{header} (use these to interpret entries; they are the household's own "
+            f"abbreviations, but never let a shorthand override an explicit time on the "
+            f"calendar):\n" + lines)
+
+
 def tool_remember(fact, about, added_by):
     conn = db()
     conn.execute("INSERT INTO memories (fact, about, added_by, created_at) VALUES (?,?,?,?)",
@@ -3802,6 +3878,11 @@ def tools_for_role(role, is_group=False):
          "input_schema": {"type": "object", "properties": {
              "occasion_id": {"type": "integer"}}, "required": ["occasion_id"]}},
         {"type": "web_search_20250305", "name": "web_search"},
+        {"name": "list_glossary",
+         "description": ("Show the family's saved calendar/email shorthand (e.g. 'JA = "
+                         "Joseph Anthony salon'). Use for 'what shorthand do you know?', "
+                         "'what does JA mean?', 'what's on the calendar key?'."),
+         "input_schema": {"type": "object", "properties": {}}},
     ]
 
     # ---- Private-chat only: memory is personal, so never in the group ----
@@ -3815,7 +3896,10 @@ def tools_for_role(role, is_group=False):
                              "even if the user says 'remember'. Those are recurring dates "
                              "that need escalating reminders, so use add_occasion instead. "
                              "'Remember Lillian's birthday is April 13' -> add_occasion, "
-                             "not remember."),
+                             "not remember. AND: if someone explains what a CALENDAR "
+                             "SHORTHAND means ('JA means Joseph Anthony salon', 'Kim remote "
+                             "means working from home'), use add_glossary_term instead - "
+                             "that's how-to-read-the-calendar, shared, not a personal fact."),
              "input_schema": {"type": "object", "properties": {
                  "fact": {"type": "string"},
                  "about": {"type": "string", "description": "Who the fact concerns, if anyone."}},
@@ -3831,6 +3915,25 @@ def tools_for_role(role, is_group=False):
 
     # ---- Parents only ----
     if role == "adult":
+        tools.append({
+            "name": "add_glossary_term",
+            "description": ("Teach a piece of the family's calendar/email shorthand so every "
+                            "context reads it correctly. Use whenever someone EXPLAINS what "
+                            "an abbreviation or calendar phrase means - 'JA means Joseph "
+                            "Anthony salon at [address]', 'on the calendar Kim remote means "
+                            "she's working from home', 'NJIT means Kim is commuting to "
+                            "Newark for work'. DIFFERENT from remember: it's how to READ the "
+                            "calendar, shared for everyone. term is the shorthand, meaning "
+                            "is the full explanation (include a location if given)."),
+            "input_schema": {"type": "object", "properties": {
+                "term": {"type": "string"}, "meaning": {"type": "string"}},
+                "required": ["term", "meaning"]}})
+        tools.append({
+            "name": "remove_glossary_term",
+            "description": ("Remove a shorthand definition. Pass the term or its id (from "
+                            "list_glossary)."),
+            "input_schema": {"type": "object", "properties": {
+                "term_or_id": {"type": "string"}}, "required": ["term_or_id"]}})
         tools.append({
             "name": "nudge",
             "description": ("Set a reminder FOR someone else or a group (parents only). "
@@ -4109,6 +4212,16 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "update_setting":
         return tool_update_setting(tool_input["key"], tool_input["value"], sender_role)
 
+    if name == "list_glossary":
+        return tool_list_glossary()
+    if name == "add_glossary_term":
+        if sender_role != "adult":
+            return "Only a parent can teach me calendar shorthand."
+        return tool_add_glossary_term(tool_input["term"], tool_input["meaning"], sender_name)
+    if name == "remove_glossary_term":
+        if sender_role != "adult":
+            return "Only a parent can change the calendar shorthand."
+        return tool_remove_glossary_term(tool_input["term_or_id"])
     if name == "remember":
         return tool_remember(tool_input["fact"], tool_input.get("about"), sender_name)
     if name == "recall":
@@ -4203,7 +4316,8 @@ GUIDE_TOPICS = [
         "key": "calendar", "title": "Calendar",
         "roles": ("adult", "caregiver", "child"), "private_only": False,
         "tools": ["check_calendar", "add_calendar_event", "edit_calendar_event",
-                  "delete_calendar_event", "find_events", "list_calendars"],
+                  "delete_calendar_event", "find_events", "list_calendars",
+                  "add_glossary_term", "remove_glossary_term", "list_glossary"],
         "summary": "See, add, change and delete events on the family calendar.",
         "body": [
             "SEE IT: \"what's on the calendar this week?\", \"what's on today?\", "
@@ -4217,6 +4331,11 @@ GUIDE_TOPICS = [
             "SOMETHING ON SEVERAL DAYS: \"add camp 9am to 4pm Monday through Thursday\" - "
             "I make ONE repeating event, not four. To remove it, say whether you mean just "
             "that day or the whole thing; I'll ask if you don't.",
+            "SHORTHAND: teach me what your calendar abbreviations mean and I'll read them "
+            "that way for everyone - \"JA means Joseph Anthony salon at [address]\", \"on "
+            "the calendar 'Kim remote' means she's working from home\". Ask \"what "
+            "shorthand do you know?\" any time, or \"forget JA\" to remove one. (Parents "
+            "teach it; everyone benefits.)",
             "(Needs a Google Calendar connected - a parent does this once.)",
         ],
     },
@@ -4800,6 +4919,10 @@ Say plainly that you only help members of one household, that you don't recogniz
 and that a parent can add them. You may answer harmless general questions, nothing more."""
 
     capabilities = capabilities_for_role(sender_role, is_group)
+    # The family's shared calendar/email shorthand. Shared (same for everyone), so it lives
+    # in the CACHED stable block - it costs nothing per call and helps every context read
+    # the household's own abbreviations. A rare edit invalidates the cache once.
+    glossary = _glossary_block()
     # Read the CURRENT contents of memory and the priority rules straight from the database
     # on every turn, so the model can never answer "what do you have stored?" from a stale
     # conversation instead of from reality (Trap 69). Empty string in group chats.
@@ -5078,6 +5201,8 @@ not correcting anything. You must call forget on the wrong memory (its id is in 
 state below) and remember the right one, in that same turn, before you confirm. The same
 goes for corrections to lists, reminders and priority rules. Confirming a change you did
 not make is worse than refusing it, because the person stops checking.
+
+{glossary}
 
 {capabilities}
 
@@ -6825,6 +6950,7 @@ def job_morning_briefing():
     weather = get_weather_line()
     occasions = _briefing_occasions()
     memory = _briefing_memory()
+    glossary = _glossary_block()
     now = now_local()
     when = (f"Right now it is {now.strftime('%-I:%M %p')} on "
             f"{now.strftime('%A, %B %-d, %Y')}. TODAY means {now.strftime('%A %B %-d')}; "
@@ -6838,7 +6964,7 @@ def job_morning_briefing():
             return
         reminders = _briefing_reminders(chat)
         context = "\n\n".join(x for x in
-                                (when, occasions, memory, calendar, reminders,
+                                (when, glossary, occasions, memory, calendar, reminders,
                                  weather or "WEATHER: unavailable - could not be fetched.")
                                 if x)
         try:
@@ -7217,7 +7343,8 @@ def job_urgent_email_poll():
                     f"EACH EMAIL GOES IN ONE PLACE ONLY (urgent OR items, never both). If "
                     f"nothing qualifies, reply {{\"urgent\": \"\", \"items\": []}}."),
                 messages=[{"role": "user", "content":
-                           (cal_ctx + "\n\n" if cal_ctx else "")
+                           (_glossary_block() + "\n\n" if _glossary_block() else "")
+                           + (cal_ctx + "\n\n" if cal_ctx else "")
                            + "NEW EMAILS:\n" + "\n\n".join(summaries)}])
             raw = "".join(b.text for b in resp.content if b.type == "text").strip()
         except Exception as e:
