@@ -6752,6 +6752,17 @@ def job_urgent_email_poll():
                 old = get_setting(f"last_email_id_{name}")
                 if old and str(old).startswith(prefix):
                     seen = old
+            if not seen:
+                # FIRST scan of this inbox (just connected, or a brand-new person). With no
+                # baseline, the loop below would treat the ENTIRE recent-unread backlog as
+                # "new" and announce up to 5 old emails as fresh deadlines the moment an
+                # account connects. They are not new, they are newly VISIBLE. Record the
+                # newest id as the baseline and surface nothing this pass; only mail that
+                # arrives AFTER connection gets flagged.
+                set_setting(key, stream[0]["id"])
+                print(f"[poll] {name}/{prov}: first scan - baseline set, {len(stream)} "
+                      f"existing unread left unflagged")
+                continue
             if stream[0]["id"] == seen:
                 continue                      # this inbox genuinely has nothing new
             for m in stream:
@@ -6818,6 +6829,9 @@ def job_urgent_email_poll():
                         f'"items": [{{"what": "<short description incl. amount if an '
                         f'invoice>", "date": "<YYYY-MM-DD or empty if none>", '
                         f'"from": "<sender>"}}]}}\n'
+                        f"EACH EMAIL GOES IN ONE PLACE ONLY: if you put something in "
+                        f"'urgent', do NOT also list it in 'items', and vice versa. Never "
+                        f"describe the same email twice.\n"
                         f"If nothing qualifies, reply {{\"urgent\": \"\", \"items\": []}}."),
                 messages=[{"role": "user", "content": "\n\n".join(summaries)}])
             raw = "".join(b.text for b in resp.content if b.type == "text").strip()
@@ -6839,11 +6853,24 @@ def job_urgent_email_poll():
         # 2) Deadlines / invoices -> offer to act, de-duped so we never repeat one.
         seen_key = f"flagged_deadlines_{name}"
         already = set((get_setting(seen_key) or "").split("|")) if get_setting(seen_key) else set()
+        # Backstop for the "urgent AND items" double-send (the SRV pickup went out twice
+        # seconds apart). If an item clearly restates the urgent line, drop the item.
+        def _overlaps_urgent(text):
+            if not urgent:
+                return False
+            a = set(re.findall(r"[a-z0-9]+", text.lower())) - _WATCH_STOPWORDS
+            b = set(re.findall(r"[a-z0-9]+", urgent.lower())) - _WATCH_STOPWORDS
+            if not a or not b:
+                return False
+            return len(a & b) / min(len(a), len(b)) >= 0.6
         new_lines = []
         new_sigs = []
         for it in verdict.get("items", []):
             what = (it.get("what") or "").strip()
             if not what:
+                continue
+            if _overlaps_urgent(what):
+                print(f"[poll] dropped item duplicating the urgent alert: {what[:40]!r}")
                 continue
             date = (it.get("date") or "").strip()
             frm = (it.get("from") or "").strip()
