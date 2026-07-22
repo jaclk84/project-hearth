@@ -246,6 +246,30 @@ def now_local():
     return datetime.datetime.now(TIMEZONE)
 
 
+def humanize_when(iso_str):
+    """A raw ISO timestamp -> the way a person would say it: 'tomorrow (Wednesday) at 9am',
+    'today at 3:30pm', 'Fri Aug 8 at 7pm'. Confirmations that read back a machine timestamp
+    feel like software; this makes them feel like they were understood."""
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TIMEZONE)
+    except (ValueError, TypeError):
+        return iso_str
+    now = now_local()
+    days = (dt.date() - now.date()).days
+    t = dt.strftime("%-I:%M%p").lower().replace(":00", "")   # 9:00AM -> 9am, 3:30PM -> 3:30pm
+    if days == 0:
+        day = "today"
+    elif days == 1:
+        day = f"tomorrow ({dt.strftime('%A')})"
+    elif 2 <= days <= 6:
+        day = dt.strftime("%A")
+    else:
+        day = dt.strftime("%a %b %-d")
+    return f"{day} at {t}"
+
+
 # Which calendar Guppi reads and writes. "primary" is a person's OWN calendar —
 # wrong for a family assistant. Set FAMILY_CALENDAR_ID in Railway to the shared
 # family calendar's id (looks like ...@group.calendar.google.com). Use the
@@ -395,6 +419,19 @@ def init_db():
     # renewals). A daily job computes days-until and fires 90/30/7/1-day nudges with a
     # help offer (gift ideas / packing list / "take action"). month/day drive annual
     # recurrence; `year` is set only for one-offs (a specific vacation).
+    # Conversation history, persisted. It used to be an in-memory dict wiped on every
+    # deploy - so mid-conversation a restart erased what Guppi was just talking about, which
+    # is why someone got "I don't have context for what you're referring to" right after a
+    # redeploy. During heavy testing that is constant. A tiny table fixes it with no
+    # downside: same 6-turn window, just durable.
+    conn.execute("""CREATE TABLE IF NOT EXISTS chat_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_chat "
+                 "ON chat_history(chat_id, id)")
     conn.execute("""CREATE TABLE IF NOT EXISTS occasions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL,
@@ -1653,15 +1690,25 @@ def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
                     "end to one day's times and let the repeat cover the rest.")
         return f"I couldn't add that to the calendar: {e}"
 
-    extra = f" at {location}" if location else ""
+    at_loc = f" at {location}" if location else ""
+    whose = f"{for_person}'s " if for_person else ""
+    # Reflect the specifics back, so the person can see it captured the details rather than
+    # just filing a title. Mention that a location and notes were saved when they were.
+    saved = []
+    if location:
+        saved.append("location")
+    if details:
+        saved.append("details")
+    saved_note = f" (saved the {' and '.join(saved)} too)" if saved else ""
     if rrule:
         how = str(repeat).lower()
-        when = (f"until {repeat_until}" if repeat_until
-                else f"{rrule[0].split('COUNT=')[-1]} times"
+        when = (f"through {repeat_until}" if repeat_until
+                else f"for {rrule[0].split('COUNT=')[-1]} occurrences"
                 if "COUNT=" in rrule[0] else "")
-        return (f"Added '{summary}' starting {start_iso}{extra}, repeating {how} {when}. "
-                f"It's one repeating series, so the whole thing can be changed at once.")
-    return f"Added '{summary}' on {start_iso}{extra}."
+        return (f"Added {whose}{summary}{at_loc}, {how} {when} starting "
+                f"{humanize_when(start_iso)}{saved_note}. It's one repeating series, so I "
+                f"can change the whole thing at once.")
+    return f"Added {whose}{summary} for {humanize_when(start_iso)}{at_loc}{saved_note}."
 
 
 # =============================================================================
@@ -2832,7 +2879,8 @@ def tool_add_reminder(text, due_iso, for_chat, created_by, repeat="none"):
                         f"{now_local().isoformat(timespec='seconds')}. Recompute the "
                         f"time from that and try again.")
         except ValueError:
-            return f"I couldn't read '{due_iso}' as a date and time. Use ISO 8601."
+            return ("I didn't quite catch that time - when would you like me to remind "
+                    "you? (e.g. 'tomorrow at 9am', 'Friday afternoon')")
 
     if (repeat or "none").lower() == "none":
         _c = db()
@@ -2858,8 +2906,8 @@ def tool_add_reminder(text, due_iso, for_chat, created_by, repeat="none"):
         (text, due_iso, for_chat, created_by, repeat))
     conn.commit()
     conn.close()
-    tail = "" if repeat == "none" else f" (repeats {repeat.replace(':',' ')})"
-    return f"Reminder set: '{text}' for {due_iso}{tail}."
+    tail = "" if repeat == "none" else f", repeating {repeat.replace(':',' ')}"
+    return f"Reminder set — I'll remind you {humanize_when(due_iso)}: {text}{tail}."
 
 
 def tool_nudge(target, text, due_iso, created_by, sender_role, repeat="none"):
@@ -2891,8 +2939,8 @@ def tool_nudge(target, text, due_iso, created_by, sender_role, repeat="none"):
             "VALUES (?,?,?,?,?)", (text, due_iso, chat, created_by, repeat))
     conn.commit(); conn.close()
     who = ", ".join(n for n, _ in people)
-    tail = "" if repeat == "none" else f" (repeats {repeat.replace(':',' ')})"
-    return f"Reminder set for {who}: '{text}' at {due_iso}{tail}."
+    tail = "" if repeat == "none" else f", repeating {repeat.replace(':',' ')}"
+    return f"Done — I'll remind {who} {humanize_when(due_iso)}: {text}{tail}."
 
 
 def tool_list_reminders(for_chat=None):
@@ -3169,7 +3217,8 @@ def tool_complete_commitment(commitment_id):
                        (commitment_id,)).fetchone()
     if not row:
         conn.close()
-        return "I couldn't find that one - try listing what's on the plate again."
+        return ("I couldn't find that one - ask me who's got what and I'll show you the "
+                "current list.")
     conn.execute("UPDATE commitments SET done = 1 WHERE id = ?", (commitment_id,))
     conn.commit()
     conn.close()
@@ -4887,6 +4936,22 @@ continuous session - today still needs its normal drop-off or start, and the rea
 times are usually in that entry's notes. Prefer the notes over the block's own start and
 end whenever they disagree.
 
+ACKNOWLEDGING IS NOT DOING. Saying "Got it", "Done", "I'll ignore that", or "I'll remind
+him" is a claim that you ACTED - so the tool that performs it must have run THIS turn before
+you say any of it. Someone asked you to ignore a sender and got "Got it" while nothing was
+saved; they had to ask again. If you cannot do it right now (wrong chat, missing info, no
+such capability), say so plainly instead of acknowledging as though it happened. A warm
+"Got it!" that changed nothing is worse than an honest "I can't do that here", because the
+person believes it's handled and stops watching.
+
+DO WHAT WAS ASKED BEFORE RAISING ANYTHING ELSE. When someone asks for something specific,
+handle THAT first and confirm it, then - only if useful - add a brief note about anything
+else you noticed. An observation, however helpful ("your calendar isn't connected"), must
+never REPLACE the thing they actually asked for: that derails them onto your agenda and
+leaves their request undone. One person asked to ignore a sender and instead got a note
+about their calendar, and their original request was dropped. Answer the question on the
+table first.
+
 NEVER PROMISE A FUTURE ACTION YOU HAVE NO MECHANISM FOR. The rules above cover facts you
 did not look up and actions you did not take; this one covers COMMITMENTS. "I'll keep an eye
 out", "I'll watch for that email", "I'll let you know when it arrives", "I'll remember to
@@ -4909,6 +4974,13 @@ added a calendar event" does NOT mean that person's own account is healthy - the
 calendar can be written using a different parent's account entirely. Use the connection
 list below, or call connection_health. Telling someone their connection is fine when it is
 dead stops them fixing it, which is worse than saying nothing.
+
+USE WHAT YOU KNOW WITHOUT BEING ASKED. The facts and connections listed in your live state
+are there to be DRAWN ON, not just recited when questioned. If you know Charlotte is at
+Swarthmore Rutledge and an email mentions that school, connect them. If you know an allergy
+and someone's planning a meal, mention it. Weaving in what you remember at the right moment
+is what makes you feel like you know the family rather than a database that answers queries.
+Don't force it - but don't sit on a relevant fact waiting to be asked for it either.
 
 A QUESTION ABOUT WHAT IS STORED RIGHT NOW ALWAYS GETS A FRESH LOOK. "What do you remember?",
 "what are my priority rules?", "what's on the list?", "what reminders do I have?" ask about
@@ -5371,7 +5443,10 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                       "line: if it's an event, offer to add it to the calendar and/or set "
                       "a reminder; if someone committed to a task ('I'll grab Charlotte'), "
                       "offer to note who's got it (and set a reminder if there's a time). "
-                      "Do NOT record or add anything yet — just offer. Name the person "
+                      "You have NO tools right now, so you literally cannot do it this turn - "
+                      "so ASK ('Want me to set that up?'), never PROMISE ('I'll set a "
+                      "reminder'). A promise you can't keep this turn reads as done and "
+                      "isn't. Do NOT record or add anything yet — just offer. Name the person "
                       "when relevant. If it turns out not to be a real task, say nothing "
                       "useful. Keep it to one line.)")
     text_part = f"{time_hint}\n\n{user_message}"
@@ -5515,15 +5590,45 @@ _HISTORY = {}
 _HISTORY_TURNS = 6          # keep the last 6 exchanges (12 messages) per chat
 
 def get_history(chat_id):
-    return list(_HISTORY.get(str(chat_id), []))
+    """Recent turns for this chat. Served from an in-memory cache, but lazily loaded from
+    the database the first time a chat is seen after a restart - so a redeploy no longer
+    wipes the conversation."""
+    key = str(chat_id)
+    if key not in _HISTORY:
+        try:
+            conn = db()
+            rows = conn.execute(
+                "SELECT role, content FROM chat_history WHERE chat_id = ? "
+                "ORDER BY id DESC LIMIT ?", (key, _HISTORY_TURNS * 2)).fetchall()
+            conn.close()
+            _HISTORY[key] = [{"role": r["role"], "content": r["content"]}
+                             for r in reversed(rows)]
+        except Exception as e:
+            print(f"[history] load failed for {key}: {e}")
+            _HISTORY[key] = []
+    return list(_HISTORY.get(key, []))
 
 def save_history(chat_id, user_text, assistant_text):
     key = str(chat_id)
-    hist = _HISTORY.get(key, [])
+    hist = get_history(key)                       # ensures the cache is warm post-restart
     hist.append({"role": "user", "content": user_text})
     hist.append({"role": "assistant", "content": assistant_text})
-    # Trim to the last N exchanges.
     _HISTORY[key] = hist[-(_HISTORY_TURNS * 2):]
+    # Persist, then trim the stored rows to the same window so the table can't grow forever.
+    try:
+        conn = db()
+        now = now_local().isoformat()
+        conn.execute("INSERT INTO chat_history (chat_id, role, content, created_at) "
+                     "VALUES (?,?,?,?)", (key, "user", user_text, now))
+        conn.execute("INSERT INTO chat_history (chat_id, role, content, created_at) "
+                     "VALUES (?,?,?,?)", (key, "assistant", assistant_text, now))
+        conn.execute(
+            "DELETE FROM chat_history WHERE chat_id = ? AND id NOT IN "
+            "(SELECT id FROM chat_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?)",
+            (key, key, _HISTORY_TURNS * 2))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[history] save failed for {key}: {e}")
 
 
 @app.get("/")
@@ -6084,7 +6189,7 @@ def tool_cancel_email_watch(watch_id, person):
                        (watch_id, person))
     conn.commit(); gone = cur.rowcount; conn.close()
     return ("Stopped watching for that." if gone
-            else "I couldn't find that watch - use list_email_watches to see the ids.")
+            else "I couldn't find that one - ask me what I'm watching for and I'll show you.")
 
 
 def _check_email_watches(person, msgs):
