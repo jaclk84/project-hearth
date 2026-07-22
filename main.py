@@ -2008,6 +2008,7 @@ def send_email_for(person, to_addr, subject, body, reply_headers=None):
 # fires after they say send. In-memory, so a pending draft clears on redeploy (fine —
 # an unsent draft that survives a restart would be a surprise, not a feature).
 _PENDING_EMAIL = {}   # person -> {to, subject, body, reply_headers, turn_id}
+_RECENT_FLAGGED = {} # person -> [ {from, subject, id}, ... ] most recently flagged by the poll
 _CURRENT_TURN = {}    # person -> id of the message turn currently being processed
 _LAST_USER_TEXT = {}  # person -> their most recent raw message (for send-confirmation check)
 
@@ -4517,6 +4518,24 @@ def _live_state_block(sender_name, sender_role, is_group):
         print(f"[state] could not load memories: {e}")
 
     if sender_role == "adult":
+        # What the email poll most recently flagged for this person, so an immediate
+        # "what's in that email?" / "read the pickup one" resolves without them having to
+        # re-identify it. This is context, not an instruction to act.
+        try:
+            recent = _RECENT_FLAGGED.get(sender_name) or []
+            if recent:
+                lines = "\n".join(
+                    f"  - from {r.get('from','?')}: {r.get('subject','(no subject)')}"
+                    for r in recent[:8])
+                parts.append(
+                    "EMAILS I JUST FLAGGED FOR THIS PERSON (my most recent inbox scan):\n"
+                    + lines +
+                    "\n  If they ask about 'that email', 'the pickup one', or 'what's in "
+                    "it', this is what they mean - use read_email with a distinctive word "
+                    "from the relevant subject to pull the full text. Do not claim you "
+                    "don't know which email they mean when it is listed here.")
+        except Exception as e:
+            print(f"[state] could not load recent flagged: {e}")
         # Whether THIS person's own accounts are alive. Cheap (settings + one row each,
         # no network), and it closes a real hole: Kim asked "why do you think it needs to
         # reconnect?" and Guppi, having no idea, told her the connection seemed fine -
@@ -5339,9 +5358,12 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     today = n.strftime("%A, %B %d, %Y")
     clock = n.strftime("%-I:%M %p")
     iso_now = n.isoformat(timespec="seconds")
-    time_hint = (f"(Right now it is {clock} on {today}. In ISO 8601 that is {iso_now}. "
-                 f"Use this to work out any relative time such as 'in 2 minutes', "
-                 f"'in an hour', 'tonight', or 'tomorrow morning'.)")
+    time_hint = (f"(CONTEXT FOR YOU ONLY - never read this back to the user: right now it "
+                 f"is {clock} on {today}, which is {iso_now} in ISO 8601. Use it to resolve "
+                 f"relative times like 'in 2 minutes', 'tonight', or 'tomorrow morning'. If "
+                 f"the user's message needs no action - 'no action needed', 'never mind', "
+                 f"'thanks' - just acknowledge briefly and stop; do NOT recite the date or "
+                 f"time.)")
     if group_offer:
         time_hint += ("\n\n(You were NOT directly addressed — you overheard this in the "
                       "family group chat. It's either a schedulable event/task or someone "
@@ -5547,7 +5569,9 @@ def _group_scheduling_intent(text):
                     "reactions, or anything without a concrete task/event/commitment."),
             messages=[{"role": "user", "content": text}])
         verdict = "".join(b.text for b in resp.content if b.type == "text").strip().upper()
-        return verdict.startswith("YES")
+        # "starts with YES" was brittle - a fenced or prefaced reply ("```\nYES") failed
+        # closed and silently skipped a real schedulable message. Look for the token.
+        return "YES" in verdict and "NO" not in verdict.split("YES")[0]
     except Exception as e:
         print(f"[group] intent check failed: {e}")
         return False
@@ -6611,6 +6635,47 @@ def job_weekly_digest():
             send_message(chat, text, proactive=True)
 
 
+def _extract_json_object(raw):
+    """Pull the first complete JSON object out of a model reply, however it's wrapped.
+
+    The verdict model was told "STRICT JSON only" and still returned things like
+    "This is a promotional email... ```json\n{...}\n```" - a leading sentence AND a code
+    fence. Stripping ``` wasn't enough: the prose remained and json.loads choked, so those
+    polls silently produced nothing. Instead of trusting the format, find the object by
+    scanning for the first balanced {...} (respecting strings and escapes), which survives
+    any amount of surrounding chatter."""
+    if not raw:
+        return None
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(raw):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        return json.loads(raw[start:i + 1])
+                    except Exception:
+                        start = -1        # keep scanning for a later, valid object
+    return None
+
+
 def _poll_unread(person):
     """Newest unread across every inbox this person connected (Gmail + IMAP), normalized.
     The 'anything new?' check is a free provider call — Claude only runs if there IS new
@@ -6718,6 +6783,13 @@ def job_urgent_email_poll():
             summaries.append(f"From {m['from']}: {m['subject']}{snip}{tag}")
             if is_priority:
                 priority_hits.append(m.get("from") or "")
+        # Remember the mail this poll just told them about, so "what's in that email?"
+        # right after an alert can be answered without them re-identifying it. Small,
+        # in-memory, per person; last one wins because that's what "that email" means.
+        if summaries:
+            _RECENT_FLAGGED[name] = [
+                {"from": m.get("from", ""), "subject": m.get("subject", ""),
+                 "id": m.get("id", "")} for m in fresh][:8]
         if not summaries:
             continue
         if not claude_call_allowed():
@@ -6753,12 +6825,10 @@ def job_urgent_email_poll():
             print(f"[poll] Claude failed for {name}: {e}")
             continue
 
-        # Parse the JSON verdict defensively.
-        try:
-            cleaned = raw.replace("```json", "").replace("```", "").strip()
-            verdict = json.loads(cleaned)
-        except Exception:
-            print(f"[poll] couldn't parse verdict for {name}: {raw[:120]}")
+        # Parse the JSON verdict however the model wrapped it (prose, code fences, both).
+        verdict = _extract_json_object(raw)
+        if verdict is None:
+            print(f"[poll] no JSON object in verdict for {name}: {raw[:120]!r}")
             continue
 
         # 1) Urgent -> alert immediately.
