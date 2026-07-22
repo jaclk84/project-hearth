@@ -75,6 +75,7 @@ import urllib.error
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request, Response, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse
+from starlette.background import BackgroundTask
 from anthropic import Anthropic
 
 from google_auth_oauthlib.flow import Flow
@@ -1174,7 +1175,17 @@ def tool_update_setting(key, value, requester_role):
         if str(value).lower() not in ("true", "false"):
             return "proactive_enabled must be true or false."
         value = str(value).lower()
-    return set_setting(key, value)
+    result = set_setting(key, value)
+    # poll_minutes is read once when the scheduler starts, so a change did nothing until a
+    # redeploy (T3.3). Reschedule the job live so "check email every 15 minutes" works now.
+    if key == "poll_minutes":
+        try:
+            mins = max(1, int(value))
+            scheduler.reschedule_job("email_poll", trigger="interval", minutes=mins)
+            print(f"[scheduler] email poll rescheduled to every {mins} min")
+        except Exception as e:
+            print(f"[scheduler] could not reschedule poll: {e}")
+    return result
 
 
 # =============================================================================
@@ -2046,6 +2057,10 @@ def send_email_for(person, to_addr, subject, body, reply_headers=None):
         if ok:
             return True, "microsoft"
         return False, err
+    # Reached only if Gmail was the sole provider and it failed - report THAT, not a
+    # misleading "nothing connected" (T4.4).
+    if "google" in providers:
+        return False, "the send didn't go through - the account may need reconnecting."
     return False, "No email account is connected to send from."
 
 
@@ -2900,13 +2915,20 @@ def tool_add_reminder(text, due_iso, for_chat, created_by, repeat="none"):
              "weekly:fri","weekly:sat","weekly:sun"}
     if repeat not in valid:
         repeat = "none"
+    if repeat == "monthly":
+        try:
+            _d = datetime.datetime.fromisoformat(due_iso)
+            repeat = _anchor_monthly("monthly", _d)     # -> "monthly:<day>"
+        except (ValueError, TypeError):
+            pass
     conn = db()
     conn.execute(
         "INSERT INTO reminders (text, due_at, for_chat, created_by, repeat) VALUES (?,?,?,?,?)",
         (text, due_iso, for_chat, created_by, repeat))
     conn.commit()
     conn.close()
-    tail = "" if repeat == "none" else f", repeating {repeat.replace(':',' ')}"
+    _disp = "monthly" if repeat.startswith("monthly") else repeat.replace(":", " ")
+    tail = "" if repeat == "none" else f", repeating {_disp}"
     return f"Reminder set — I'll remind you {humanize_when(due_iso)}: {text}{tail}."
 
 
@@ -2920,6 +2942,11 @@ def tool_nudge(target, text, due_iso, created_by, sender_role, repeat="none"):
         return (f"{target} isn't set up with me yet. A parent can invite them, then they "
                 f"send me /start.")
     repeat = (repeat or "none").lower()
+    if repeat == "monthly":
+        try:
+            repeat = _anchor_monthly("monthly", datetime.datetime.fromisoformat(due_iso))
+        except (ValueError, TypeError):
+            pass
     conn = db()
     # A4: the duplicate pharmacy reminder came through THIS path, not add_reminder.
     if repeat == "none":
@@ -2939,7 +2966,8 @@ def tool_nudge(target, text, due_iso, created_by, sender_role, repeat="none"):
             "VALUES (?,?,?,?,?)", (text, due_iso, chat, created_by, repeat))
     conn.commit(); conn.close()
     who = ", ".join(n for n, _ in people)
-    tail = "" if repeat == "none" else f", repeating {repeat.replace(':',' ')}"
+    _disp = "monthly" if repeat.startswith("monthly") else repeat.replace(":", " ")
+    tail = "" if repeat == "none" else f", repeating {_disp}"
     return f"Done — I'll remind {who} {humanize_when(due_iso)}: {text}{tail}."
 
 
@@ -3143,8 +3171,8 @@ def job_occasion_reminders():
     """Once a day: for each tracked occasion, if today is exactly a milestone (90/30/7/1
     days out, per kind), send the escalating nudge + help offer to the right parent(s).
     De-duped per occasion+year+milestone so each fires once."""
-    if not proactive_on() or in_quiet_hours():
-        return
+    if not proactive_on():
+        return  # scheduled digest fires at its set time; quiet hours only gates ad-hoc proactivity
     today = now_local().date()
     conn = db()
     occ_rows = conn.execute("SELECT * FROM occasions").fetchall()
@@ -3225,10 +3253,19 @@ def tool_complete_commitment(commitment_id):
     return f"Marked done: {row['task']}."
 
 
+def _write_list_name(conn, list_name):
+    """The name to write under: reuse an existing list matching however it's spelled
+    ('to do' / 'todo' / 'to-do'), else the name as given. Reads canonicalise; writes did
+    not, so 'clear the todo list' reported an empty 'todo' while items sat under 'to do'
+    (T1.3). Now writes land on the same list reads find."""
+    existing = _resolve_list_name(conn, list_name)
+    return existing if existing else list_name.strip()
+
+
 def tool_add_to_list(list_name, item, added_by):
     conn = db()
     conn.execute("INSERT INTO list_items (list_name, item, added_by, created_at) VALUES (?,?,?,?)",
-                 (list_name.lower(), item, added_by, now_local().isoformat()))
+                 (_write_list_name(conn, list_name), item, added_by, now_local().isoformat()))
     conn.commit()
     conn.close()
     return f"Added '{item}' to the {list_name} list."
@@ -3246,7 +3283,7 @@ def tool_add_items_to_list(list_name, items, added_by):
         if it:
             conn.execute(
                 "INSERT INTO list_items (list_name, item, added_by, created_at) VALUES (?,?,?,?)",
-                (list_name.lower(), it, added_by, now))
+                (_write_list_name(conn, list_name), it, added_by, now))
     conn.commit()
     conn.close()
     n = len([i for i in items if str(i).strip()])
@@ -3317,7 +3354,8 @@ def tool_show_list(list_name):
 def tool_clear_list(list_name):
     """Empty an entire list (e.g. after the grocery run)."""
     conn = db()
-    cur = conn.execute("DELETE FROM list_items WHERE list_name = ?", (list_name.lower(),))
+    cur = conn.execute("DELETE FROM list_items WHERE list_name = ?",
+                       (_write_list_name(conn, list_name),))
     conn.commit(); n = cur.rowcount; conn.close()
     return f"Cleared the {list_name} list ({n} items removed)." if n else f"The {list_name} list was already empty."
 
@@ -3327,7 +3365,8 @@ def tool_check_off_item(list_name, item_text):
     Lets someone say 'check off milk' without needing the item's id number."""
     conn = db()
     rows = conn.execute(
-        "SELECT id, item FROM list_items WHERE list_name = ?", (list_name.lower(),)).fetchall()
+        "SELECT id, item FROM list_items WHERE list_name = ?",
+        (_write_list_name(conn, list_name),)).fetchall()
     match = None
     for r in rows:
         if item_text.strip().lower() in r["item"].lower():
@@ -3382,7 +3421,7 @@ def tool_start_from_template(template_name, list_name, added_by):
     now = now_local().isoformat()
     for it in items:
         conn.execute("INSERT INTO list_items (list_name, item, added_by, created_at) VALUES (?,?,?,?)",
-                     (list_name.lower(), it, added_by, now))
+                     (_write_list_name(conn, list_name), it, added_by, now))
     conn.commit(); conn.close()
     return f"Started the {list_name} list from '{template_name}' ({len(items)} items)."
 
@@ -5062,6 +5101,8 @@ def in_quiet_hours():
     h = now_local().hour
     start = int(get_setting("quiet_start_hour") or 22)
     end = int(get_setting("quiet_end_hour") or 6)
+    if start == end:
+        return False        # not configured as a real window; treat as "no quiet hours"
     if start > end:
         return h >= start or h < end
     return start <= h < end
@@ -6316,6 +6357,21 @@ def _adults_with_chats():
     return [(r["name"], r["chat_id"]) for r in rows]
 
 
+def _anchor_monthly(repeat, due_dt):
+    """Store a monthly repeat as 'monthly:<intended day>' so it never drifts.
+
+    T3.1: a "31st of the month" reminder was clamped to Feb 28 and that clamped day was
+    written back, so it moved permanently to the 28th (Feb 28 -> Mar 28 -> ...). Capturing
+    the INTENDED day at creation lets each month clamp independently without losing it:
+    Jan 31 -> Feb 28 -> Mar 31 -> Apr 30 -> May 31."""
+    if (repeat or "").lower() == "monthly":
+        try:
+            return f"monthly:{due_dt.day}"
+        except Exception:
+            return "monthly"
+    return repeat
+
+
 def _next_occurrence(due_dt, repeat):
     """Given a fired reminder's time and its repeat rule, return the next datetime it
     should fire, or None for a one-time reminder."""
@@ -6324,14 +6380,17 @@ def _next_occurrence(due_dt, repeat):
         return None
     if repeat == "daily":
         return due_dt + datetime.timedelta(days=1)
-    if repeat == "monthly":
-        # same day next month (clamp to end of month handled loosely by adding ~30d
-        # then snapping to the same day-of-month when possible)
+    if repeat == "monthly" or repeat.startswith("monthly:"):
+        # Target the INTENDED day-of-month (from 'monthly:N'), not the possibly-clamped day
+        # we last fired on. Falls back to the current day for a legacy bare 'monthly'.
+        try:
+            anchor = int(repeat.split(":", 1)[1]) if ":" in repeat else due_dt.day
+        except (ValueError, IndexError):
+            anchor = due_dt.day
         month = due_dt.month + 1
         year = due_dt.year + (1 if month > 12 else 0)
         month = 1 if month > 12 else month
-        day = due_dt.day
-        # step back until valid (handles 31st -> shorter months)
+        day = min(anchor, 31)
         while day > 28:
             try:
                 return due_dt.replace(year=year, month=month, day=day)
@@ -6646,8 +6705,8 @@ def job_morning_briefing():
       A6d - a 300-CHARACTER limit, which is about two sentences: no room to say which day
             something falls on, let alone reason about it.
     """
-    if not proactive_on() or in_quiet_hours():
-        return
+    if not proactive_on():
+        return  # scheduled digest fires at its set time; quiet hours only gates ad-hoc proactivity
     calendar = _briefing_calendar()
     weather = get_weather_line()
     now = now_local()
@@ -6705,8 +6764,8 @@ def _people_with_chats_by_role():
 def job_weekly_digest():
     """Sunday 6pm: a 'week ahead' summary. Parents get the full week; children and the
     caregiver get a lighter version focused on what's relevant to them."""
-    if not proactive_on() or in_quiet_hours():
-        return
+    if not proactive_on():
+        return  # scheduled digest fires at its set time; quiet hours only gates ad-hoc proactivity
     week = tool_check_calendar(days_ahead=7)
 
     for name, chat, role in _people_with_chats_by_role():
@@ -6994,7 +7053,8 @@ def job_urgent_email_poll():
                       "Just tell me which.")
             send_message(chat, body, proactive=True)
             # Remember what we've flagged (cap the stored history so it can't grow forever).
-            merged = list(already | set(new_sigs))
+            prior = [x for x in (get_setting(seen_key) or "").split("|") if x]
+            merged = prior + [x for x in new_sigs if x not in set(prior)]
             set_setting(seen_key, "|".join(merged[-100:]))
             # LEARNING: record the senders we just flagged as "awaiting outcome". If the
             # person engages with this flag (asks for a reminder/calendar/reply) before the
@@ -7072,8 +7132,17 @@ def backup_download(token: str = ""):
     snap = make_db_snapshot()
     if not snap:
         return {"ok": False, "error": "snapshot failed"}
+    # Delete the temp snapshot AFTER it's been streamed. run_backup cleans up its own
+    # copy; this download path did not, leaving a full credential dump in /tmp per download
+    # (T4.5). BackgroundTask runs once the response is fully sent.
+    def _cleanup(path=snap):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
     return FileResponse(snap, filename=os.path.basename(snap),
-                        media_type="application/octet-stream")
+                        media_type="application/octet-stream",
+                        background=BackgroundTask(_cleanup))
 
 
 @app.post("/restore")
@@ -7114,6 +7183,12 @@ async def restore_upload(request: Request, token: str = "", file: UploadFile = F
             os.remove(tmp_path)
             return {"ok": False, "error": f"uploaded file isn't a usable database: {e}"}
         os.replace(tmp_path, DB_PATH)   # atomic swap
+        for _sfx in ("-wal", "-shm"):
+            try:
+                if os.path.exists(DB_PATH + _sfx):
+                    os.remove(DB_PATH + _sfx)
+            except Exception as _e:
+                print(f"[restore] could not remove {DB_PATH + _sfx}: {_e}")
         print(f"[restore] database restored from upload ({len(data)} bytes)")
         return {"ok": True, "restored_bytes": len(data),
                 "note": ("Database restored (atomic swap). Previous DB saved as "
