@@ -2481,7 +2481,7 @@ def imap_unread(person, max_results=5):
         ids = data[0].split()
         for mid in reversed(ids[-max_results:]):
             # PEEK so we don't mark the mail as read just by checking it.
-            typ, md = M.uid("fetch", mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+            typ, md = M.uid("fetch", mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
             if typ != "OK":
                 continue
             # Scan for the payload instead of indexing md[0][1]. IMAP does not guarantee
@@ -2502,6 +2502,7 @@ def imap_unread(person, max_results=5):
                 "id": f"i:{mid.decode()}",
                 "from": _decode(hmsg.get("From", "?")),
                 "subject": _decode(hmsg.get("Subject", "(no subject)")),
+                "received": _fmt_received(hmsg.get("Date", "")),
                 "snippet": ""})
     except Exception as e:
         print(f"[imap] unread failed for {person}: {e}")
@@ -3912,6 +3913,13 @@ def tools_for_role(role, is_group=False):
                 "input_schema": {"type": "object", "properties": {
                     "watch_id": {"type": "integer"}}, "required": ["watch_id"]}})
             tools.append({
+                "name": "show_skipped_email",
+                "description": ("Show recent emails Guppi did NOT surface because the sender "
+                                "is on the ignore list or looked like marketing. Use for "
+                                "'what did you skip?', 'anything you ignored?', 'what emails "
+                                "did you not tell me about?'."),
+                "input_schema": {"type": "object", "properties": {}}})
+            tools.append({
                 "name": "connect_link",
                 "description": ("Create a working sign-in link so someone can CONNECT or "
                                 "RECONNECT an account. Use whenever anyone needs to link "
@@ -3992,7 +4000,7 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
                        "connection_health", "manage_deadline_ignores",
                        "manage_email_priorities", "backup_now", "backup_link",
                        "connect_link", "watch_for_email", "list_email_watches",
-                       "cancel_email_watch"}
+                       "cancel_email_watch", "show_skipped_email"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -4084,6 +4092,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return tool_list_email_watches(sender_name)
     if name == "cancel_email_watch":
         return tool_cancel_email_watch(tool_input["watch_id"], sender_name)
+    if name == "show_skipped_email":
+        return tool_show_skipped_email(sender_name)
     if name == "connect_link":
         return tool_connect_link(tool_input.get("person") or sender_name,
                                  tool_input.get("kind", "google"))
@@ -4264,7 +4274,8 @@ GUIDE_TOPICS = [
         "key": "flags", "title": "What email I flag you about",
         "roles": ("adult",), "private_only": True,
         "tools": ["manage_email_priorities", "manage_deadline_ignores",
-                  "watch_for_email", "list_email_watches", "cancel_email_watch"],
+                  "watch_for_email", "list_email_watches", "cancel_email_watch",
+                  "show_skipped_email"],
         "summary": "Control which senders I chase you about, and watch for mail you expect.",
         "body": [
             "I watch new mail and flag deadlines, invoices and RSVPs, offering to set a "
@@ -4275,6 +4286,8 @@ GUIDE_TOPICS = [
             "STOP CHASING DEADLINES FROM ONE SENDER: \"stop flagging deadlines from "
             "Todoist\" - different from ignoring them entirely.",
             "SEE THE RULES: \"what are my email priorities?\"",
+            "WHAT I SKIPPED: \"what did you ignore?\" - I'll show recent emails I didn't "
+            "surface, so you can catch a sender I'm wrongly skipping.",
             "I also quietly notice what you act on versus ignore, and will OFFER to adjust. "
             "I only ever suggest - your rules always win.",
             "WATCH FOR SOMETHING YOU'RE EXPECTING: \"keep an eye out for the Fandango "
@@ -6299,6 +6312,22 @@ def _check_email_watches(person, msgs):
     return hits
 
 
+def tool_show_skipped_email(person):
+    """What the last polls chose NOT to surface (ignored senders, marketing). Lets a person
+    catch a wrongly-ignored sender - Jason asked for this. In-memory and recent-only."""
+    items = _RECENT_SKIPPED.get(person) or []
+    if not items:
+        return ("I haven't skipped anything recently - everything new looked worth a "
+                "mention, or there's been no new mail.")
+    lines = []
+    for it in items[:12]:
+        rcv = f" ({it['received']})" if it.get("received") else ""
+        lines.append(f"- {it.get('subject','(no subject)')} — from {it.get('from','?')}{rcv}")
+    return ("Recently skipped (marketing / senders you told me to ignore):\n"
+            + "\n".join(lines)
+            + "\n\nIf one of these should be surfaced, say \"always flag <sender>\".")
+
+
 def tool_manage_email_priorities(action, sender=None, person=None):
     """Manage which senders are PRIORITY (always flag) or IGNORED (never flag) for this
     person, and view learned patterns.
@@ -6942,6 +6971,70 @@ def _extract_json_object(raw):
     return None
 
 
+_RECENT_SKIPPED = {}   # person -> [ {from, subject, received}, ... ] most recent poll's ignored mail
+
+
+def _fmt_received(date_header):
+    """An email's Date header -> how a person would say when it came: 'today 9:14am',
+    'yesterday 4pm', 'Tue 8:40am', 'Jul 12'. Surfacing this stops people re-reviewing old
+    mail (Jason's request) and grounds the triage in recency."""
+    if not date_header:
+        return ""
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(date_header)
+        if dt is None:
+            return ""
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TIMEZONE)
+        dt = dt.astimezone(TIMEZONE)
+    except Exception:
+        return ""
+    now = now_local()
+    days = (now.date() - dt.date()).days
+    t = dt.strftime("%-I:%M%p").lower().replace(":00", "")
+    if days == 0:
+        return f"today {t}"
+    if days == 1:
+        return f"yesterday {t}"
+    if 2 <= days <= 6:
+        return f"{dt.strftime('%a')} {t}"
+    return dt.strftime("%b %-d")
+
+
+def _calendar_context_for_triage(days=45):
+    """A compact list of upcoming calendar events, so the poll can cross-check an email's
+    event against what's already scheduled: already-on, a time difference, or a conflict.
+    Returns a text block (or '') - one calendar read per poll, shared across all emails."""
+    service = get_calendar_service()
+    if not service:
+        return ""
+    now = now_local()
+    try:
+        result = service.events().list(
+            calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(),
+            timeMax=(now + datetime.timedelta(days=days)).isoformat(),
+            singleEvents=True, orderBy="startTime", maxResults=60).execute()
+    except Exception as e:
+        print(f"[poll] calendar context read failed: {e}")
+        return ""
+    lines = []
+    for e in result.get("items", []):
+        start = e["start"].get("dateTime", e["start"].get("date"))
+        try:
+            sdt = datetime.datetime.fromisoformat(start)
+            when = sdt.strftime("%a %b %-d %-I:%M%p").replace(":00", "") \
+                if "dateTime" in e["start"] else sdt.strftime("%a %b %-d (all day)")
+        except (ValueError, TypeError):
+            when = start
+        loc = f" @ {e['location']}" if e.get("location") else ""
+        lines.append(f"  - {when}: {e.get('summary','(no title)')}{loc}")
+    if not lines:
+        return "CALENDAR (next few weeks): nothing scheduled."
+    return "THE FAMILY CALENDAR (next few weeks) - cross-check email events against this:\n" \
+           + "\n".join(lines[:60])
+
+
 def _poll_unread(person):
     """Newest unread across every inbox this person connected (Gmail + IMAP), normalized.
     The 'anything new?' check is a free provider call — Claude only runs if there IS new
@@ -6960,11 +7053,12 @@ def _poll_unread(person):
                 for m in res.get("messages", []):
                     md = service.users().messages().get(
                         userId="me", id=m["id"], format="metadata",
-                        metadataHeaders=["From", "Subject"]).execute()
+                        metadataHeaders=["From", "Subject", "Date"]).execute()
                     h = {x["name"]: x["value"] for x in md["payload"]["headers"]}
                     out.append({"id": f"g:{m['id']}", "from": h.get("From", "?"),
                                 "subject": h.get("Subject", "(no subject)"),
-                                "snippet": md.get("snippet", "")[:120]})
+                                "received": _fmt_received(h.get("Date", "")),
+                                "snippet": md.get("snippet", "")[:200]})
             except Exception as e:
                 print(f"[poll] gmail failed for {person}: {e}")
     if "imap" in provs:
@@ -6973,13 +7067,18 @@ def _poll_unread(person):
 
 
 def job_urgent_email_poll():
-    """Every N minutes (6am-10pm): for each connected adult, scan new unread mail across
-    all their inboxes for two things:
-      1. genuine urgency (school closure, appointment change) -> alert now
-      2. deadlines / due dates / invoices -> proactively offer to set a reminder or add
-         a calendar entry
-    Only calls Claude when there IS new mail. Alerts ONLY that inbox's owner. De-dupes so
-    the same email is never flagged twice."""
+    """Every N minutes: for each connected adult, TRIAGE new unread mail and surface what
+    needs them - richer than the old "I spotted a deadline" list.
+
+    For each important email it produces: what it is, WHEN it was received (so old mail
+    isn't re-reviewed), a one-line summary, a calendar CROSS-CHECK (already on / conflicts /
+    differs / not on), and only the actions that genuinely help (add/update calendar, a
+    reminder at a specific time, or a reply when one is clearly expected). It offers; the
+    person confirms - nothing is added or sent on its own.
+
+    Ignored/marketing mail is remembered (not surfaced) so "what did you skip?" can show it.
+    Only calls Claude when there IS new mail; alerts ONLY that inbox's owner; de-dupes so
+    the same email is never surfaced twice."""
     if not proactive_on() or in_quiet_hours():
         return
     for name, chat in _adults_with_chats():
@@ -7045,7 +7144,7 @@ def job_urgent_email_poll():
         ignore = _ignored_senders()
         priority = _priority_senders(name)
         summaries = []
-        priority_hits = []      # senders on this person's always-flag list that showed up
+        skipped = []            # ignored senders - kept so "what did you skip?" can answer
         # Walk `fresh` - the new messages from BOTH inboxes - not the raw concatenated
         # list with a break on a single marker id.
         for m in fresh:
@@ -7054,12 +7153,16 @@ def job_urgent_email_poll():
             # Ignore filter applies UNLESS the sender is explicitly a priority (explicit
             # priority always wins over ignore).
             if not is_priority and any(bad in frm for bad in ignore):
+                skipped.append({"from": m.get("from", ""), "subject": m.get("subject", ""),
+                                "received": m.get("received", "")})
                 continue
+            rcv = f" [received {m['received']}]" if m.get("received") else ""
             snip = f" - {m['snippet']}" if m.get("snippet") else ""
             tag = " [PRIORITY SENDER]" if is_priority else ""
-            summaries.append(f"From {m['from']}: {m['subject']}{snip}{tag}")
-            if is_priority:
-                priority_hits.append(m.get("from") or "")
+            summaries.append(f"From {m['from']}: {m['subject']}{rcv}{snip}{tag}")
+        # Keep this poll's skipped mail so a later "anything you ignored?" can show it.
+        if skipped:
+            _RECENT_SKIPPED[name] = (skipped + _RECENT_SKIPPED.get(name, []))[:15]
         # Remember the mail this poll just told them about, so "what's in that email?"
         # right after an alert can be answered without them re-identifying it. Small,
         # in-memory, per person; last one wins because that's what "that email" means.
@@ -7073,104 +7176,152 @@ def job_urgent_email_poll():
             return
 
         today = now_local().strftime("%A, %B %d, %Y")
+        cal_ctx = _calendar_context_for_triage()
         try:
             resp = claude_create(
-                model=MODEL, max_tokens=350,
-                system=(f"You are Guppi, scanning a family member's NEW unread emails. "
-                        f"Today is {today}. Look for two kinds of things:\n"
-                        f"1) URGENT: genuinely time-sensitive items worth an interruption "
-                        f"now (school closure, appointment change, safety, a bill due very "
-                        f"soon).\n"
-                        f"2) DEADLINES/INVOICES: due dates, payment amounts and due dates, "
-                        f"RSVP-by dates, form deadlines, appointment dates.\n"
-                        f"3) PRIORITY SENDERS: any email tagged [PRIORITY SENDER] is from "
-                        f"someone this person told me to ALWAYS surface. Include it as an "
-                        f"item even if it has no explicit deadline - summarize what it's "
-                        f"about so they don't miss it.\n"
-                        f"IGNORE marketing, promotions, newsletters, 'limited time offers', "
-                        f"and routine notifications — those are never urgent or deadlines "
-                        f"(UNLESS tagged [PRIORITY SENDER]).\n"
-                        f"Reply with STRICT JSON only, no prose:\n"
-                        f'{{"urgent": "<one short sentence, or empty>", '
-                        f'"items": [{{"what": "<short description incl. amount if an '
-                        f'invoice>", "date": "<YYYY-MM-DD or empty if none>", '
-                        f'"from": "<sender>"}}]}}\n'
-                        f"EACH EMAIL GOES IN ONE PLACE ONLY: if you put something in "
-                        f"'urgent', do NOT also list it in 'items', and vice versa. Never "
-                        f"describe the same email twice.\n"
-                        f"If nothing qualifies, reply {{\"urgent\": \"\", \"items\": []}}."),
-                messages=[{"role": "user", "content": "\n\n".join(summaries)}])
+                model=MODEL, max_tokens=900,
+                system=(
+                    f"You are Guppi, triaging a family member's NEW unread emails and "
+                    f"deciding what (if anything) is worth telling them. Today is {today}.\n\n"
+                    f"You are given each new email (sender, subject, when it was received, a "
+                    f"snippet) AND the family's upcoming calendar. For EACH email decide if "
+                    f"it is worth surfacing. Surface anything with a date, deadline, "
+                    f"appointment, RSVP, payment, form, or from a [PRIORITY SENDER]. IGNORE "
+                    f"marketing, promotions, newsletters, and routine notifications (unless "
+                    f"[PRIORITY SENDER]).\n\n"
+                    f"For every email you surface, CROSS-CHECK any event it describes against "
+                    f"the calendar above and set cal_status to exactly one of:\n"
+                    f"  not_on  - the event is not on the calendar\n"
+                    f"  already_on - it IS on the calendar at the same date/time\n"
+                    f"  differs - it is on the calendar but the email's date/time/place "
+                    f"disagrees (put the difference in 'note')\n"
+                    f"  conflict - a DIFFERENT event already occupies that time (name it in "
+                    f"'note')\n"
+                    f"  none - the email has no schedulable event\n\n"
+                    f"Suggest ONLY the actions that genuinely help, in 'suggest' (a list, any "
+                    f"of): 'calendar' (offer to add/update it), 'reminder' (offer a reminder "
+                    f"- put the time in 'remind_when'), 'reply' (ONLY if the email clearly "
+                    f"needs a response like an RSVP or a direct question - put why in "
+                    f"'reply_reason'). Never suggest adding something already_on unless it "
+                    f"differs. Do NOT suggest a reply unless one is genuinely expected.\n\n"
+                    f"Reply with STRICT JSON only:\n"
+                    f'{{"urgent": "<one sentence for something needing attention NOW, or empty>", '
+                    f'"items": [{{"what": "<short: what it is>", "from": "<sender>", '
+                    f'"received": "<the received string given>", "summary": "<one line of the '
+                    f'useful content>", "event_date": "<YYYY-MM-DD or empty>", '
+                    f'"cal_status": "<not_on|already_on|differs|conflict|none>", '
+                    f'"note": "<the difference or conflict, else empty>", '
+                    f'"suggest": ["calendar"|"reminder"|"reply"], '
+                    f'"remind_when": "<YYYY-MM-DD HH:MM or empty>", '
+                    f'"reply_reason": "<why a reply is needed, or empty>"}}]}}\n'
+                    f"EACH EMAIL GOES IN ONE PLACE ONLY (urgent OR items, never both). If "
+                    f"nothing qualifies, reply {{\"urgent\": \"\", \"items\": []}}."),
+                messages=[{"role": "user", "content":
+                           (cal_ctx + "\n\n" if cal_ctx else "")
+                           + "NEW EMAILS:\n" + "\n\n".join(summaries)}])
             raw = "".join(b.text for b in resp.content if b.type == "text").strip()
         except Exception as e:
             print(f"[poll] Claude failed for {name}: {e}")
             continue
 
-        # Parse the JSON verdict however the model wrapped it (prose, code fences, both).
         verdict = _extract_json_object(raw)
         if verdict is None:
             print(f"[poll] no JSON object in verdict for {name}: {raw[:120]!r}")
             continue
 
-        # 1) Urgent -> alert immediately.
+        # Record what this poll surfaced, so "what's in that email?" resolves right after.
+        surfaced = [it for it in verdict.get("items", []) if (it.get("what") or "").strip()]
+        if surfaced or (verdict.get("urgent") or "").strip():
+            _RECENT_FLAGGED[name] = [
+                {"from": m.get("from", ""), "subject": m.get("subject", ""),
+                 "id": m.get("id", "")} for m in fresh][:8]
+
+        # 1) Urgent -> its own immediate line.
         urgent = (verdict.get("urgent") or "").strip()
         if urgent and urgent.upper() != "NONE":
-            send_message(chat, urgent, proactive=True)
+            send_message(chat, "Heads up: " + urgent, proactive=True)
 
-        # 2) Deadlines / invoices -> offer to act, de-duped so we never repeat one.
+        # 2) The triaged items -> one rich, de-duped message.
         seen_key = f"flagged_deadlines_{name}"
-        already = set((get_setting(seen_key) or "").split("|")) if get_setting(seen_key) else set()
-        # Backstop for the "urgent AND items" double-send (the SRV pickup went out twice
-        # seconds apart). If an item clearly restates the urgent line, drop the item.
+        already = set(x for x in (get_setting(seen_key) or "").split("|") if x)
+
         def _overlaps_urgent(text):
             if not urgent:
                 return False
             a = set(re.findall(r"[a-z0-9]+", text.lower())) - _WATCH_STOPWORDS
             b = set(re.findall(r"[a-z0-9]+", urgent.lower())) - _WATCH_STOPWORDS
-            if not a or not b:
-                return False
-            return len(a & b) / min(len(a), len(b)) >= 0.6
-        new_lines = []
-        new_sigs = []
-        for it in verdict.get("items", []):
-            what = (it.get("what") or "").strip()
-            if not what:
-                continue
-            if _overlaps_urgent(what):
-                print(f"[poll] dropped item duplicating the urgent alert: {what[:40]!r}")
-                continue
-            date = (it.get("date") or "").strip()
-            frm = (it.get("from") or "").strip()
-            sig = f"{what[:40]}|{date}"          # dedupe signature
-            if sig in already:
-                continue
-            new_sigs.append(sig)
-            when = f" (due {date})" if date else ""
-            src = f" — from {frm}" if frm else ""
-            new_lines.append(f"• {what}{when}{src}")
+            return bool(a and b) and len(a & b) / min(len(a), len(b)) >= 0.6
 
-        if new_lines:
-            body = ("I spotted possible deadlines in your new email:\n"
-                    + "\n".join(new_lines)
-                    + "\n\nWant me to set reminders or add any to the calendar? "
-                      "Just tell me which.")
+        _STATUS_NOTE = {
+            "already_on": "Already on your calendar - nothing to do.",
+            "not_on": "Not on your calendar yet.",
+        }
+        blocks, new_sigs = [], []
+        for it in surfaced:
+            what = (it.get("what") or "").strip()
+            if _overlaps_urgent(what):
+                continue
+            date = (it.get("event_date") or "").strip()
+            sig = f"{what[:40]}|{date}"
+            if sig in already:
+                continue                      # already told them about this one
+            new_sigs.append(sig)
+
+            frm = (it.get("from") or "").strip()
+            rcv = (it.get("received") or "").strip()
+            summ = (it.get("summary") or "").strip()
+            status = (it.get("cal_status") or "none").strip()
+            note = (it.get("note") or "").strip()
+            suggest = it.get("suggest") or []
+
+            head = f"*{what}*"
+            meta = []
+            if rcv:
+                meta.append(f"received {rcv}")
+            if frm:
+                meta.append(f"from {frm}")
+            if meta:
+                head += "  (" + ", ".join(meta) + ")"
+            lines = [head]
+            if summ:
+                lines.append(f"  {summ}")
+            # calendar cross-check line
+            if status == "differs" and note:
+                lines.append(f"  On your calendar but it differs: {note}")
+            elif status == "conflict" and note:
+                lines.append(f"  Careful - this conflicts with {note}")
+            elif status in _STATUS_NOTE:
+                lines.append(f"  {_STATUS_NOTE[status]}")
+            # suggested actions
+            offers = []
+            if "calendar" in suggest:
+                offers.append("add to calendar" if status != "differs" else "update it")
+            if "reminder" in suggest:
+                rw = (it.get("remind_when") or "").strip()
+                offers.append(f"remind you{(' ' + rw) if rw else ''}")
+            if "reply" in suggest:
+                offers.append("draft a reply")
+            if offers:
+                lines.append("  Want me to " + ", or ".join(offers) + "?")
+            blocks.append("\n".join(lines))
+
+        if blocks:
+            body = ("Here's what came in that may need you:\n\n"
+                    + "\n\n".join(blocks)
+                    + "\n\nJust tell me which to handle.")
             send_message(chat, body, proactive=True)
-            # Remember what we've flagged (cap the stored history so it can't grow forever).
             prior = [x for x in (get_setting(seen_key) or "").split("|") if x]
             merged = prior + [x for x in new_sigs if x not in set(prior)]
             set_setting(seen_key, "|".join(merged[-100:]))
-            # LEARNING: record the senders we just flagged as "awaiting outcome". If the
-            # person engages with this flag (asks for a reminder/calendar/reply) before the
-            # next poll, those senders get an "acted" tally; if a later poll flags new mail
-            # and these were never engaged, they get "dismissed". This is what makes the
-            # priority model adaptive. Senders that were flagged BECAUSE they're already on
-            # the explicit priority list are skipped (no need to learn what you told us).
-            flagged_senders = [(it.get("from") or "").strip()
-                               for it in verdict.get("items", []) if it.get("from")]
+            # LEARNING outcomes (unchanged): credit senders as awaiting engagement.
+            flagged_senders = [(it.get("from") or "").strip() for it in surfaced if it.get("from")]
             pri = _priority_senders(name)
-            learnable = [s for s in flagged_senders
-                         if s and not any(p in s.lower() for p in pri)]
+            learnable = [x for x in flagged_senders
+                         if x and not any(p in x.lower() for p in pri)]
             if learnable:
                 _set_pending_outcomes(name, learnable)
+
+        new_lines = blocks   # keep the name the learning block below checks
 
         # LEARNING: if a clear pattern has emerged, offer a rule change (at most once per
         # poll, and only when we actually messaged them, to avoid nagging out of nowhere).
