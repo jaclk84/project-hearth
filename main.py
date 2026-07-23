@@ -5503,6 +5503,16 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     Without it, every message is treated as brand new and references break.
     """
     who_id = sender_chat_id or chat_id
+    # who_id identifies the PERSON (for identity, permissions, per-person turn tracking).
+    # Conversation HISTORY must be keyed by the CHAT, not the person: in a group,
+    # sender_chat_id is the individual's id - the SAME id as their private chat - so keying
+    # history on it merged a person's group history with their private one. That bled the
+    # group's Denise-reminder talk into a private turn (the model tried to re-create it),
+    # and worse, it meant a private conversation's content was loaded as context when that
+    # person spoke in the GROUP - a privacy leak the group design forbids. Key on chat_id:
+    # private stays private (a private chat's id == the user's id), the group is one shared
+    # thread, and the two never mix.
+    hist_key = str(chat_id or sender_chat_id)
     sender_name, sender_role = identify_sender(who_id)
     print(f"[guppi] {'GROUP' if is_group else 'private'} msg from "
           f"{sender_name or 'UNKNOWN'} ({sender_role}) chat={who_id}"
@@ -5576,7 +5586,7 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
 
     # Prepend recent history (plain text turns only — no images or tool internals, to
     # keep it clean). This is what lets "yes" refer to Guppi's last message.
-    history = get_history(who_id)
+    history = get_history(hist_key)
     messages = history + [this_turn]
 
     tools = tools_for_role(sender_role, is_group)
@@ -5619,7 +5629,7 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                    "smaller pieces - one day at a time, or the calendar first and the "
                    "reminder after.")
             reply = f"{partial}\n\n{msg}" if partial else msg
-            save_history(who_id, user_message, reply)
+            save_history(hist_key, user_message, reply)
             return reply
 
         if response.stop_reason == "tool_use":
@@ -5677,7 +5687,7 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
         # Remember this exchange for next time (store the raw user text, not the
         # time-hint wrapper, so history stays readable and doesn't pile up stale clocks).
         placeholder = "(sent a photo)" if image_data else ("(sent an attachment)" if doc_data else None)
-        save_history(who_id, user_message if not placeholder else placeholder, reply)
+        save_history(hist_key, user_message if not placeholder else placeholder, reply)
         return reply
 
     return "Sorry, that took too many steps. Can you rephrase?"
