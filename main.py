@@ -1863,11 +1863,20 @@ def _ms_token_request(fields):
         body = ""
         if hasattr(e, "read"):
             try:
-                body = e.read().decode()[:300]
+                body = e.read().decode()[:400]
             except Exception:
                 pass
         print(f"[ms] token request failed: {e} {body}")
-        return None
+        # Return the parsed error body when there is one, so the caller can distinguish a
+        # transient outage (503 / temporarily_unavailable) from a genuinely dead token
+        # (invalid_grant). A bare network failure returns a transient marker.
+        try:
+            parsed = json.loads(body) if body else {}
+            if isinstance(parsed, dict) and parsed.get("error"):
+                return parsed
+        except Exception:
+            pass
+        return {"error": "network"}
 
 
 def save_ms_token(person, tok, email_addr=None):
@@ -1900,7 +1909,7 @@ def get_ms_access_token(person):
     # If this token is already known-dead (a prior refresh failed and it needs a manual
     # reconnect), don't keep hammering Microsoft on every scheduler job — that just spams
     # the logs and the endpoint. Stay quiet until the reconnect clears the flag.
-    if get_setting(f"ms_dead_{person}") == "1":
+    if _ms_token_dead(person):
         return None
     conn = db()
     row = conn.execute("SELECT refresh_token, access_token, expires_at FROM ms_tokens "
@@ -1920,16 +1929,47 @@ def get_ms_access_token(person):
         "grant_type": "refresh_token", "refresh_token": row["refresh_token"],
         "scope": MS_SCOPES, "redirect_uri": MS_REDIRECT_URI})
     if not tok or "access_token" not in tok:
-        print(f"[ms] {person}: refresh failed; needs reconnect")
-        set_setting(f"ms_dead_{person}", "1")
+        err = (tok or {}).get("error", "").lower() if isinstance(tok, dict) else ""
+        if any(d in err for d in _MS_DEAD_ERRORS):
+            # A real auth failure - the token is dead and a reconnect is required.
+            print(f"[ms] {person}: token DEAD ({err}) - needs reconnect")
+            set_setting(f"ms_dead_{person}", now_local().isoformat())
+        else:
+            # Transient (503 / temporarily_unavailable / network). Fail THIS cycle but do
+            # NOT mark the token dead - Microsoft was momentarily unavailable, not revoked.
+            # This is the standard we already hold on the Google path.
+            print(f"[ms] {person}: transient refresh failure ({err or 'network'}); "
+                  f"will retry next cycle, NOT marking dead")
         return None
     save_ms_token(person, tok)
     set_setting(f"ms_dead_{person}", "")
     return tok["access_token"]
 
 
+# Microsoft OAuth error codes that mean the token is genuinely DEAD (needs a reconnect),
+# as opposed to a transient outage. Keyed off the standard OAuth `error` field.
+_MS_DEAD_ERRORS = ("invalid_grant", "invalid_client", "unauthorized_client",
+                   "interaction_required", "consent_required", "invalid_scope")
+_MS_DEAD_RETEST_HOURS = 12
+
+
+def _ms_token_dead(person):
+    """True only if the token is CONFIRMED dead and still inside the re-test window. A blank
+    flag is healthy; a legacy "1" (set by the old over-broad logic, which marked dead on any
+    failure incl. a transient 503) is treated as re-testable so it heals on the next poll; a
+    timestamp older than the window is re-tested rather than trusted forever."""
+    v = get_setting(f"ms_dead_{person}")
+    if not v or v == "1":
+        return False
+    try:
+        marked = datetime.datetime.fromisoformat(v)
+    except ValueError:
+        return False
+    return (now_local() - marked) < datetime.timedelta(hours=_MS_DEAD_RETEST_HOURS)
+
+
 def ms_needs_reconnect(person):
-    return get_setting(f"ms_dead_{person}") == "1"
+    return _ms_token_dead(person)
 
 
 @app.get("/connect-microsoft")
