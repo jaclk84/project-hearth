@@ -332,6 +332,10 @@ def humanize_when(iso_str):
     now = now_local()
     days = (dt.date() - now.date()).days
     t = dt.strftime("%-I:%M%p").lower().replace(":00", "")   # 9:00AM -> 9am, 3:30PM -> 3:30pm
+    if days < 0:
+        # A past timestamp must not read like a future one (L-7).
+        day = "yesterday" if days == -1 else dt.strftime("%a %b %-d")
+        return f"{day} at {t} (already past)"
     if days == 0:
         day = "today"
     elif days == 1:
@@ -1706,7 +1710,6 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
 
     who = person or "Trip"
     tzname = str(TIMEZONE)
-    created = []
 
     # (2) Individual outbound flight event (actual gate-to-gate times).
     _cal_insert_event(
@@ -1716,7 +1719,6 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
         location=f"{out['dep_airport']} \u2192 {out['arr_airport']}",
         details=f"{out['airline']} flight {out['number']}. Auto-added by Guppi.",
         color_id=TRAVEL_COLOR_ID)
-    created.append(f"outbound {out['number']} ({out['dep_airport']}\u2192{out['arr_airport']})")
 
     # Trip-block bounds start at outbound departure minus 1 hour (airport buffer).
     try:
@@ -1734,7 +1736,6 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
             location=f"{ret['dep_airport']} \u2192 {ret['arr_airport']}",
             details=f"{ret['airline']} flight {ret['number']}. Auto-added by Guppi.",
             color_id=TRAVEL_COLOR_ID)
-        created.append(f"return {ret['number']} ({ret['dep_airport']}\u2192{ret['arr_airport']})")
 
         # (1) Trip block: outbound depart -1h  ->  return arrival.
         _cal_insert_event(
@@ -1746,7 +1747,6 @@ def tool_add_flight(outbound_number, outbound_date, person=None,
                      f"return {ret['number']} {ret['dep_airport']}\u2192{ret['arr_airport']}. "
                      f"Block starts 1h before departure for airport travel. Auto-added by Guppi."),
             color_id=TRAVEL_COLOR_ID)
-        created.append("trip block")
         summary_line = (f"Added your trip: block from 1h before {out['number']} departs "
                         f"({out['dep_airport']}) through {ret['number']} arrival "
                         f"({ret['arr_airport']}), plus both flight events.")
@@ -2604,9 +2604,15 @@ def _imap_fetch_message(M, mid):
         return None
 
 
-def imap_search(person, keywords, max_results=5, with_attachments=False):
+def imap_search(person, keywords, max_results=5, with_attachments=False, full=True):
     """Search a person's IMAP inbox. `keywords` is plain words (Gmail-style operators are
     stripped upstream). Returns normalized dicts, newest first.
+
+    full=False is the LIGHT mode for search listings: headers only (from/subject/date),
+    no body download. The full fetch pulls the ENTIRE message including attachment
+    bytes - megabytes per hit on a big email - which only read_email actually needs
+    (M-3). Light results carry an empty snippet; the model is already instructed to
+    read_email anything too thin to judge.
 
     with_attachments is opt-in because attachment bytes are large: only read_email wants
     them, and carrying them through every routine search would waste memory for nothing.
@@ -2637,6 +2643,26 @@ def imap_search(person, keywords, max_results=5, with_attachments=False):
             return None
         ids = data[0].split()
         for mid in reversed(ids[-max_results:]):  # newest first
+            if not full:
+                # Light fetch: headers only, scanned not indexed (Trap 63's lesson).
+                typ2, md = M.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+                raw = None
+                for item in md or []:
+                    if (isinstance(item, tuple) and len(item) > 1
+                            and isinstance(item[1], (bytes, bytearray)) and item[1]):
+                        raw = item[1]
+                        break
+                if typ2 != "OK" or raw is None:
+                    print(f"[imap] light fetch failed for {mid!r}")
+                    continue
+                hmsg = emaillib.message_from_bytes(raw)
+                out.append({
+                    "from": _decode(hmsg.get("From", "?")),
+                    "subject": _decode(hmsg.get("Subject", "(no subject)")),
+                    "date": hmsg.get("Date", ""),
+                    "snippet": "", "full_body": "",
+                    "id": mid.decode(), "provider": "imap"})
+                continue
             msg = _imap_fetch_message(M, mid)
             if not msg:
                 continue
@@ -2779,7 +2805,25 @@ def tool_connection_health(person):
                             (person,)).fetchone()
     conn.close()
     if imap_row:
-        lines.append(f"IMAP ({imap_row['email_addr']}): configured.")
+        # "configured" only proved a row existed. This function's whole promise is
+        # tested reality, so live-test the login like the other two (L-10).
+        acct = get_imap_account(person)
+        app_pw = (_dec_secret(acct["app_password"], f"{person}'s email app password")
+                  if acct else None)
+        ok = False
+        if acct and app_pw:
+            try:
+                M = imaplib.IMAP4_SSL(acct["imap_host"], acct["imap_port"], timeout=15)
+                M.login(acct["email_addr"], app_pw)
+                M.logout()
+                ok = True
+            except Exception as e:
+                print(f"[imap] health-check login failed for {person}: {e}")
+        lines.append(f"IMAP ({imap_row['email_addr']}): "
+                     + ("connected and working."
+                        if ok else
+                        "NOT working - the saved app password may need redoing "
+                        "with /connectemail."))
 
     if not lines:
         lines.append("No accounts connected yet.")
@@ -3017,7 +3061,7 @@ def tool_search_email(query, person, max_results=5):
     imap_failed = False
     imap_found = []
     if "imap" in providers:
-        res = imap_search(person, imap_q, max_results)
+        res = imap_search(person, imap_q, max_results, full=False)
         if res is None:
             imap_failed = True
         else:
@@ -3433,8 +3477,6 @@ def tool_add_occasion(title, kind, month, day, year=None, scope="family",
     # only gets the 1-day nudge this cycle; next year it gets them all).
     today = now_local().date()
     nxt = _occasion_next_date(month, day, year, today)
-    remaining = [d for d in leads if nxt and (nxt - today).days <= d and (nxt - today).days >= 0]
-    all_ahead = [d for d in leads if nxt and (nxt - today).days <= d]
     lead_str = "/".join(str(d) for d in leads)
 
     base = (f"Got it - tracking {title} ({kind}) on {when}{yr}. "
@@ -6814,33 +6856,9 @@ def job_reminders():
         conn.commit(); conn.close()
 
 
-def reminders_for_briefing(for_chat=None, horizon_hours=36):
-    """Reminders relevant to THIS MORNING's briefing: ones due today or within the next
-    ~36 hours. The full list (via list_reminders) dumps everything — so a Saturday
-    briefing wrongly showed Tuesday's recycling. This scopes to what's actually imminent,
-    which is what a morning briefing is for."""
-    now = now_local()
-    cutoff = now + datetime.timedelta(hours=horizon_hours)
-    conn = db()
-    if for_chat:
-        rows = conn.execute(
-            "SELECT text, due_at FROM reminders WHERE fired = 0 "
-            "AND (for_chat = ? OR for_chat IS NULL) ORDER BY due_at",
-            (str(for_chat),)).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT text, due_at FROM reminders WHERE fired = 0 ORDER BY due_at").fetchall()
-    conn.close()
-    out = []
-    for r in rows:
-        try:
-            due = datetime.datetime.fromisoformat(r["due_at"])
-        except (ValueError, TypeError):
-            continue
-        if due <= cutoff:                    # today or imminent only
-            when = due.strftime("%-I:%M %p") if due.date() == now.date() else due.strftime("%a %-I:%M %p")
-            out.append(f"{when}: {r['text']}")
-    return "\n".join(out) if out else "None due today."
+# (reminders_for_briefing was removed here - superseded by _briefing_reminders, which
+# splits today from tomorrow instead of labelling a 36-hour window "today". It had no
+# remaining callers.)
 
 
 def _event_notes(e, limit=280):
@@ -7372,6 +7390,8 @@ def job_urgent_email_poll():
     the same email is never surfaced twice."""
     if not proactive_on() or in_quiet_hours():
         return
+    cal_ctx = None   # calendar + glossary context: fetched once per run, when first
+    gl = None        # needed, shared by both adults (L-8)
     for name, chat in _adults_with_chats():
         if not connected_providers(name):
             continue
@@ -7487,7 +7507,10 @@ def job_urgent_email_poll():
             return
 
         today = now_local().strftime("%A, %B %d, %Y")
-        cal_ctx = _calendar_context_for_triage()
+        if cal_ctx is None:
+            cal_ctx = _calendar_context_for_triage()
+        if gl is None:
+            gl = _glossary_block()
         try:
             resp = claude_create(
                 model=MODEL, max_tokens=900,
@@ -7528,7 +7551,7 @@ def job_urgent_email_poll():
                     f"EACH EMAIL GOES IN ONE PLACE ONLY (urgent OR items, never both). If "
                     f"nothing qualifies, reply {{\"urgent\": \"\", \"items\": []}}."),
                 messages=[{"role": "user", "content":
-                           (_glossary_block() + "\n\n" if _glossary_block() else "")
+                           (gl + "\n\n" if gl else "")
                            + (cal_ctx + "\n\n" if cal_ctx else "")
                            + "NEW EMAILS:\n" + "\n\n".join(summaries)}])
             raw = "".join(b.text for b in resp.content if b.type == "text").strip()
