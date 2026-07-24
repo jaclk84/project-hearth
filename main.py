@@ -3693,6 +3693,115 @@ def tool_complete_commitment(commitment_id):
     return f"Marked done: {row['task']}."
 
 
+def tool_whats_open(person, chat):
+    """One sweep of everything currently hanging - the answer to "what am I
+    forgetting?". The real mental load isn't any single item, it's not knowing what
+    has been dropped. Built entirely in CODE from the database (the model only words
+    it), worst first: overdue, then imminent, then the open loops."""
+    now = now_local()
+    today = now.date()
+    sections = []
+
+    conn = db()
+    try:
+        # Overdue + imminent reminders (this person's, or family-wide).
+        rows = conn.execute(
+            "SELECT text, due_at FROM reminders WHERE fired = 0 "
+            "AND (for_chat = ? OR for_chat IS NULL) ORDER BY due_at",
+            (str(chat) if chat else None,)).fetchall()
+        overdue, soon = [], []
+        for r in rows:
+            try:
+                due = datetime.datetime.fromisoformat(r["due_at"])
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=TIMEZONE)
+            except (ValueError, TypeError):
+                continue
+            if due <= now:
+                overdue.append(f"  - {r['text']} (was due {humanize_when(r['due_at'])})")
+            elif due <= now + datetime.timedelta(hours=48):
+                soon.append(f"  - {r['text']} ({humanize_when(r['due_at'])})")
+        if overdue:
+            sections.append("OVERDUE REMINDERS:\n" + "\n".join(overdue[:8]))
+        if soon:
+            sections.append("DUE IN THE NEXT TWO DAYS:\n" + "\n".join(soon[:8]))
+
+        # Open commitments - who's on the hook for what.
+        crows = conn.execute("SELECT task, who, when_text FROM commitments "
+                             "WHERE done = 0 ORDER BY id").fetchall()
+        if crows:
+            sections.append("OPEN COMMITMENTS:\n" + "\n".join(
+                f"  - {r['who'] or 'unclaimed'}: {r['task']}"
+                + (f" ({r['when_text']})" if r["when_text"] else "")
+                for r in crows[:8]))
+
+        # Tracked occasions inside their lead window.
+        orows = conn.execute(
+            "SELECT title, kind, month, day, year FROM occasions").fetchall()
+        occ = []
+        for r in orows:
+            nxt = _occasion_next_date(r["month"], r["day"], r["year"], today)
+            if not nxt:
+                continue
+            days_out = (nxt - today).days
+            leads = _OCCASION_LEADS.get(r["kind"], _DEFAULT_LEADS)
+            if 0 <= days_out <= max(leads):
+                occ.append((days_out,
+                            f"  - {r['title']} ({r['kind']}) in {days_out} "
+                            f"day{'s' if days_out != 1 else ''}"))
+        if occ:
+            occ.sort()
+            sections.append("COMING UP (tracked dates):\n"
+                            + "\n".join(t for _d, t in occ[:8]))
+    finally:
+        conn.close()
+
+    # Email flags queued for the next digest, and flags never engaged with.
+    conn = db()
+    try:
+        qrows = conn.execute("SELECT block FROM email_digest_queue WHERE person = ? "
+                             "ORDER BY id", (person,)).fetchall()
+    finally:
+        conn.close()
+    if qrows:
+        heads = []
+        for r in qrows[:5]:
+            first = (r["block"] or "").splitlines()[0].strip("* ")
+            heads.append(f"  - {first}")
+        sections.append("EMAIL FLAGS WAITING FOR THE NEXT DIGEST:\n"
+                        + "\n".join(heads))
+    pend = _pending_outcomes(person)
+    if pend:
+        sections.append("FLAGGED EMAIL YOU HAVEN'T ENGAGED WITH YET, from: "
+                        + ", ".join(pend[:6]))
+
+    # Active watches - held by Guppi, listed so nothing feels forgotten.
+    conn = db()
+    try:
+        wrows = conn.execute(
+            "SELECT description, expires_at FROM email_watches "
+            "WHERE person = ? AND fired = 0", (person,)).fetchall()
+    finally:
+        conn.close()
+    live = []
+    for r in wrows:
+        try:
+            if datetime.datetime.fromisoformat(r["expires_at"]) < now:
+                continue
+        except (ValueError, TypeError):
+            pass
+        live.append(f"  - {r['description']}")
+    if live:
+        sections.append("I'M WATCHING YOUR INBOX FOR:\n" + "\n".join(live[:5]))
+
+    if not sections:
+        return ("Nothing hanging - no overdue reminders, no open commitments, no "
+                "tracked dates closing in, and no unhandled email flags. You're "
+                "clear.")
+    return ("Here's everything currently open (worst first). Relay ALL of it "
+            "faithfully - do not drop or add items:\n\n" + "\n\n".join(sections))
+
+
 def _write_list_name(conn, list_name):
     """The name to write under: reuse an existing list matching however it's spelled
     ('to do' / 'todo' / 'to-do'), else the name as given. Reads canonicalise; writes did
@@ -4362,6 +4471,18 @@ def tools_for_role(role, is_group=False):
                                 "did you not tell me about?'."),
                 "input_schema": {"type": "object", "properties": {}}})
             tools.append({
+                "name": "whats_open",
+                "description": ("ONE sweep of everything currently open for the "
+                                "family: overdue and imminent reminders, open "
+                                "commitments, tracked occasions closing in, email "
+                                "flags waiting for the digest or never engaged with, "
+                                "and active inbox watches. Use for 'what am I "
+                                "forgetting?', 'what's open?', 'anything hanging?', "
+                                "'what's outstanding?'. The result is built from the "
+                                "database - relay it faithfully, never add or drop "
+                                "items."),
+                "input_schema": {"type": "object", "properties": {}}})
+            tools.append({
                 "name": "connect_link",
                 "description": ("Create a working sign-in link so someone can CONNECT or "
                                 "RECONNECT an account. Use whenever anyone needs to link "
@@ -4443,7 +4564,7 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
                        "connection_health", "manage_deadline_ignores",
                        "manage_email_priorities", "backup_now", "backup_link",
                        "connect_link", "watch_for_email", "list_email_watches",
-                       "cancel_email_watch", "show_skipped_email"}
+                       "cancel_email_watch", "show_skipped_email", "whats_open"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -4537,6 +4658,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return tool_cancel_email_watch(tool_input["watch_id"], sender_name)
     if name == "show_skipped_email":
         return tool_show_skipped_email(sender_name)
+    if name == "whats_open":
+        return tool_whats_open(sender_name, sender_chat)
     if name == "connect_link":
         return tool_connect_link(tool_input.get("person") or sender_name,
                                  tool_input.get("kind", "google"))
@@ -4815,10 +4938,13 @@ GUIDE_TOPICS = [
         "key": "settings", "title": "Settings and your accounts",
         "roles": ("adult",), "private_only": True,
         "tools": ["show_settings", "update_setting", "connection_health", "connect_link",
-                  "invite_person", "backup_now", "backup_link"],
+                  "invite_person", "backup_now", "backup_link", "whats_open"],
         "summary": "Everything you can turn up, down or off.",
         "body": [
             "SEE EVERYTHING: \"show me your settings\".",
+            "WHAT AM I FORGETTING: \"what am I forgetting?\", \"anything "
+            "hanging?\" - one sweep of overdue reminders, open commitments, dates "
+            "closing in, and email flags you haven't dealt with yet.",
             "HOW CHATTY I AM: \"set the daily message cap to 15\" - this limits messages I "
             "send on my OWN. Answers to you are never limited.",
             "QUIET HOURS: \"quiet hours from 9pm to 7am\" - I won't message unprompted then.",
