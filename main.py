@@ -1001,7 +1001,12 @@ def welcome_message(name, role):
                 "• Email — connect your inbox and I'll search it, flag deadlines, and even "
                 "draft & send replies (I always show you first)\n"
                 "• Travel — give me a flight number and I'll build the trip on your calendar\n"
-                "• Photos & PDFs — send a school flyer and I'll pull out the events\n\n"
+                "• Photos & PDFs — send a school flyer and I'll pull out the events\n"
+                "• Deadlines — \"stay on me about the form due Friday\" and I'll chase "
+                "you until it's done\n"
+                "• \"What am I forgetting?\" — one sweep of everything still open\n"
+                "• Files — send a flyer or card and say \"file that\"; ask for it back "
+                "any time\n\n"
                 "I'll also send a morning briefing.")
     elif role == "caregiver":
         body = ("Here's what I can help with:\n"
@@ -5324,8 +5329,7 @@ GUIDE_TOPICS = [
     {
         "key": "occasions", "title": "Birthdays, anniversaries and renewals",
         "roles": ("adult",), "private_only": False,
-        "tools": ["add_occasion", "list_occasions", "delete_occasion",
-                  "track_deadline", "list_tracked", "complete_tracked"],
+        "tools": ["add_occasion", "list_occasions", "delete_occasion"],
         "summary": "Dates I warn you about well in advance, not on the day.",
         "body": [
             "\"remember Mom's birthday is March 5\", \"our anniversary is June 12\", "
@@ -5335,11 +5339,35 @@ GUIDE_TOPICS = [
             "or a packing list - early enough to actually do something.",
             "\"what occasions are you tracking?\", \"stop tracking the registration\".",
             "Say \"just me\" to keep one private; otherwise both parents get the warnings.",
-            "CHASED DEADLINES: \"stay on me about the physical form, due Aug 15\" - "
-            "I'll warn you 7, 3 and 1 days out and on the day, then keep asking every "
-            "couple of days until you say \"done with the form\". (I stop a week "
-            "past due, and I'll say so rather than nag forever.)",
+        ],
+    },
+    {
+        "key": "deadlines", "title": "Deadlines I chase until they're done",
+        "roles": ("adult",), "private_only": False,
+        "tools": ["track_deadline", "list_tracked", "complete_tracked"],
+        "summary": "Forms, payments and RSVPs I keep after you until they're handled.",
+        "body": [
+            "\"stay on me about the physical form, due Aug 15\", \"chase me about "
+            "the camp payment due Friday\" - different from a one-time reminder: I "
+            "warn you 7, 3 and 1 days out and on the day, then keep asking every couple "
+            "of days until it's done.",
+            "CLOSE IT: \"done with the form\", \"I paid the camp\" - and I stop.",
             "\"what deadlines are you tracking?\" lists them.",
+            "I stop a week past due and say so, rather than nag forever. Both parents "
+            "get the nudges unless you say \"just me\".",
+        ],
+    },
+    {
+        "key": "forgetting", "title": "What am I forgetting?",
+        "roles": ("adult",), "private_only": True,
+        "tools": ["whats_open"],
+        "summary": "One sweep of everything currently open, worst first.",
+        "body": [
+            "\"what am I forgetting?\", \"what's open?\", \"anything hanging?\" - "
+            "I pull together overdue and imminent reminders, open commitments, dates "
+            "closing in, deadlines I'm chasing, and email flags you haven't dealt with, "
+            "into one list.",
+            "If nothing's hanging, I'll tell you that too - so you can stop wondering.",
         ],
     },
     {
@@ -5396,13 +5424,10 @@ GUIDE_TOPICS = [
         "key": "settings", "title": "Settings and your accounts",
         "roles": ("adult",), "private_only": True,
         "tools": ["show_settings", "update_setting", "connection_health", "connect_link",
-                  "invite_person", "backup_now", "backup_link", "whats_open"],
+                  "invite_person", "backup_now", "backup_link"],
         "summary": "Everything you can turn up, down or off.",
         "body": [
             "SEE EVERYTHING: \"show me your settings\".",
-            "WHAT AM I FORGETTING: \"what am I forgetting?\", \"anything "
-            "hanging?\" - one sweep of overdue reminders, open commitments, dates "
-            "closing in, and email flags you haven't dealt with yet.",
             "HOW CHATTY I AM: \"set the daily message cap to 15\" - this limits messages I "
             "send on my OWN. Answers to you are never limited.",
             "QUIET HOURS: \"quiet hours from 9pm to 7am\" - I won't message unprompted then.",
@@ -5548,6 +5573,9 @@ def capabilities_for_role(role, is_group=False):
         "it's not set up.)",
         "Invite a family member: \"invite Breanna\" - then they send me /start. (This is how "
         "kids and a caregiver get added, without the setup secret.)",
+        "Chased deadlines: \"stay on me about the physical form due Aug 15\" - I nudge "
+        "you 7/3/1 days out and on the day, then keep asking until you say it's done "
+        "(and stop a week past due). Different from a reminder, which fires once.",
     ]
     caregiver = [
         "Add or change calendar events for the kids' schedule: \"add gymnastics Tuesday 4pm\".",
@@ -5583,6 +5611,12 @@ def capabilities_for_role(role, is_group=False):
         "chat so old copies of your account credentials don't pile up. For a copy to KEEP, "
         "say \"send me a backup link\" - it downloads straight to your device and leaves "
         "nothing behind in Telegram. (Automatic.)",
+        "\"What am I forgetting?\" / \"anything hanging?\" - one sweep of overdue "
+        "reminders, open commitments, dates closing in, deadlines I'm chasing, and "
+        "email flags you haven't dealt with. If nothing's open, I'll say so.",
+        "Family files: send a photo or PDF and say \"file that as the camp map\"; I "
+        "keep the original and hand it back when you ask - \"show me the camp map\". "
+        "(A map, a form, an insurance card - anything worth keeping.)",
         "Memory: \"remember that Charlotte is allergic to peanuts\", \"what do you "
         "remember?\", \"forget that\". (For facts - birthdays/dates I track as occasions "
         "instead so they get reminders.)",
