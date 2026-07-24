@@ -582,6 +582,20 @@ def init_db():
         person TEXT NOT NULL,
         block TEXT NOT NULL,
         created_at TEXT NOT NULL)""")
+    # Batch 8: the tickler file. A tracked deadline is CHASED - escalating nudges
+    # before the date and continued asking after it - until someone says it's done.
+    # done=1: closed by a human. stopped=1: Guppi gave up a week past due (and said
+    # so honestly rather than nagging forever).
+    conn.execute("""CREATE TABLE IF NOT EXISTS tracked_deadlines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        due_date TEXT NOT NULL,
+        notes TEXT,
+        for_chat TEXT,
+        created_by TEXT,
+        done INTEGER NOT NULL DEFAULT 0,
+        stopped INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL)""")
     conn.commit()
     for name, role in SEEDED_PEOPLE:
         conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
@@ -3544,6 +3558,108 @@ def tool_delete_occasion(occasion_id):
     return f"Stopped tracking {row['title']}."
 
 
+def tool_track_deadline(title, due_date, notes=None, scope="family",
+                        creator_chat=None, created_by=None):
+    """Track a deadline and CHASE it until a human closes it. Different from a
+    reminder (fires once) and an occasion (annual): this escalates 7/3/1 days out
+    and on the day, then keeps asking every 2 days until told done, stopping - and
+    saying so - a week past due."""
+    title = (title or "").strip()
+    if not title:
+        return "Tell me what to track and when it's due."
+    try:
+        dd = datetime.date.fromisoformat(str(due_date)[:10])
+    except (ValueError, TypeError):
+        return "I need the due date as YYYY-MM-DD - when is it actually due?"
+    today = now_local().date()
+    if dd < today:
+        return (f"That date ({due_date}) is already past. If it's still live, give me "
+                f"the real date to chase it to.")
+    for_chat = str(creator_chat) if (scope == "just_me" and creator_chat) else None
+    conn = db()
+    # Duplicate guard (Trap 73's lesson): same errand, same date -> don't double-track.
+    rows = conn.execute(
+        "SELECT id, title FROM tracked_deadlines WHERE done = 0 AND stopped = 0 "
+        "AND due_date = ?", (dd.isoformat(),)).fetchall()
+    for r in rows:
+        if _norm_reminder_text(r["title"]) == _norm_reminder_text(title):
+            conn.close()
+            return (f"I'm already tracking '{r['title']}' for "
+                    f"{dd.strftime('%b %-d')} (id {r['id']}). Tell the user it was "
+                    f"already being tracked - do not claim a new one was set up.")
+    conn.execute(
+        "INSERT INTO tracked_deadlines (title, due_date, notes, for_chat, "
+        "created_by, created_at) VALUES (?,?,?,?,?,?)",
+        (title, dd.isoformat(), notes, for_chat, created_by,
+         now_local().isoformat()))
+    conn.commit(); conn.close()
+    days = (dd - today).days
+    who = "just you" if for_chat else "you and your partner"
+    base = (f"Tracking it: {title}, due {dd.strftime('%A %b %-d')}. I'll nudge {who} "
+            f"7, 3 and 1 days out and on the day, then keep asking every couple of "
+            f"days until you say it's done. (If it's still open a week past due, "
+            f"I'll stop chasing and say so.)")
+    if days < 7:
+        base += (f" Heads up: it's only {days} day{'s' if days != 1 else ''} away, "
+                 f"so this one just gets the closer-in nudges.")
+    return base
+
+
+def tool_list_tracked():
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, title, due_date, stopped FROM tracked_deadlines "
+        "WHERE done = 0 ORDER BY due_date").fetchall()
+    conn.close()
+    if not rows:
+        return "I'm not tracking any deadlines right now."
+    today = now_local().date()
+    out = []
+    for r in rows:
+        try:
+            dd = datetime.date.fromisoformat(r["due_date"])
+        except (ValueError, TypeError):
+            continue
+        dl = (dd - today).days
+        when = (f"{-dl} day{'s' if dl != -1 else ''} OVERDUE" if dl < 0
+                else "due TODAY" if dl == 0
+                else f"in {dl} day{'s' if dl != 1 else ''}")
+        extra = " - I stopped chasing this one; re-track it if it's still live"             if r["stopped"] else ""
+        out.append(f"[{r['id']}] {r['title']} - due {dd.strftime('%b %-d')} "
+                   f"({when}){extra}")
+    return "Deadlines I'm tracking:\n" + "\n".join(out)
+
+
+def tool_complete_tracked(id_or_title):
+    """Close a tracked deadline. Accepts the id, or title words ('done with the
+    form') - matched fuzzily; an ambiguous match asks instead of guessing."""
+    key = str(id_or_title or "").strip()
+    conn = db()
+    row = None
+    if key.isdigit():
+        row = conn.execute("SELECT id, title FROM tracked_deadlines WHERE id = ? "
+                           "AND done = 0", (int(key),)).fetchone()
+    if row is None and key:
+        want = _norm_reminder_text(key)
+        cands = [r for r in conn.execute(
+            "SELECT id, title FROM tracked_deadlines WHERE done = 0").fetchall()
+            if want and (want in _norm_reminder_text(r["title"])
+                         or _norm_reminder_text(r["title"]) in want)]
+        if len(cands) == 1:
+            row = cands[0]
+        elif len(cands) > 1:
+            conn.close()
+            return ("More than one tracked deadline matches - ask which one: "
+                    + "; ".join(f"[{r['id']}] {r['title']}" for r in cands))
+    if row is None:
+        conn.close()
+        return ("I couldn't find that one - ask me what deadlines I'm tracking and "
+                "tell me the number.")
+    conn.execute("UPDATE tracked_deadlines SET done = 1 WHERE id = ?", (row["id"],))
+    conn.commit(); conn.close()
+    return f"Done - '{row['title']}' is closed. I'll stop chasing it."
+
+
 # Which lead-time milestones each kind gets, and how the nudge is framed.
 _OCCASION_LEADS = {
     "vacation": [90, 30, 7, 1],
@@ -3640,6 +3756,67 @@ def job_occasion_reminders():
             if chat:
                 send_message(chat, msg, proactive=True)
         set_setting(sig, "1")
+
+
+def job_tracked_deadlines():
+    """Daily 7:05am: chase every open tracked deadline. 7/3/1 days out and the day
+    itself, then every 2 days overdue; at 7 days past due, one honest goodbye and
+    stopped=1 - an assistant that nags forever gets muted, one that says it is
+    letting go stays trusted. Each milestone fires once (dated dedupe keys, swept by
+    the pruner), and only a CONFIRMED send marks a milestone done (the L-2 lesson) -
+    a nudge held by the message cap retries the next morning."""
+    if not proactive_on():
+        return
+    today = now_local().date()
+    conn = db()
+    rows = conn.execute("SELECT * FROM tracked_deadlines WHERE done = 0 "
+                        "AND stopped = 0").fetchall()
+    conn.close()
+    if not rows:
+        return
+    parents = _adults_with_chats()
+    for r in rows:
+        try:
+            dd = datetime.date.fromisoformat(r["due_date"])
+        except (ValueError, TypeError):
+            continue
+        dl = (dd - today).days          # negative = overdue
+        note = f" ({r['notes']})" if r["notes"] else ""
+        msg = sig = None
+        if dl in (7, 3, 1):
+            msg = (f"Coming due: {r['title']} - {dd.strftime('%A %b %-d')}, "
+                   f"{dl} day{'s' if dl != 1 else ''} away.{note} When it's "
+                   f"handled, say \"done with it\" and I'll stop tracking.")
+            sig = f"tickler_{r['id']}_{r['due_date']}_d{dl}"
+        elif dl == 0:
+            msg = f"Due TODAY: {r['title']}.{note} Done, or still open?"
+            sig = f"tickler_{r['id']}_{r['due_date']}_d0"
+        elif dl < 0:
+            od = -dl
+            if od >= 7:
+                msg = (f"I've been chasing '{r['title']}' for a week past its date, "
+                       f"so I'll stop now. If it's still live, ask me to track it "
+                       f"again with a new date and I'll stay on it.")
+                sig = f"tickler_{r['id']}_{r['due_date']}_stop"
+            elif od % 2 == 0:
+                msg = (f"Still open: {r['title']} - was due {dd.strftime('%b %-d')}, "
+                       f"{od} days ago. Done, or still open? Say \"done with it\" "
+                       f"and I'll stop asking.")
+                sig = f"tickler_{r['id']}_{r['due_date']}_od{od}"
+        if not msg or get_setting(sig):
+            continue
+        targets = ([(None, r["for_chat"])] if r["for_chat"] else parents)
+        sent_any = False
+        for _n, chat in targets:
+            if chat and send_message(chat, msg, proactive=True):
+                sent_any = True
+        if sent_any:
+            set_setting(sig, "1")
+            if dl <= -7:
+                c = db()
+                c.execute("UPDATE tracked_deadlines SET stopped = 1 WHERE id = ?",
+                          (r["id"],))
+                c.commit(); c.close()
 
 
 def tool_add_commitment(task, who=None, when_text=None, created_by=None):
@@ -3753,6 +3930,26 @@ def tool_whats_open(person, chat):
             occ.sort()
             sections.append("COMING UP (tracked dates):\n"
                             + "\n".join(t for _d, t in occ[:8]))
+
+        # The tickler file - chased deadlines, overdue first (Batch 8).
+        trows = conn.execute(
+            "SELECT id, title, due_date FROM tracked_deadlines "
+            "WHERE done = 0 AND stopped = 0 ORDER BY due_date").fetchall()
+        tick = []
+        for r in trows:
+            try:
+                dd = datetime.date.fromisoformat(r["due_date"])
+            except (ValueError, TypeError):
+                continue
+            dl = (dd - today).days
+            when = (f"{-dl} day{'s' if dl != -1 else ''} OVERDUE" if dl < 0
+                    else "due TODAY" if dl == 0
+                    else f"due in {dl} day{'s' if dl != 1 else ''}")
+            tick.append((dl, f"  - [{r['id']}] {r['title']} - {when}"))
+        if tick:
+            tick.sort()
+            sections.append("DEADLINES I'M CHASING (say \"done with ...\" to "
+                            "close one):\n" + "\n".join(t for _d, t in tick[:8]))
     finally:
         conn.close()
 
@@ -4402,6 +4599,38 @@ def tools_for_role(role, is_group=False):
                             "setup code instead."),
             "input_schema": {"type": "object", "properties": {
                 "name": {"type": "string"}}, "required": ["name"]}})
+        tools.append({
+            "name": "track_deadline",
+            "description": ("Track a deadline and CHASE it until the user says it's "
+                            "done - forms, payments, registrations, RSVPs. Different "
+                            "from add_reminder (fires once) and add_occasion (annual "
+                            "dates): this nudges 7/3/1 days out and on the day, then "
+                            "keeps asking every 2 days until told done (it stops, and "
+                            "says so, a week past due). Use when someone says 'stay "
+                            "on me about', 'don't let me forget', 'chase me', 'keep "
+                            "on it', or accepts a 'stay on it' offer from an email "
+                            "flag. due_date is YYYY-MM-DD. scope 'family' (default) "
+                            "nudges both parents; 'just_me' only the asker."),
+            "input_schema": {"type": "object", "properties": {
+                "title": {"type": "string"},
+                "due_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "notes": {"type": "string"},
+                "scope": {"type": "string", "enum": ["family", "just_me"]}},
+                "required": ["title", "due_date"]}})
+        tools.append({
+            "name": "list_tracked",
+            "description": ("Show the deadlines being chased, with ids. Use for "
+                            "'what deadlines are you tracking?', 'what are you "
+                            "chasing me about?'."),
+            "input_schema": {"type": "object", "properties": {}}})
+        tools.append({
+            "name": "complete_tracked",
+            "description": ("Close a tracked deadline because the user says it's "
+                            "handled ('done with the form', 'I paid it'). Pass the "
+                            "id from list_tracked or the title words. You MUST call "
+                            "this before telling the user the chasing has stopped."),
+            "input_schema": {"type": "object", "properties": {
+                "id_or_title": {"type": "string"}}, "required": ["id_or_title"]}})
         if not is_group:
             tools.append({
                 "name": "manage_deadline_ignores",
@@ -4750,6 +4979,20 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "invite_person":
         return link_person(tool_input["name"], sender_role)
 
+    if name == "track_deadline":
+        if sender_role != "adult":
+            return "Only a parent can set up deadline chasing."
+        return tool_track_deadline(tool_input["title"], tool_input["due_date"],
+                                   tool_input.get("notes"),
+                                   tool_input.get("scope", "family"),
+                                   sender_chat, sender_name)
+    if name == "list_tracked":
+        return tool_list_tracked()
+    if name == "complete_tracked":
+        if sender_role != "adult":
+            return "Only a parent can close a tracked deadline."
+        return tool_complete_tracked(tool_input["id_or_title"])
+
     return "Unknown tool."
 
 
@@ -4888,7 +5131,8 @@ GUIDE_TOPICS = [
     {
         "key": "occasions", "title": "Birthdays, anniversaries and renewals",
         "roles": ("adult",), "private_only": False,
-        "tools": ["add_occasion", "list_occasions", "delete_occasion"],
+        "tools": ["add_occasion", "list_occasions", "delete_occasion",
+                  "track_deadline", "list_tracked", "complete_tracked"],
         "summary": "Dates I warn you about well in advance, not on the day.",
         "body": [
             "\"remember Mom's birthday is March 5\", \"our anniversary is June 12\", "
@@ -4898,6 +5142,11 @@ GUIDE_TOPICS = [
             "or a packing list - early enough to actually do something.",
             "\"what occasions are you tracking?\", \"stop tracking the registration\".",
             "Say \"just me\" to keep one private; otherwise both parents get the warnings.",
+            "CHASED DEADLINES: \"stay on me about the physical form, due Aug 15\" - "
+            "I'll warn you 7, 3 and 1 days out and on the day, then keep asking every "
+            "couple of days until you say \"done with the form\". (I stop a week "
+            "past due, and I'll say so rather than nag forever.)",
+            "\"what deadlines are you tracking?\" lists them.",
         ],
     },
     {
@@ -7738,7 +7987,9 @@ def job_urgent_email_poll():
                     f"of): 'calendar' (offer to add/update it), 'reminder' (offer a reminder "
                     f"- put the time in 'remind_when'), 'reply' (ONLY if the email clearly "
                     f"needs a response like an RSVP or a direct question - put why in "
-                    f"'reply_reason'). Never suggest adding something already_on unless it "
+                    f"'reply_reason'), 'track' (for a FORM, PAYMENT, REGISTRATION or "
+                    f"RSVP with a hard date - offer to stay on it, chasing until they "
+                    f"say it's done). Never suggest adding something already_on unless it "
                     f"differs. Do NOT suggest a reply unless one is genuinely expected.\n\n"
                     f"Reply with STRICT JSON only:\n"
                     f'{{"urgent": "<one sentence for something needing attention NOW, or empty>", '
@@ -7747,7 +7998,7 @@ def job_urgent_email_poll():
                     f'useful content>", "event_date": "<YYYY-MM-DD or empty>", '
                     f'"cal_status": "<not_on|already_on|differs|conflict|none>", '
                     f'"note": "<the difference or conflict, else empty>", '
-                    f'"suggest": ["calendar"|"reminder"|"reply"], '
+                    f'"suggest": ["calendar"|"reminder"|"reply"|"track"], '
                     f'"remind_when": "<YYYY-MM-DD HH:MM or empty>", '
                     f'"reply_reason": "<why a reply is needed, or empty>", '
                     f'"proposed_reply": "<when suggesting a reply: ONE short sentence '
@@ -7869,6 +8120,8 @@ def job_urgent_email_poll():
                     offers.append("send that reply (I'll show the full draft first)")
                 else:
                     offers.append("draft a reply")
+            if "track" in suggest:
+                offers.append("stay on it until you tell me it's done")
             if offers:
                 lines.append("  Want me to " + ", or ".join(offers) + "?")
             blocks.append("\n".join(lines))
@@ -8018,6 +8271,8 @@ def start_scheduler():
     scheduler.add_job(job_daily_backup, "cron", hour=3, minute=30, id="daily_backup",
                       replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_occasion_reminders, "cron", hour=7, minute=0, id="occasions",
+                      replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(job_tracked_deadlines, "cron", hour=7, minute=5, id="tickler",
                       replace_existing=True, max_instances=1, coalesce=True)
     _schedule_digest_jobs()
     scheduler.start()
