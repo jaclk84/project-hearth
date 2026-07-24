@@ -2469,10 +2469,15 @@ def imap_search(person, keywords, max_results=5, with_attachments=False):
     stripped upstream). Returns normalized dicts, newest first.
 
     with_attachments is opt-in because attachment bytes are large: only read_email wants
-    them, and carrying them through every routine search would waste memory for nothing."""
+    them, and carrying them through every routine search would waste memory for nothing.
+
+    Returns None when the CONNECTION failed (dead token, network, server refusal). A
+    lookup failure is not an empty inbox, and callers must never present it as one -
+    Trap 48's shape at the transport layer (Trap 112). [] means the search genuinely
+    ran and matched nothing."""
     M = _imap_connect(person)
     if not M:
-        return []
+        return None
     out = []
     try:
         M.select("INBOX")
@@ -2488,7 +2493,8 @@ def imap_search(person, keywords, max_results=5, with_attachments=False):
         else:
             typ, data = M.search(None, "ALL")
         if typ != "OK":
-            return []
+            print(f"[imap] search returned {typ} for {person}; treating as a failure")
+            return None
         ids = data[0].split()
         for mid in reversed(ids[-max_results:]):  # newest first
             msg = _imap_fetch_message(M, mid)
@@ -2512,6 +2518,8 @@ def imap_search(person, keywords, max_results=5, with_attachments=False):
                 out[-1]["skipped_attachments"] = skipped
     except Exception as e:
         print(f"[imap] search failed for {person}: {e}")
+        if not out:
+            return None   # an error with nothing collected is a failure, not zero matches
     finally:
         try:
             M.logout()
@@ -2705,9 +2713,13 @@ def tool_read_email(query, person, max_results=3):
     imap_q = re.sub(r"\s+", " ", imap_q).strip()
 
     results = []
+    gmail_failed = False
+    imap_failed = False
 
     if "google" in providers:
         service = get_gmail_service(person)
+        if not service:
+            gmail_failed = True   # connected on paper, unusable in practice (dead token)
         if service:
             try:
                 res = service.users().messages().list(
@@ -2724,11 +2736,16 @@ def tool_read_email(query, person, max_results=3):
                                     "images": [], "skipped": [], "provider": "google"})
             except Exception as e:
                 print(f"[read_email:google] failed: {e}")
+                gmail_failed = True
 
     if "imap" in providers:
-        # imap_search fetches BODY.PEEK[TEXT], which already carries the attachment bytes,
-        # so asking for attachments here costs no extra round-trip.
-        for m in imap_search(person, imap_q, max_results, with_attachments=True):
+        # imap_search fetches the complete message (BODY.PEEK[]), which already carries
+        # the attachment bytes, so asking for attachments here costs no extra round-trip.
+        imap_res = imap_search(person, imap_q, max_results, with_attachments=True)
+        if imap_res is None:
+            imap_failed = True    # connection failure - NOT "no matching email"
+            imap_res = []
+        for m in imap_res:
             results.append({"from": m["from"], "subject": m["subject"],
                             "date": m.get("date", ""),
                             "body": m.get("full_body") or m.get("snippet", ""),
@@ -2737,6 +2754,18 @@ def tool_read_email(query, person, max_results=3):
                             "provider": "imap"})
 
     if not results:
+        failed = []
+        if gmail_failed:
+            failed.append("Gmail")
+        if imap_failed:
+            failed.append("the Outlook/live.com inbox")
+        if failed:
+            print(f"[read_email] lookup FAILED for {query!r} (couldn't reach: {failed})")
+            return ("EMAIL LOOKUP FAILED - I couldn't connect to " + " or ".join(failed) +
+                    " just now. This is a CONNECTION problem, not a missing email: tell "
+                    "the user their email couldn't be reached right now and suggest "
+                    "checking their connections. Do NOT say the email doesn't exist or "
+                    "that the inbox is empty.")
         print(f"[read_email] no match for {query!r}")
         return ("I couldn't find an email matching that search. Say that you didn't find "
                 "anything with THAT SEARCH - do not tell the user their inbox is empty, "
@@ -2773,21 +2802,28 @@ def tool_read_email(query, person, max_results=3):
         out.append(f"{hdr}\n\n{body}{note}")
 
     text = "\n\n----- next email -----\n\n".join(out)
+    if gmail_failed or imap_failed:
+        _f = "Gmail" if gmail_failed else "the Outlook/live.com inbox"
+        text += (f"\n\n[NOTE: {_f} COULD NOT BE REACHED, so the results above are from "
+                 f"the other inbox only. Say so rather than implying everything was "
+                 f"searched.]")
     # A plain string when there's nothing to look at keeps every other caller unchanged;
     # only the attachment case needs the richer shape.
     return {"text": text, "images": images[:_MAX_ATTACHMENTS]} if images else text
 
 
 def _gmail_search(person, query, max_results):
+    """Returns None when Gmail could not be searched at all (no usable token, API
+    failure) - a lookup failure, not zero results (Trap 112). [] = genuinely no matches."""
     service = get_gmail_service(person)
     if not service:
-        return []
+        return None
     try:
         res = service.users().messages().list(
             userId="me", q=query, maxResults=max_results).execute()
     except Exception as e:
         print(f"[email:google] search failed for {person}: {e}")
-        return []
+        return None
     out = []
     for m in res.get("messages", []):
         try:
@@ -2834,6 +2870,20 @@ def tool_search_email(query, person, max_results=5):
     imap_q = re.sub(r"\bfrom:(\S+)", r"\1", imap_q)
     imap_q = re.sub(r"\s+", " ", imap_q).strip()
 
+    # Search each provider, DISTINGUISHING "no matches" from "couldn't connect". A dead
+    # token or a network failure used to return the same empty list as a genuinely empty
+    # result, so the reply became "no matching emails" - Trap 48's shape at the transport
+    # layer (Trap 112). None = the lookup failed; [] = searched fine, nothing matched.
+    imap_failed = False
+    imap_found = []
+    if "imap" in providers:
+        res = imap_search(person, imap_q, max_results)
+        if res is None:
+            imap_failed = True
+        else:
+            imap_found = res
+
+    gmail_failed = False
     seen = set()
     for attempt in gmail_attempts:
         if attempt in seen:
@@ -2842,9 +2892,12 @@ def tool_search_email(query, person, max_results=5):
         print(f"[search_email] {person} ({'+'.join(providers)}) trying: gmail={attempt!r} imap={imap_q!r}")
         found = []
         if "google" in providers:
-            found += _gmail_search(person, attempt, max_results)
-        if "imap" in providers:
-            found += imap_search(person, imap_q, max_results)
+            g = _gmail_search(person, attempt, max_results)
+            if g is None:
+                gmail_failed = True
+            else:
+                found += g
+        found += imap_found
         if found:
             print(f"[search_email] found {len(found)}")
             lines = []
@@ -2852,7 +2905,32 @@ def tool_search_email(query, person, max_results=5):
                 tag = "" if len(providers) < 2 else f"[{m['provider']}] "
                 snip = f": {m['snippet']}" if m['snippet'] else ""
                 lines.append(f"{tag}From {m['from']} | {m['subject']}{snip}")
+            if imap_failed:
+                lines.append("[NOTE: the Outlook/live.com inbox COULD NOT BE REACHED - "
+                             "these results are from Gmail only. Say so; don't imply "
+                             "the whole mailbox was searched.]")
+            if gmail_failed:
+                lines.append("[NOTE: Gmail COULD NOT BE REACHED - these results are "
+                             "from the Outlook/live.com inbox only. Say so; don't "
+                             "imply the whole mailbox was searched.]")
             return "\n".join(lines)
+
+    failed, searched_ok = [], []
+    if "google" in providers:
+        (failed if gmail_failed else searched_ok).append("Gmail")
+    if "imap" in providers:
+        (failed if imap_failed else searched_ok).append("the Outlook/live.com inbox")
+    if failed and not searched_ok:
+        return ("EMAIL LOOKUP FAILED - I couldn't connect to " + " or ".join(failed) +
+                " just now. This is a CONNECTION problem, not an empty inbox and not a "
+                "bad search: tell the user their email couldn't be reached right now, "
+                "and suggest checking their connections. Do NOT say there are no "
+                "matching emails.")
+    if failed:
+        return ("No matches in " + " and ".join(searched_ok) + " - but " +
+                " and ".join(failed) + " COULD NOT BE REACHED, so it was never "
+                "searched. Tell the user that inbox couldn't be checked right now; do "
+                "NOT claim there are no matching emails anywhere.")
     return "No matching emails found (searched broadly)."
 
 
@@ -3556,8 +3634,12 @@ def tool_save_template(template_name, from_list=None, items=None):
     explicit set of items."""
     if from_list:
         conn = db()
+        # T1.3's last sibling: reads/writes were canonicalised ('todo'/'to-do'/'to do'
+        # all one list) but this path still matched raw .lower(), so "save the todo
+        # list as a template" found nothing when the list was stored as "to do".
+        actual = _resolve_list_name(conn, from_list)
         rows = conn.execute("SELECT item FROM list_items WHERE list_name = ?",
-                            (from_list.lower(),)).fetchall()
+                            (actual if actual else from_list.lower(),)).fetchall()
         conn.close()
         items = [r["item"] for r in rows]
     items = [str(i).strip() for i in (items or []) if str(i).strip()]
@@ -3752,7 +3834,10 @@ def tools_for_role(role, is_group=False):
     if perms["email"]:
         tools.append({
             "name": "search_email",
-            "description": "Search this person's own Gmail. Uses Gmail search syntax.",
+            "description": ("Search this person's own inbox(es) - Gmail and/or "
+                            "Outlook/live.com, whichever they have connected. Gmail "
+                            "search syntax is fine; operators are adapted for Outlook "
+                            "automatically."),
             "input_schema": {"type": "object", "properties": {
                 "query": {"type": "string"}}, "required": ["query"]}})
         tools.append({
