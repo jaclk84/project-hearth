@@ -574,6 +574,14 @@ def init_db():
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
         fired INTEGER NOT NULL DEFAULT 0)""")
+    # Batch 6: non-urgent email flags queue here and go out as a digest a few times a
+    # day instead of interrupting on every poll. Durable on purpose - a redeploy must
+    # not eat a queued flag. Rows are deleted only after the digest actually sends.
+    conn.execute("""CREATE TABLE IF NOT EXISTS email_digest_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        person TEXT NOT NULL,
+        block TEXT NOT NULL,
+        created_at TEXT NOT NULL)""")
     conn.commit()
     for name, role in SEEDED_PEOPLE:
         conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
@@ -1281,6 +1289,7 @@ DEFAULT_SETTINGS = {
     "daily_claude_calls_cap": "200",  # scheduler Claude calls per day (circuit breaker)
     "daily_messages_cap": "75",       # proactive messages per day (noise only, zero cost)
     "poll_minutes": "30",             # how often to check for urgent email
+    "email_digest_times": "8:00,12:30,17:00",  # when non-urgent email flags deliver
     "quiet_start_hour": "22",         # 10pm — stop proactive activity
     "quiet_end_hour": "6",            # 6am  — resume (briefing goes out at 6am)
     "proactive_enabled": "true",      # master kill switch
@@ -1332,6 +1341,11 @@ def tool_update_setting(key, value, requester_role):
         if str(value).lower() not in ("true", "false"):
             return "proactive_enabled must be true or false."
         value = str(value).lower()
+    elif key == "email_digest_times":
+        if not _parse_digest_times(str(value)):
+            return ("email_digest_times needs comma-separated 24-hour times like "
+                    "'8:00,12:30,17:00'.")
+        value = str(value)
     result = set_setting(key, value)
     # poll_minutes is read once when the scheduler starts, so a change did nothing until a
     # redeploy (T3.3). Reschedule the job live so "check email every 15 minutes" works now.
@@ -1342,6 +1356,11 @@ def tool_update_setting(key, value, requester_role):
             print(f"[scheduler] email poll rescheduled to every {mins} min")
         except Exception as e:
             print(f"[scheduler] could not reschedule poll: {e}")
+    if key == "email_digest_times":
+        try:
+            _schedule_digest_jobs()
+        except Exception as e:
+            print(f"[scheduler] could not reschedule digests: {e}")
     return result
 
 
@@ -4396,7 +4415,8 @@ def tools_for_role(role, is_group=False):
                                 "(how many messages Guppi may send UNPROMPTED per day - "
                                 "Telegram messages are free, so this is purely about not "
                                 "being annoying; replies to you are never limited), "
-                                "poll_minutes, "
+                                "poll_minutes, email_digest_times (when the email "
+                                "digests go out, e.g. '8:00,12:30,17:00'), "
                                 "quiet_start_hour, quiet_end_hour, proactive_enabled."),
                 "input_schema": {"type": "object", "properties": {
                     "key": {"type": "string"}, "value": {"type": "string"}},
@@ -4718,7 +4738,10 @@ GUIDE_TOPICS = [
         "summary": "Control which senders I chase you about, and watch for mail you expect.",
         "body": [
             "I watch new mail and flag deadlines, invoices and RSVPs, offering to set a "
-            "reminder or add it to the calendar. I skip marketing and newsletters.",
+            "reminder or add it to the calendar. I skip marketing and newsletters. "
+            "Flags arrive as a digest a few times a day (normally 8am, 12:30 and 5pm - "
+            "\"set the digest times to 9:00,17:00\" changes it); genuinely urgent "
+            "things and emails I'm watching for still come immediately.",
             "ALWAYS TELL ME: \"always flag emails from the school\", \"the coach is "
             "important\".",
             "NEVER TELL ME: \"never flag newsletters\", \"ignore Robinhood\".",
@@ -7375,6 +7398,47 @@ def _poll_unread(person):
     return out
 
 
+def _imap_snippets_for_uids(person, uids, limit=600):
+    """Bodies for the handful of NEW messages the triage is about to judge. One
+    connection, at most five full fetches, hard-capped output - the bounded cousin of
+    the search rule (searches stay headers-only; the poll's few genuinely-new
+    messages are worth their bytes, because sender+subject alone made every Outlook
+    summary guesswork)."""
+    out = {}
+    if not uids:
+        return out
+    M = _imap_connect(person)
+    if not M:
+        return out
+    try:
+        M.select("INBOX")
+        for uid in uids[:5]:
+            typ, md = M.uid("fetch", uid, "(BODY.PEEK[])")
+            raw = None
+            for item in md or []:
+                if (isinstance(item, tuple) and len(item) > 1
+                        and isinstance(item[1], (bytes, bytearray)) and item[1]):
+                    raw = item[1]
+                    break
+            if typ != "OK" or raw is None:
+                continue
+            try:
+                body = _imap_full_body(emaillib.message_from_bytes(raw))
+            except Exception as e:
+                print(f"[poll] body parse failed for uid {uid!r}: {e}")
+                continue
+            if body:
+                out[uid] = re.sub(r"\s+", " ", body)[:limit]
+    except Exception as e:
+        print(f"[poll] body fetch failed for {person}: {e}")
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    return out
+
+
 def job_urgent_email_poll():
     """Every N minutes: for each connected adult, TRIAGE new unread mail and surface what
     needs them - richer than the old "I spotted a deadline" list.
@@ -7469,6 +7533,18 @@ def job_urgent_email_poll():
 
         ignore = _ignored_senders()
         priority = _priority_senders(name)
+        # Gap A: Outlook triage used to judge from sender+subject alone (imap_unread
+        # fetches headers only), so importance and the one-line summary for the MAIN
+        # inbox were guesswork. Fetch bodies for the genuinely-new, non-ignored ones.
+        _want = [m["id"][2:] for m in fresh
+                 if m["id"].startswith("i:") and not m.get("snippet")
+                 and (any(p in (m.get("from") or "").lower() for p in priority)
+                      or not any(b in (m.get("from") or "").lower() for b in ignore))]
+        if _want:
+            _bodies = _imap_snippets_for_uids(name, _want)
+            for m in fresh:
+                if m["id"].startswith("i:") and m["id"][2:] in _bodies:
+                    m["snippet"] = _bodies[m["id"][2:]]
         summaries = []
         considered = []   # the messages actually summarised for triage (fresh minus skipped)
         skipped = []            # ignored senders - kept so "what did you skip?" can answer
@@ -7547,7 +7623,9 @@ def job_urgent_email_poll():
                     f'"note": "<the difference or conflict, else empty>", '
                     f'"suggest": ["calendar"|"reminder"|"reply"], '
                     f'"remind_when": "<YYYY-MM-DD HH:MM or empty>", '
-                    f'"reply_reason": "<why a reply is needed, or empty>"}}]}}\n'
+                    f'"reply_reason": "<why a reply is needed, or empty>", '
+                    f'"proposed_reply": "<when suggesting a reply: ONE short sentence '
+                    f'they could send as-is, else empty>"}}]}}\n'
                     f"EACH EMAIL GOES IN ONE PLACE ONLY (urgent OR items, never both). If "
                     f"nothing qualifies, reply {{\"urgent\": \"\", \"items\": []}}."),
                 messages=[{"role": "user", "content":
@@ -7651,18 +7729,37 @@ def job_urgent_email_poll():
                 offers.append("add to calendar" if status != "differs" else "update it")
             if "reminder" in suggest:
                 rw = (it.get("remind_when") or "").strip()
+                if rw:
+                    try:
+                        rw = humanize_when(datetime.datetime.strptime(
+                            rw, "%Y-%m-%d %H:%M").isoformat())
+                    except (ValueError, TypeError):
+                        pass
                 offers.append(f"remind you{(' ' + rw) if rw else ''}")
             if "reply" in suggest:
-                offers.append("draft a reply")
+                pr = (it.get("proposed_reply") or "").strip()
+                if pr:
+                    lines.append(f'  Suggested reply: "{pr}"')
+                    offers.append("send that reply (I'll show the full draft first)")
+                else:
+                    offers.append("draft a reply")
             if offers:
                 lines.append("  Want me to " + ", or ".join(offers) + "?")
             blocks.append("\n".join(lines))
 
         if blocks:
-            body = ("Here's what came in that may need you:\n\n"
-                    + "\n\n".join(blocks)
-                    + "\n\nJust tell me which to handle.")
-            send_message(chat, body, proactive=True)
+            # Gap D: non-urgent flags no longer interrupt on every poll - they QUEUE
+            # (durably) and deliver as a digest at the email_digest_times. Urgent
+            # items and watch alerts, sent above, are the deliberate exceptions.
+            # Sigs are recorded at QUEUE time, so a retried triage can never queue
+            # the same item twice.
+            _qc = db()
+            _qnow = now_local().isoformat()
+            for b in blocks:
+                _qc.execute("INSERT INTO email_digest_queue (person, block, created_at) "
+                            "VALUES (?,?,?)", (name, b, _qnow))
+            _qc.commit(); _qc.close()
+            print(f"[poll] queued {len(blocks)} item(s) for {name}'s next digest")
             try:
                 prior = json.loads(raw_seen) if raw_seen.startswith("[") else []
             except Exception:
@@ -7690,9 +7787,84 @@ def job_urgent_email_poll():
                 offered_raw = get_setting(f"suggested_{name}") or ""
                 offered = [s for s in offered_raw.split("||") if s]
                 if sig not in offered:
-                    send_message(chat, sug, proactive=True)
+                    _qc = db()
+                    _qc.execute("INSERT INTO email_digest_queue (person, block, "
+                                "created_at) VALUES (?,?,?)",
+                                (name, sug, now_local().isoformat()))
+                    _qc.commit(); _qc.close()
                     offered.append(sig)
                     set_setting(f"suggested_{name}", "||".join(offered[-30:]))  # bounded
+
+
+def _parse_digest_times(raw):
+    """'8:00,12:30,17:00' -> [(8, 0), (12, 30), (17, 0)], or [] if invalid. Max 6."""
+    out = []
+    for part in (raw or "").split(","):
+        m = re.match(r"^(\d{1,2}):(\d{2})$", part.strip())
+        if not m:
+            return []
+        h, mi = int(m.group(1)), int(m.group(2))
+        if not (0 <= h <= 23 and 0 <= mi <= 59):
+            return []
+        out.append((h, mi))
+    return out[:6]
+
+
+def _schedule_digest_jobs():
+    """(Re)register the digest delivery jobs from the email_digest_times setting."""
+    times = (_parse_digest_times(get_setting("email_digest_times") or "")
+             or _parse_digest_times(DEFAULT_SETTINGS["email_digest_times"]))
+    for i, (h, mi) in enumerate(times):
+        scheduler.add_job(job_email_digest_flush, "cron", hour=h, minute=mi,
+                          id=f"email_digest_{i}", replace_existing=True,
+                          max_instances=1, coalesce=True)
+    for i in range(len(times), 6):        # remove leftovers if the list shrank
+        try:
+            scheduler.remove_job(f"email_digest_{i}")
+        except Exception:
+            pass
+    print("[scheduler] email digests at "
+          + ", ".join(f"{h:02d}:{mi:02d}" for h, mi in times))
+
+
+def job_email_digest_flush():
+    """Deliver each adult's queued (non-urgent) email flags as ONE digest message.
+    Urgent items and email-watch alerts never queue - the poll sends those
+    immediately. Rows are deleted only after the send succeeds, so a digest held by
+    the message cap is retried at the next flush time instead of being lost."""
+    if not proactive_on() or in_quiet_hours():
+        return
+    conn = db()
+    try:
+        rows = conn.execute("SELECT id, person, block FROM email_digest_queue "
+                            "ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return
+    by_person = {}
+    for r in rows:
+        by_person.setdefault(r["person"], []).append(r)
+    chats = dict(_adults_with_chats())
+    for person, items in by_person.items():
+        chat = chats.get(person)
+        if not chat:
+            continue
+        batch = items[:10]
+        body = ("Here's what came in that may need you:\n\n"
+                + "\n\n".join(r["block"] for r in batch)
+                + ("\n\n(more queued - they'll come in the next digest)"
+                   if len(items) > 10 else "")
+                + "\n\nJust tell me which to handle.")
+        if send_message(chat, body, proactive=True):
+            conn = db()
+            conn.execute(
+                "DELETE FROM email_digest_queue WHERE id IN (%s)"
+                % ",".join("?" * len(batch)), [r["id"] for r in batch])
+            conn.commit(); conn.close()
+            print(f"[digest] delivered {len(batch)} item(s) to {person}")
+        else:
+            print(f"[digest] send held for {person}; queue kept for the next flush")
 
 
 # =============================================================================
@@ -7721,6 +7893,7 @@ def start_scheduler():
                       replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_occasion_reminders, "cron", hour=7, minute=0, id="occasions",
                       replace_existing=True, max_instances=1, coalesce=True)
+    _schedule_digest_jobs()
     scheduler.start()
     print(f"[scheduler] started: reminders/min, briefing 6am, occasions 7am, weekly Sun 6pm, email poll/{poll_min}min, backup 3:30am (all sent PRIVATELY, never to the group)")
 
