@@ -942,6 +942,11 @@ def save_google_token(person, creds):
                  (person, creds.to_json()))
     conn.commit()
     conn.close()
+    # Trap 110: a successful save - a fresh OAuth connect OR a working refresh - means
+    # the token is alive again. Clear any dead flag, exactly as save_ms_token does.
+    # Without this, the dead short-circuit in load_google_token blocked the very
+    # reconnect that was meant to clear it: once flagged, a person could never come back.
+    set_setting(f"google_dead_{person}", "")
 
 
 def load_google_token(person):
@@ -966,7 +971,15 @@ def load_google_token(person):
     except Exception as e:
         print(f"[gtoken] {person}: could not build creds: {e}")
         return None
+    # A currently-VALID credential is alive no matter what a stale dead flag says -
+    # trust it, and clear the flag so status reporting matches reality (Trap 110).
+    if creds and creds.valid:
+        if google_needs_reconnect(person):
+            set_setting(f"google_dead_{person}", "")
+        return creds
     # Don't hammer a token already known to be dead - same short-circuit Microsoft has.
+    # (save_google_token clears this flag on a successful reconnect, so the short-circuit
+    # can no longer lock out someone who has just reconnected.)
     if google_needs_reconnect(person):
         return None
     if creds and not creds.valid and creds.refresh_token:
@@ -7132,6 +7145,7 @@ def job_urgent_email_poll():
         # anyone whose main inbox is Outlook, deadline flagging only worked during windows
         # when Gmail happened to have no recent unread.
         fresh = []
+        pending_marks = {}   # provider marker advances, committed only AFTER triage runs
         for prov, prefix in (("google", "g:"), ("imap", "i:")):
             stream = [m for m in msgs if str(m.get("id", "")).startswith(prefix)]
             if not stream:
@@ -7161,7 +7175,11 @@ def job_urgent_email_poll():
                 if m["id"] == seen:
                     break
                 fresh.append(m)
-            set_setting(key, stream[0]["id"])
+            # Trap 111: do NOT advance the marker yet. It used to be advanced right
+            # here, so a cap hit, a failed model call, or an unparseable verdict further
+            # down marked this mail as seen without it ever being triaged - silently
+            # lost. The advance now happens only after the triage call succeeds.
+            pending_marks[key] = stream[0]["id"]
         if not fresh:
             continue  # nothing new in EITHER inbox -> no Claude call, no cost
         print(f"[poll] {name}: {len(fresh)} new "
@@ -7171,6 +7189,7 @@ def job_urgent_email_poll():
         ignore = _ignored_senders()
         priority = _priority_senders(name)
         summaries = []
+        considered = []   # the messages actually summarised for triage (fresh minus skipped)
         skipped = []            # ignored senders - kept so "what did you skip?" can answer
         # Walk `fresh` - the new messages from BOTH inboxes - not the raw concatenated
         # list with a break on a single marker id.
@@ -7187,19 +7206,23 @@ def job_urgent_email_poll():
             snip = f" - {m['snippet']}" if m.get("snippet") else ""
             tag = " [PRIORITY SENDER]" if is_priority else ""
             summaries.append(f"From {m['from']}: {m['subject']}{rcv}{snip}{tag}")
+            considered.append(m)
         # Keep this poll's skipped mail so a later "anything you ignored?" can show it.
         if skipped:
             _RECENT_SKIPPED[name] = (skipped + _RECENT_SKIPPED.get(name, []))[:15]
-        # Remember the mail this poll just told them about, so "what's in that email?"
-        # right after an alert can be answered without them re-identifying it. Small,
-        # in-memory, per person; last one wins because that's what "that email" means.
-        if summaries:
-            _RECENT_FLAGGED[name] = [
-                {"from": m.get("from", ""), "subject": m.get("subject", ""),
-                 "id": m.get("id", "")} for m in fresh][:8]
+        # (_RECENT_FLAGGED used to be set HERE, from `fresh` - which still contained
+        # the skipped senders, and it fired even when the triage below surfaced nothing.
+        # The live state then claimed Guppi had "just flagged" emails it never mentioned.
+        # It is now set after the verdict, from the messages actually considered.)
         if not summaries:
+            # Everything new was skippable (ignored senders / marketing). Nothing will
+            # be triaged, so nothing can be lost - safe to mark this mail as seen.
+            for _k, _v in pending_marks.items():
+                set_setting(_k, _v)
             continue
         if not claude_call_allowed():
+            print(f"[poll] {name}: Claude-call cap reached with {len(summaries)} new "
+                  f"email(s) untriaged - markers left so they are retried next poll")
             return
 
         today = now_local().strftime("%A, %B %d, %Y")
@@ -7249,20 +7272,29 @@ def job_urgent_email_poll():
                            + "NEW EMAILS:\n" + "\n\n".join(summaries)}])
             raw = "".join(b.text for b in resp.content if b.type == "text").strip()
         except Exception as e:
-            print(f"[poll] Claude failed for {name}: {e}")
+            print(f"[poll] Claude failed for {name}: {e} - markers left; these emails "
+                  f"are retried next poll")
             continue
 
         verdict = _extract_json_object(raw)
         if verdict is None:
-            print(f"[poll] no JSON object in verdict for {name}: {raw[:120]!r}")
+            print(f"[poll] no JSON object in verdict for {name}: {raw[:120]!r} - "
+                  f"markers left; these emails are retried next poll")
             continue
 
-        # Record what this poll surfaced, so "what's in that email?" resolves right after.
+        # Triage genuinely ran - NOW advance the per-provider markers (Trap 111). The
+        # item-level dedupe below still guarantees nothing is announced twice on a retry.
+        for _k, _v in pending_marks.items():
+            set_setting(_k, _v)
+
+        # Record what this poll surfaced, so "what's in that email?" resolves right
+        # after. Built from `considered` (the mail actually shown to the triage), never
+        # from `fresh`, which still contains the skipped senders.
         surfaced = [it for it in verdict.get("items", []) if (it.get("what") or "").strip()]
         if surfaced or (verdict.get("urgent") or "").strip():
             _RECENT_FLAGGED[name] = [
                 {"from": m.get("from", ""), "subject": m.get("subject", ""),
-                 "id": m.get("id", "")} for m in fresh][:8]
+                 "id": m.get("id", "")} for m in considered][:8]
 
         # 1) Urgent -> its own immediate line.
         urgent = (verdict.get("urgent") or "").strip()
@@ -7270,8 +7302,17 @@ def job_urgent_email_poll():
             send_message(chat, "Heads up: " + urgent, proactive=True)
 
         # 2) The triaged items -> one rich, de-duped message.
+        # Found by the Batch-1 test: the sig itself contains "|" (what|date), and the
+        # store was joined AND split on "|" - so a stored sig shattered into fragments
+        # on read and never matched again. The cross-poll dedupe had never actually
+        # deduped. Stored as JSON now; a legacy "|"-joined value is discarded (worst
+        # case: one already-announced item surfaces once more, then dedupes correctly).
         seen_key = f"flagged_deadlines_{name}"
-        already = set(x for x in (get_setting(seen_key) or "").split("|") if x)
+        raw_seen = get_setting(seen_key) or ""
+        try:
+            already = set(json.loads(raw_seen)) if raw_seen.startswith("[") else set()
+        except Exception:
+            already = set()
 
         def _overlaps_urgent(text):
             if not urgent:
@@ -7338,9 +7379,12 @@ def job_urgent_email_poll():
                     + "\n\n".join(blocks)
                     + "\n\nJust tell me which to handle.")
             send_message(chat, body, proactive=True)
-            prior = [x for x in (get_setting(seen_key) or "").split("|") if x]
+            try:
+                prior = json.loads(raw_seen) if raw_seen.startswith("[") else []
+            except Exception:
+                prior = []
             merged = prior + [x for x in new_sigs if x not in set(prior)]
-            set_setting(seen_key, "|".join(merged[-100:]))
+            set_setting(seen_key, json.dumps(merged[-100:]))
             # LEARNING outcomes (unchanged): credit senders as awaiting engagement.
             flagged_senders = [(it.get("from") or "").strip() for it in surfaced if it.get("from")]
             pri = _priority_senders(name)
