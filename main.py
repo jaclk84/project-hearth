@@ -110,6 +110,78 @@ SCOPES = [
 # Railway (e.g. America/New_York) to override.
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "America/New_York"))
 
+# ---- Encryption at rest (H3 part two) ----------------------------------------
+# Stored credentials (Google token JSON, Microsoft refresh/access tokens, IMAP app
+# passwords) are encrypted with a Fernet key held in GUPPI_CRYPTO_KEY - which lives in
+# Railway AND in the family password manager, because losing the key means every
+# account must be reconnected. What this protects is every COPY of the database that
+# leaves the server (the Telegram backup, files saved to a PC): a leaked backup
+# without the key is inert. It does NOT protect against a compromise of Railway
+# itself, where the key sits next to the data - a documented boundary, not a secret.
+#
+# Failure behaviour, chosen deliberately (fail closed, never fatal):
+#   * key missing + plaintext rows   -> everything works; loud warning to set the key
+#   * key missing/wrong + encrypted  -> credentials are UNAVAILABLE (accounts look
+#     disconnected, honestly reported); fixed by restoring the correct env var.
+#     The app stays up and nothing is corrupted.
+#   * a restored PRE-encryption backup re-encrypts itself on the next boot (the
+#     startup migration is idempotent - ciphertext is recognisable by its prefix).
+try:
+    from cryptography.fernet import Fernet as _Fernet
+except Exception:                    # package not installed (requirements.txt lag)
+    _Fernet = None
+GUPPI_CRYPTO_KEY = os.environ.get("GUPPI_CRYPTO_KEY", "")
+_fernet = None
+if GUPPI_CRYPTO_KEY and _Fernet:
+    try:
+        _fernet = _Fernet(GUPPI_CRYPTO_KEY.strip().encode())
+        print("[crypto] encryption at rest is ON")
+    except Exception as _e:
+        print(f"[crypto] GUPPI_CRYPTO_KEY is set but is not a valid Fernet key "
+              f"({_e}) - encrypted credentials will be UNREADABLE until it is fixed")
+elif GUPPI_CRYPTO_KEY and not _Fernet:
+    print("[crypto] GUPPI_CRYPTO_KEY is set but the 'cryptography' package is not "
+          "installed - add it to requirements.txt (Trap 22). Encrypted credentials "
+          "will be unreadable until the next deploy includes it.")
+else:
+    print("[crypto] GUPPI_CRYPTO_KEY is not set - stored credentials stay PLAINTEXT")
+
+
+def _is_encrypted(value):
+    """Fernet ciphertext always starts 'gAAAA' (version byte 0x80, base64url). A
+    cheap, reliable ciphertext test - it is what makes the boot migration idempotent
+    and lets a restored plaintext backup keep working."""
+    return isinstance(value, str) and value.startswith("gAAAA")
+
+
+def _enc_secret(value):
+    """Encrypt a credential for storage. Passthrough (with the boot-time warning)
+    when no key is configured; never double-encrypts."""
+    if value is None or not isinstance(value, str) or not _fernet:
+        return value
+    if _is_encrypted(value):
+        return value
+    return _fernet.encrypt(value.encode()).decode()
+
+
+def _dec_secret(value, what="credential"):
+    """Decrypt a stored credential. Plaintext passes through (pre-migration rows, or
+    a restored old backup). Encrypted-but-unreadable returns None - callers treat
+    that as 'not connected', which is the fail-closed behaviour."""
+    if value is None or not isinstance(value, str) or not _is_encrypted(value):
+        return value
+    if not _fernet:
+        print(f"[crypto] {what} is encrypted but no usable GUPPI_CRYPTO_KEY is "
+              f"configured - treating it as unavailable")
+        return None
+    try:
+        return _fernet.decrypt(value.encode()).decode()
+    except Exception:
+        print(f"[crypto] {what} would not decrypt (wrong key?) - treating it as "
+              f"unavailable")
+        return None
+
+
 # ---- Telegram ---------------------------------------------------------------
 # TELEGRAM_BOT_TOKEN: from @BotFather when you create the bot.
 # TELEGRAM_SETUP_SECRET: a private phrase YOU choose. An adult binds their chat by
@@ -300,6 +372,38 @@ PERMISSIONS = {
 # =============================================================================
 #  DATABASE
 # =============================================================================
+def _migrate_encrypt_at_rest():
+    """One idempotent pass: encrypt any PLAINTEXT credential values in place. Runs at
+    every boot; already-encrypted values are recognised by prefix and left untouched,
+    so a restored pre-encryption backup simply re-encrypts itself on the next start."""
+    if not _fernet:
+        return
+    try:
+        conn = db()
+        total = 0
+        for table, keycol, cols in (
+                ("google_tokens", "person", ("token_json",)),
+                ("ms_tokens", "person", ("refresh_token", "access_token")),
+                ("imap_accounts", "person", ("app_password",))):
+            rows = conn.execute(
+                f"SELECT {keycol}, {', '.join(cols)} FROM {table}").fetchall()
+            for row in rows:
+                for c in cols:
+                    v = row[c]
+                    if v and not _is_encrypted(v):
+                        conn.execute(
+                            f"UPDATE {table} SET {c} = ? WHERE {keycol} = ?",
+                            (_enc_secret(v), row[keycol]))
+                        total += 1
+        conn.commit()
+        conn.close()
+        if total:
+            print(f"[crypto] migrated {total} stored credential value(s) to "
+                  f"encrypted-at-rest")
+    except Exception as e:
+        print(f"[crypto] at-rest migration failed (data left as-is): {e}")
+
+
 def init_db():
     os.makedirs("/app/data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -471,6 +575,7 @@ def init_db():
         conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
     conn.commit()
     conn.close()
+    _migrate_encrypt_at_rest()
 
 
 def db():
@@ -939,7 +1044,7 @@ def link_person(name, requester_role):
 def save_google_token(person, creds):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("INSERT OR REPLACE INTO google_tokens (person, token_json) VALUES (?, ?)",
-                 (person, creds.to_json()))
+                 (person, _enc_secret(creds.to_json())))
     conn.commit()
     conn.close()
     # Trap 110: a successful save - a fresh OAuth connect OR a working refresh - means
@@ -965,8 +1070,11 @@ def load_google_token(person):
     if not row:
         print(f"[gtoken] {person}: no row in google_tokens")
         return None
+    raw = _dec_secret(row[0], f"{person}'s Google token")
+    if raw is None:
+        return None        # encrypted but unreadable - fail closed as not-connected
     try:
-        info = json.loads(row[0])
+        info = json.loads(raw)
         creds = Credentials.from_authorized_user_info(info, SCOPES)
     except Exception as e:
         print(f"[gtoken] {person}: could not build creds: {e}")
@@ -1038,22 +1146,35 @@ def _make_oauth_state(person):
     callback can verify it originated from us (CSRF) and wasn't crafted by a stranger."""
     import secrets as _secrets
     nonce = _secrets.token_urlsafe(16)
-    payload = f"{person}:{nonce}"
+    # M-7: states used to live forever - one lifted from an old log or a browser
+    # history could complete an OAuth flow indefinitely later, binding an attacker's
+    # account under a family name. 30 minutes covers any real sign-in.
+    exp = int(time.time()) + 30 * 60
+    payload = f"{person}:{exp}:{nonce}"
     sig = hmac.new(TELEGRAM_SETUP_SECRET.encode(), payload.encode(),
                    "sha256").hexdigest()[:16]
     return f"{payload}:{sig}"
 
 
 def _verify_oauth_state(state):
-    """Return the person name if the state is a valid signed token we issued, else None."""
+    """Return the person name if the state is a valid, UNEXPIRED signed token we
+    issued, else None. States expire after 30 minutes (M-7)."""
     try:
-        person, nonce, sig = state.split(":", 2)
+        person, exp_s, nonce, sig = state.split(":", 3)
     except (ValueError, AttributeError):
         return None
-    payload = f"{person}:{nonce}"
+    payload = f"{person}:{exp_s}:{nonce}"
     expect = hmac.new(TELEGRAM_SETUP_SECRET.encode(), payload.encode(),
                       "sha256").hexdigest()[:16]
-    return person if hmac.compare_digest(sig, expect) else None
+    if not hmac.compare_digest(sig, expect):
+        return None
+    try:
+        if int(exp_s) < int(time.time()):
+            print("[oauth] state expired - the sign-in link is stale; mint a fresh one")
+            return None
+    except ValueError:
+        return None
+    return person
 
 
 @app.get("/connect")
@@ -1839,7 +1960,8 @@ def save_imap_account(person, email_addr, app_password):
     conn = db()
     conn.execute("INSERT OR REPLACE INTO imap_accounts "
                  "(person, email_addr, app_password, imap_host, imap_port) "
-                 "VALUES (?,?,?,?,?)", (person, email_addr, app_password, host, port))
+                 "VALUES (?,?,?,?,?)",
+                 (person, email_addr, _enc_secret(app_password), host, port))
     conn.commit()
     conn.close()
     print(f"[imap] saved account for {person}: {email_addr}")
@@ -1916,7 +2038,8 @@ def save_ms_token(person, tok, email_addr=None):
     conn.execute("INSERT OR REPLACE INTO ms_tokens "
                  "(person, email_addr, refresh_token, access_token, expires_at) "
                  "VALUES (?,?,?,?,?)",
-                 (person, email_addr, refresh, tok.get("access_token"), expires_at))
+                 (person, email_addr, _enc_secret(refresh),
+                  _enc_secret(tok.get("access_token")), expires_at))
     conn.commit()
     conn.close()
     # A successful save (fresh connect OR a working refresh) means the token is alive again
@@ -1940,15 +2063,20 @@ def get_ms_access_token(person):
     if not row:
         print(f"[ms] {person}: no ms_tokens row")
         return None
+    access = (_dec_secret(row["access_token"], f"{person}'s Microsoft access token")
+              if row["access_token"] else None)
+    refresh = _dec_secret(row["refresh_token"], f"{person}'s Microsoft refresh token")
+    if refresh is None:
+        return None        # encrypted but unreadable - fail closed as not-connected
     try:
-        if row["access_token"] and row["expires_at"] and \
+        if access and row["expires_at"] and \
                 datetime.datetime.fromisoformat(row["expires_at"]) > now_local():
-            return row["access_token"]
+            return access
     except ValueError:
         pass
     tok = _ms_token_request({
         "client_id": MS_CLIENT_ID, "client_secret": MS_CLIENT_SECRET,
-        "grant_type": "refresh_token", "refresh_token": row["refresh_token"],
+        "grant_type": "refresh_token", "refresh_token": refresh,
         "scope": MS_SCOPES, "redirect_uri": MS_REDIRECT_URI})
     if not tok or "access_token" not in tok:
         err = (tok or {}).get("error", "").lower() if isinstance(tok, dict) else ""
@@ -2279,9 +2407,12 @@ def _imap_connect(person):
     row = get_imap_account(person)
     if not row:
         return None
+    app_pw = _dec_secret(row["app_password"], f"{person}'s email app password")
+    if app_pw is None:
+        return None        # encrypted but unreadable - fail closed
     try:
         M = imaplib.IMAP4_SSL(row["imap_host"], row["imap_port"], timeout=20)
-        M.login(row["email_addr"], row["app_password"])
+        M.login(row["email_addr"], app_pw)
         return M
     except Exception as e:
         print(f"[imap] connect failed for {person}: {e}")
