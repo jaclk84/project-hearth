@@ -1094,7 +1094,16 @@ def oauth_callback(request: Request, state: str = ""):
     # Railway serves HTTPS at its edge but forwards internally as HTTP; the OAuth
     # library refuses non-HTTPS. Rebuild as https (it IS secure end to end).
     callback_url = str(request.url).replace("http://", "https://", 1)
-    flow.fetch_token(authorization_response=callback_url)
+    try:
+        flow.fetch_token(authorization_response=callback_url)
+    except Exception as e:
+        # A denied consent, an expired/re-used code, or a reloaded callback page used
+        # to surface as a raw 500 error page (L-9). Fail with instructions instead.
+        print(f"[oauth] fetch_token failed for {person}: {e}")
+        return HTMLResponse(
+            "<h2>That Google sign-in didn't complete.</h2>"
+            "<p>The link may have been used already or timed out. Ask Guppi for a "
+            "fresh connect link and try again.</p>", status_code=400)
     save_google_token(person, flow.credentials)
     print(f"[oauth] saved Google token for {person}")
     safe = html_lib.escape(person)
@@ -5788,7 +5797,11 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
         save_history(hist_key, user_message if not placeholder else placeholder, reply)
         return reply
 
-    return "Sorry, that took too many steps. Can you rephrase?"
+    bail = "Sorry, that took too many steps. Can you rephrase?"
+    # Keep even a bailed exchange in history, so a follow-up ("what happened?", "try
+    # again") has something to refer to instead of a hole in the conversation (L-6).
+    save_history(hist_key, user_message, bail)
+    return bail
 
 
 # ---- Conversation memory (short, per-chat, in-memory) -----------------------
@@ -6187,6 +6200,26 @@ async def telegram_webhook(request: Request):
             return {"ok": True}
 
     if not text and not image_data and not doc_data:
+        # Trap 79's last silent exit: a voice note, video, or sticker from a family
+        # member used to vanish here - no reply, no log. Every drop path must log, and
+        # a person who ASKED something (by voice) deserves to know it wasn't heard.
+        kinds = {
+            "voice": "a voice note", "audio": "an audio file", "video": "a video",
+            "video_note": "a video message", "sticker": "a sticker",
+            "animation": "a GIF", "location": "a location pin",
+            "contact": "a contact card", "poll": "a poll",
+        }
+        got = next((label for key, label in kinds.items() if message.get(key)), None)
+        print(f"[tg] unsupported message type from {sender_chat_id}: "
+              f"{got or 'no readable content'}")
+        if got in ("a sticker", "a GIF"):
+            # A sticker or GIF is a reaction, not a request - stay quiet rather than
+            # nag. The log line above means it is no longer an invisible drop.
+            return {"ok": True}
+        if got:
+            send_message(chat_id,
+                         f"I can't read {got} yet - I understand text, photos, and "
+                         f"PDFs. Type it (or snap a picture) and I'm on it.")
         return {"ok": True}
 
     # Strip a leading @mention so Claude doesn't see it as part of the request.
@@ -6429,7 +6462,9 @@ def _check_email_watches(person, msgs):
             hay = f"{m.get('from','')} {m.get('subject','')} {m.get('snippet','')}".lower()
             if sum(1 for k in kw if k in hay) >= need:
                 hits.append((r["id"], r["description"], m))
-                conn.execute("UPDATE email_watches SET fired = 1 WHERE id = ?", (r["id"],))
+                # fired is set by the CALLER after the alert actually sends - marking
+                # it here lost the alert for good whenever the message cap or a send
+                # failure held the message (L-2).
                 print(f"[watch] MATCH watch {r['id']} -> {m.get('subject','')[:50]!r}")
                 break
     conn.commit(); conn.close()
@@ -7216,12 +7251,22 @@ def job_urgent_email_poll():
         # look out for must not depend on a model choosing to mention it, nor be skipped
         # because the newest id happens to be unchanged.
         for _wid, _desc, _m in _check_email_watches(name, msgs):
-            send_message(chat,
+            _sent = send_message(chat,
                          f"That thing you asked me to watch for has arrived: "
                          f"*{_m.get('subject', '(no subject)')}* from "
                          f"{_m.get('from', 'someone')}.\n\n(You asked me to look out for: "
                          f"{_desc}.) Want me to add anything from it to the calendar?",
                          proactive=True)
+            if _sent:
+                _wc = db()
+                _wc.execute("UPDATE email_watches SET fired = 1 WHERE id = ?", (_wid,))
+                _wc.commit(); _wc.close()
+            else:
+                # The promised alert was held (message cap or send failure). Leave the
+                # watch un-fired so it matches again next poll - a promise Guppi made
+                # must not be silently dropped by a cap (L-2).
+                print(f"[watch] alert for watch {_wid} HELD - not marked fired; "
+                      f"retrying next poll")
         # PER-PROVIDER de-dupe. This used to key off msgs[0] alone - and _poll_unread
         # returns Gmail first with IMAP appended, so msgs[0] was ALWAYS a Gmail id whenever
         # Gmail had any unread. Two consequences, both silent: an unchanged newest Gmail
