@@ -596,6 +596,17 @@ def init_db():
         done INTEGER NOT NULL DEFAULT 0,
         stopped INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL)""")
+    # Batch 9: the filing cabinet. Metadata only - the file bytes live on the volume
+    # in FILES_DIR, deliberately OUTSIDE the nightly backup (see FILES_DIR comment).
+    conn.execute("""CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        tags TEXT,
+        filename TEXT NOT NULL,
+        media_type TEXT,
+        size INTEGER,
+        added_by TEXT,
+        created_at TEXT NOT NULL)""")
     conn.commit()
     for name, role in SEEDED_PEOPLE:
         conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
@@ -2337,6 +2348,9 @@ _PENDING_EMAIL = {}   # person -> {to, subject, body, reply_headers, turn_id}
 _RECENT_FLAGGED = {} # person -> [ {from, subject, id}, ... ] most recently flagged by the poll
 _CURRENT_TURN = {}    # person -> id of the message turn currently being processed
 _LAST_USER_TEXT = {}  # person -> their most recent raw message (for send-confirmation check)
+_LAST_ATTACHMENT = {} # person -> their most recent photo/PDF, so "file that" can save it.
+                      # In-memory: a redeploy drops a pending one, and Guppi just asks
+                      # for the file again - honest, and no stale bytes accumulate.
 
 def tool_draft_email(person, to_addr, subject, body, reply_headers=None):
     """Prepare an email draft and show it to the user for approval. Does NOT send. The
@@ -3660,6 +3674,139 @@ def tool_complete_tracked(id_or_title):
     return f"Done - '{row['title']}' is closed. I'll stop chasing it."
 
 
+# ---- The family filing cabinet (Batch 9) ------------------------------------
+# Storage decision, made explicitly: files on the VOLUME, metadata in the DB, and
+# the nightly Telegram backup does NOT carry them. The backup's job is credentials
+# and family data; an archive-sized backup would grow past Telegram's 50MB bot
+# limit and silently stop arriving - the worse failure. Trade-off accepted: losing
+# the volume loses the archive (the extracted facts are in memory, which IS backed
+# up). Derived from DB_PATH so the two always live side by side.
+FILES_DIR = os.path.join(os.path.dirname(DB_PATH), "files")
+_DOC_EXT = {"application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png",
+            "image/webp": "webp", "image/gif": "gif"}
+
+
+def tool_save_document(title, tags, person):
+    """File the most recent photo/PDF this person sent. Offer-then-save: the model
+    offers after reading an attachment, and only a yes lands here."""
+    att = _LAST_ATTACHMENT.get(person)
+    if not att:
+        return ("I don't have a file from you in hand - send the photo or PDF "
+                "again and then ask me to file it.")
+    title = (title or "").strip()
+    if not title:
+        return "What should I call it? Give me a short title, like 'camp map'."
+    ext = _DOC_EXT.get((att.get("media_type") or "").lower(), "bin")
+    safe = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower()).strip("-")[:40] or "file"
+    fname = f"{int(time.time())}_{safe}.{ext}"
+    try:
+        os.makedirs(FILES_DIR, exist_ok=True)
+        raw = base64.b64decode(att["data"])
+        with open(os.path.join(FILES_DIR, fname), "wb") as f:
+            f.write(raw)
+    except Exception as e:
+        print(f"[files] save failed: {e}")
+        return "I couldn't save the file just now - try sending it again."
+    conn = db()
+    conn.execute("INSERT INTO documents (title, tags, filename, media_type, size, "
+                 "added_by, created_at) VALUES (?,?,?,?,?,?,?)",
+                 (title, (tags or "").strip().lower() or None, fname,
+                  att.get("media_type"), len(raw), person,
+                  now_local().isoformat()))
+    conn.commit(); conn.close()
+    print(f"[files] saved '{title}' as {fname} ({len(raw)} bytes)")
+    return (f"Filed: '{title}' ({max(1, len(raw) // 1024)} KB). Ask me for it any "
+            f"time - \"show me the {title}\".")
+
+
+def _find_document(id_or_title):
+    """A document by id or by title/tag words. Returns (row, candidates): exactly one
+    match -> (row, None); several -> (None, list); none -> (None, None)."""
+    key = str(id_or_title or "").strip()
+    conn = db()
+    rows = conn.execute("SELECT id, title, tags, filename FROM documents "
+                        "ORDER BY id").fetchall()
+    conn.close()
+    if key.isdigit():
+        hit = [r for r in rows if r["id"] == int(key)]
+        return (hit[0], None) if hit else (None, None)
+    want = set(re.findall(r"[a-z0-9]+", key.lower()))
+    if not want:
+        return None, None
+
+    def _words(r):
+        return set(re.findall(r"[a-z0-9]+", f"{r['title']} {r['tags'] or ''}".lower()))
+    cands = [r for r in rows if want & _words(r)]
+    if len(cands) > 1:
+        # Prefer a document matching EVERY word asked for - "soccer map" should hit
+        # 'soccer map', not tie with 'camp map' on the shared word "map". Only ask
+        # when genuinely ambiguous.
+        full = [r for r in cands if want <= _words(r)]
+        if len(full) == 1:
+            return full[0], None
+    if len(cands) == 1:
+        return cands[0], None
+    if cands:
+        return None, cands
+    return None, None
+
+
+def tool_list_documents():
+    conn = db()
+    rows = conn.execute("SELECT id, title, tags, size, created_at FROM documents "
+                        "ORDER BY id").fetchall()
+    conn.close()
+    if not rows:
+        return ("The family files are empty. Send me a photo or PDF and say "
+                "\"file that as ...\" to start keeping things.")
+    out = []
+    for r in rows:
+        kb = max(1, (r["size"] or 0) // 1024)
+        tags = f" [{r['tags']}]" if r["tags"] else ""
+        out.append(f"[{r['id']}] {r['title']}{tags} - {kb} KB, "
+                   f"saved {r['created_at'][:10]}")
+    return "In the family files:\n" + "\n".join(out)
+
+
+def tool_get_document(id_or_title, chat):
+    """Send a filed document back into this chat as the actual file."""
+    row, cands = _find_document(id_or_title)
+    if cands:
+        return ("More than one file matches - ask which: "
+                + "; ".join(f"[{r['id']}] {r['title']}" for r in cands))
+    if not row:
+        return ("I don't have a file matching that - ask \"what's in the files?\" "
+                "to see what I'm keeping.")
+    path = os.path.join(FILES_DIR, row["filename"])
+    if not os.path.exists(path):
+        print(f"[files] MISSING on disk: {path}")
+        return (f"'{row['title']}' is in my index but the file itself is gone from "
+                f"storage (this can happen if the server volume was replaced). Send "
+                f"it to me again and I'll re-file it.")
+    mid = _tg_send_document(chat, path, caption=row["title"])
+    if mid:
+        return (f"Sent - '{row['title']}' is the file above. Tell the user it's "
+                f"there; don't describe its contents from memory.")
+    return "I couldn't send the file just now - try again in a moment."
+
+
+def tool_delete_document(id_or_title):
+    row, cands = _find_document(id_or_title)
+    if cands:
+        return ("More than one file matches - ask which: "
+                + "; ".join(f"[{r['id']}] {r['title']}" for r in cands))
+    if not row:
+        return "I don't have a file matching that."
+    try:
+        os.remove(os.path.join(FILES_DIR, row["filename"]))
+    except Exception as e:
+        print(f"[files] delete of {row['filename']} failed (non-fatal): {e}")
+    conn = db()
+    conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
+    conn.commit(); conn.close()
+    return f"Deleted '{row['title']}' from the family files."
+
+
 # Which lead-time milestones each kind gets, and how the nudge is framed.
 _OCCASION_LEADS = {
     "vacation": [90, 30, 7, 1],
@@ -4712,6 +4859,41 @@ def tools_for_role(role, is_group=False):
                                 "items."),
                 "input_schema": {"type": "object", "properties": {}}})
             tools.append({
+                "name": "save_document",
+                "description": ("FILE the photo/PDF the user just sent, keeping the "
+                                "original so it can be sent back later. Use when they "
+                                "say 'file that', 'save this as the camp map', 'keep "
+                                "this', or accept your offer to file an attachment. "
+                                "title is a short name ('camp map', 'Lillian's "
+                                "insurance card'); tags are optional search words. "
+                                "Only works on the most recently sent attachment."),
+                "input_schema": {"type": "object", "properties": {
+                    "title": {"type": "string"},
+                    "tags": {"type": "string",
+                             "description": "Optional search words, e.g. 'camp charlotte'."}},
+                    "required": ["title"]}})
+            tools.append({
+                "name": "list_documents",
+                "description": ("Show everything in the family files. Use for "
+                                "'what's in the files?', 'what documents do you "
+                                "have?'."),
+                "input_schema": {"type": "object", "properties": {}}})
+            tools.append({
+                "name": "get_document",
+                "description": ("SEND a filed document back as the actual file. Use "
+                                "for 'show me the camp map', 'send me the insurance "
+                                "card'. Pass the id from list_documents or title "
+                                "words. You cannot see the file's contents yourself - "
+                                "send it, don't describe it."),
+                "input_schema": {"type": "object", "properties": {
+                    "id_or_title": {"type": "string"}}, "required": ["id_or_title"]}})
+            tools.append({
+                "name": "delete_document",
+                "description": ("Remove a document from the family files, by id or "
+                                "title words."),
+                "input_schema": {"type": "object", "properties": {
+                    "id_or_title": {"type": "string"}}, "required": ["id_or_title"]}})
+            tools.append({
                 "name": "connect_link",
                 "description": ("Create a working sign-in link so someone can CONNECT or "
                                 "RECONNECT an account. Use whenever anyone needs to link "
@@ -4793,7 +4975,9 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
                        "connection_health", "manage_deadline_ignores",
                        "manage_email_priorities", "backup_now", "backup_link",
                        "connect_link", "watch_for_email", "list_email_watches",
-                       "cancel_email_watch", "show_skipped_email", "whats_open"}
+                       "cancel_email_watch", "show_skipped_email", "whats_open",
+                       "save_document", "list_documents", "get_document",
+                       "delete_document"}
     if is_group and name in GROUP_FORBIDDEN:
         print(f"[security] BLOCKED '{name}' in group chat")
         return ("That's private - I won't answer it here where everyone can see. "
@@ -4889,6 +5073,15 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return tool_show_skipped_email(sender_name)
     if name == "whats_open":
         return tool_whats_open(sender_name, sender_chat)
+    if name == "save_document":
+        return tool_save_document(tool_input["title"], tool_input.get("tags"),
+                                  sender_name)
+    if name == "list_documents":
+        return tool_list_documents()
+    if name == "get_document":
+        return tool_get_document(tool_input["id_or_title"], sender_chat)
+    if name == "delete_document":
+        return tool_delete_document(tool_input["id_or_title"])
     if name == "connect_link":
         return tool_connect_link(tool_input.get("person") or sender_name,
                                  tool_input.get("kind", "google"))
@@ -5147,6 +5340,22 @@ GUIDE_TOPICS = [
             "couple of days until you say \"done with the form\". (I stop a week "
             "past due, and I'll say so rather than nag forever.)",
             "\"what deadlines are you tracking?\" lists them.",
+        ],
+    },
+    {
+        "key": "files", "title": "The family filing cabinet",
+        "roles": ("adult",), "private_only": True,
+        "tools": ["save_document", "list_documents", "get_document",
+                  "delete_document"],
+        "summary": "Flyers, maps, forms and card photos I keep and hand back on demand.",
+        "body": [
+            "Send me a photo or PDF, then: \"file that as the camp map\", \"save "
+            "this as Lillian's insurance card\". I read it AND keep the original.",
+            "GET IT BACK: \"show me the camp map\", \"send me the insurance "
+            "card\" - I send the actual file, not a description.",
+            "\"what's in the files?\" lists everything; \"delete the camp map\" "
+            "removes one.",
+            "Private chat only - the files themselves can be personal.",
         ],
     },
     {
@@ -6248,7 +6457,10 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                    "conflict with something already scheduled, point that out. Then offer "
                    "any logistics help that follows - travel time, a pickup, or a meal "
                    "around the timing. Summarize what you found and ask before making "
-                   "changes. If it's a list, offer to save it.)")
+                   "changes. If it's a list, offer to save it. If the document "
+                   "itself is worth keeping - a map, schedule, form, or card - "
+                   "OFFER to file it in the family files (save_document); never "
+                   "file it without a yes.)")
     if doc_data:
         this_turn = {"role": "user", "content": [
             {"type": "document", "source": {"type": "base64",
@@ -6746,6 +6958,10 @@ async def telegram_webhook(request: Request):
         if fetched:
             image_data, image_media_type = fetched
             print(f"[tg] fetched photo ({image_media_type})")
+            if _gate_name:
+                _LAST_ATTACHMENT[_gate_name] = {"data": image_data,
+                                                "media_type": image_media_type,
+                                                "kind": "image", "ts": time.time()}
         if not text:
             text = "(sent a photo)"
 
@@ -6763,6 +6979,10 @@ async def telegram_webhook(request: Request):
                 doc_data, doc_media_type = b64, media_type
             else:  # an image sent as a file -> treat like a photo
                 image_data, image_media_type = b64, media_type
+            if _gate_name:
+                _LAST_ATTACHMENT[_gate_name] = {"data": b64,
+                                                "media_type": media_type,
+                                                "kind": kind, "ts": time.time()}
             if not text:
                 text = "(sent an attachment)"
         else:
