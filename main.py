@@ -7962,6 +7962,30 @@ def _calendar_context_for_triage(days=45):
            + "\n".join(lines[:60])
 
 
+def _surfaced_email_ids(person):
+    """Ids the poll has already finished processing for this person (surfaced, judged
+    unimportant, or skipped). Bounded JSON list in one settings row - the guard that
+    makes 'never notify the same email twice' true by IDENTITY, not by the model's
+    wording (Trap 115)."""
+    raw = get_setting(f"surfaced_email_ids_{person}") or ""
+    try:
+        return json.loads(raw) if raw.startswith("[") else []
+    except Exception:
+        return []
+
+
+def _mark_email_ids_surfaced(person, ids):
+    """Record ids as handled. Bounded to 300 - well past imap_unread's 3-day lookback,
+    so an id ages out of the guard only after it has already left the search window."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return
+    have = _surfaced_email_ids(person)
+    seen = set(have)
+    have += [i for i in ids if i not in seen]
+    set_setting(f"surfaced_email_ids_{person}", json.dumps(have[-300:]))
+
+
 def _poll_unread(person):
     """Newest unread across every inbox this person connected (Gmail + IMAP), normalized.
     The 'anything new?' check is a free provider call — Claude only runs if there IS new
@@ -8122,6 +8146,22 @@ def job_urgent_email_poll():
             pending_marks[key] = stream[0]["id"]
         if not fresh:
             continue  # nothing new in EITHER inbox -> no Claude call, no cost
+        # Trap 115: drop any email already handled in a previous poll, by ITS OWN id,
+        # before it can be re-triaged and re-notified under different model wording.
+        # The per-provider marker is the "how far have I read" cursor; this is the
+        # "have I already acted on THIS message" guard, immune to marker-window slips.
+        _handled = set(_surfaced_email_ids(name))
+        _pre = len(fresh)
+        fresh = [m for m in fresh if m.get("id") not in _handled]
+        if _pre != len(fresh):
+            print(f"[poll] {name}: skipped {_pre - len(fresh)} already-surfaced "
+                  f"email(s) (id-level dedupe)")
+        if not fresh:
+            # Everything new had already been handled - advance markers so we stop
+            # re-fetching them, and move on with no Claude call.
+            for _k, _v in pending_marks.items():
+                set_setting(_k, _v)
+            continue
         print(f"[poll] {name}: {len(fresh)} new "
               f"({sum(1 for m in fresh if m['id'].startswith('g:'))} gmail, "
               f"{sum(1 for m in fresh if m['id'].startswith('i:'))} outlook)")
@@ -8171,6 +8211,7 @@ def job_urgent_email_poll():
             # be triaged, so nothing can be lost - safe to mark this mail as seen.
             for _k, _v in pending_marks.items():
                 set_setting(_k, _v)
+            _mark_email_ids_surfaced(name, [m.get("id") for m in fresh])
             continue
         if not claude_call_allowed():
             print(f"[poll] {name}: Claude-call cap reached with {len(summaries)} new "
@@ -8241,10 +8282,13 @@ def job_urgent_email_poll():
                   f"markers left; these emails are retried next poll")
             continue
 
-        # Triage genuinely ran - NOW advance the per-provider markers (Trap 111). The
-        # item-level dedupe below still guarantees nothing is announced twice on a retry.
+        # Triage genuinely ran - NOW advance the per-provider markers (Trap 111), and
+        # record every email in this batch as handled by ID so it is never re-triaged
+        # or re-notified next poll (Trap 115). The content sig below stays as a
+        # secondary backstop, but identity is the guarantee.
         for _k, _v in pending_marks.items():
             set_setting(_k, _v)
+        _mark_email_ids_surfaced(name, [m.get("id") for m in fresh])
 
         # Record what this poll surfaced, so "what's in that email?" resolves right
         # after. Built from `considered` (the mail actually shown to the triage), never
