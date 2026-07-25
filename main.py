@@ -8167,17 +8167,46 @@ def job_urgent_email_poll():
                 print(f"[poll] {name}/{prov}: first scan - baseline set, {len(stream)} "
                       f"existing unread left unflagged")
                 continue
-            if stream[0]["id"] == seen:
-                continue                      # this inbox genuinely has nothing new
-            for m in stream:
-                if m["id"] == seen:
-                    break
-                fresh.append(m)
-            # Trap 111: do NOT advance the marker yet. It used to be advanced right
-            # here, so a cap hit, a failed model call, or an unparseable verdict further
-            # down marked this mail as seen without it ever being triaged - silently
-            # lost. The advance now happens only after the triage call succeeds.
-            pending_marks[key] = stream[0]["id"]
+            if prov == "imap":
+                # Trap 116 - the root cause of the daily repeats. The old logic broke
+                # the loop when it reached the exact `seen` id; but IMAP only returns
+                # UNSEEN mail, so once that boundary email was READ it vanished from the
+                # stream, the break never fired, and the ENTIRE unread backlog was
+                # reprocessed - re-flagging anything perpetually unread (an ignored
+                # J. Scott / 1776 email) every single day. UIDs are monotonic, so use a
+                # NUMERIC high-water mark: fresh = anything with a UID above the mark,
+                # and advance the mark to the highest UID seen. Immune to the boundary
+                # email disappearing, because it's a level, not a landmark.
+                def _uid(m):
+                    try:
+                        return int(str(m.get("id", "")).split(":", 1)[1])
+                    except (ValueError, IndexError):
+                        return -1
+                try:
+                    seen_uid = int(str(seen).split(":", 1)[1])
+                except (ValueError, IndexError):
+                    seen_uid = -1
+                newer = [m for m in stream if _uid(m) > seen_uid]
+                top = max((_uid(m) for m in stream), default=seen_uid)
+                if not newer:
+                    # Still advance to the highest UID present, so a read boundary
+                    # email can never drag the mark backwards.
+                    if top > seen_uid:
+                        pending_marks[key] = f"i:{top}"
+                    continue
+                fresh += newer
+                pending_marks[key] = f"i:{top}"
+            else:
+                if stream[0]["id"] == seen:
+                    continue                  # this inbox genuinely has nothing new
+                for m in stream:
+                    if m["id"] == seen:
+                        break
+                    fresh.append(m)
+                # Trap 111: advance only AFTER triage succeeds (committed below), so a
+                # cap hit / failed call / unparseable verdict cannot mark mail seen
+                # without it ever being triaged.
+                pending_marks[key] = stream[0]["id"]
         if not fresh:
             continue  # nothing new in EITHER inbox -> no Claude call, no cost
         # Trap 115: drop any email already handled in a previous poll, by ITS OWN id,
@@ -8187,9 +8216,10 @@ def job_urgent_email_poll():
         _handled = set(_surfaced_email_ids(name))
         _pre = len(fresh)
         fresh = [m for m in fresh if m.get("id") not in _handled]
-        if _pre != len(fresh):
-            print(f"[poll] {name}: skipped {_pre - len(fresh)} already-surfaced "
-                  f"email(s) (id-level dedupe)")
+        # Log the dedupe decision EVERY time (even 0 skipped), so if a repeat is ever
+        # reported again the log answers "did the id-guard see it?" without guessing.
+        print(f"[poll] {name}: {_pre} past the marker -> {len(fresh)} genuinely new, "
+              f"{_pre - len(fresh)} skipped as already-seen (id dedupe)")
         if not fresh:
             # Everything new had already been handled - advance markers so we stop
             # re-fetching them, and move on with no Claude call.
@@ -8575,6 +8605,9 @@ def start_scheduler():
     _schedule_digest_jobs()
     scheduler.start()
     print(f"[scheduler] started: reminders/min, briefing 6am, occasions 7am, weekly Sun 6pm, email poll/{poll_min}min, backup 3:30am (all sent PRIVATELY, never to the group)")
+    print("[boot] anti-repeat guards ACTIVE: IMAP high-water marker (Trap 116) + "
+          "per-email-id dedupe (Trap 115). A repeated email flag now logs "
+          "'skipped as already-seen'.")
 
 
 @app.get("/backup")
