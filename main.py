@@ -5748,6 +5748,22 @@ def _live_state_block(sender_name, sender_role, is_group):
                     "don't know which email they mean when it is listed here.")
         except Exception as e:
             print(f"[state] could not load recent flagged: {e}")
+        # Email flags QUEUED for the next digest but not yet delivered. This is what
+        # lets "any important emails?" answer honestly instead of "clear of flags"
+        # while things wait in the queue.
+        try:
+            pend = _pending_digest_headlines(sender_name)
+            if pend:
+                parts.append(
+                    "EMAIL FLAGS WAITING FOR THIS PERSON'S NEXT DIGEST (already "
+                    "triaged, queued to go out at the next digest time):\n"
+                    + "\n".join(f"  - {p}" for p in pend[:10]) +
+                    "\n  If they ask 'any important emails?' / 'anything I should "
+                    "know?', these ARE flagged - tell them what's waiting; never say "
+                    "the inbox is clear when this list is non-empty. Offer to send the "
+                    "digest now or act on any of them.")
+        except Exception as e:
+            print(f"[state] could not load pending digest: {e}")
         # Whether THIS person's own accounts are alive. Cheap (settings + one row each,
         # no network), and it closes a real hole: Kim asked "why do you think it needs to
         # reconnect?" and Guppi, having no idea, told her the connection seemed fine -
@@ -7996,6 +8012,27 @@ def _calendar_context_for_triage(days=45):
            + "\n".join(lines[:60])
 
 
+def _pending_digest_headlines(person):
+    """The first line of each block queued for this person's next digest - so the
+    live state can tell the model what is ALREADY waiting to go out. Without this,
+    'any important emails?' answered 'clear of flags' while items sat in the queue
+    (Jason's live report)."""
+    try:
+        conn = db()
+        rows = conn.execute("SELECT block FROM email_digest_queue WHERE person = ? "
+                            "ORDER BY id", (person,)).fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[state] could not read digest queue: {e}")
+        return []
+    out = []
+    for r in rows:
+        first = (r["block"] or "").splitlines()[0].strip("* ").strip()
+        if first:
+            out.append(first)
+    return out
+
+
 def _surfaced_email_ids(person):
     """Ids the poll has already finished processing for this person (surfaced, judged
     unimportant, or skipped). Bounded JSON list in one settings row - the guard that
@@ -8296,9 +8333,21 @@ def job_urgent_email_poll():
                     f"You are given each new email (sender, subject, when it was received, a "
                     f"snippet) AND the family's upcoming calendar. For EACH email decide if "
                     f"it is worth surfacing. Surface anything with a date, deadline, "
-                    f"appointment, RSVP, payment, form, or from a [PRIORITY SENDER]. IGNORE "
-                    f"marketing, promotions, newsletters, and routine notifications (unless "
-                    f"[PRIORITY SENDER]).\n\n"
+                    f"appointment, RSVP, payment, or form; a CHANGE, CANCELLATION, "
+                    f"RESCHEDULE, or CLOSURE affecting the family's plans (a canceled "
+                    f"activity, a moved practice, a school closing early, a venue "
+                    f"change) - these matter even with no deadline, because a parent "
+                    f"has to react; anything the sender themselves marks urgent or "
+                    f"important; or anything from a [PRIORITY SENDER]. A subject like "
+                    f"'important update' or 'schedule change' is a SIGNAL to look, not a "
+                    f"reason to skip. IGNORE marketing, promotions, newsletters, sales, "
+                    f"and routine automated notifications (unless [PRIORITY SENDER]).\n\n"
+                    f"URGENT vs the digest: put it in 'urgent' (sent to them right away) "
+                    f"when it is TIME-SENSITIVE - a change or cancellation to something "
+                    f"happening TODAY or TOMORROW, a same-day closure, a safety issue, "
+                    f"or a bill due within a day. Everything else goes in 'items' for "
+                    f"the next digest. A canceled sleepover tonight is urgent; a form "
+                    f"due in three weeks is an item.\n\n"
                     f"For every email you surface, CROSS-CHECK any event it describes against "
                     f"the calendar above and set cal_status to exactly one of:\n"
                     f"  not_on  - the event is not on the calendar\n"
