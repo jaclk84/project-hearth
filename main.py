@@ -3238,6 +3238,27 @@ def _glossary_block(header="THE FAMILY'S CALENDAR/EMAIL SHORTHAND"):
 
 
 def tool_remember(fact, about, added_by):
+    # Trap 119: keep recurring dates and calendar shorthand OUT of plain memory. The
+    # model has buried birthdays in memory (where they fire no reminders) and shorthand
+    # in memory (where email triage never sees it) for a long time despite the prompt
+    # asking otherwise. Prompts are suggestions; this is the guarantee - refuse and
+    # redirect, so the data lands in the table that actually uses it.
+    f = (fact or "").lower()
+    if re.search(r"\b(birthday|anniversary)\b", f):
+        return ("Hold on - a birthday or anniversary is a RECURRING DATE and belongs "
+                "in occasions, not plain memory, so it fires the escalating reminders. "
+                "Call add_occasion now (kind birthday/anniversary, with the month and "
+                "day). If it's a one-off party rather than the annual date, use "
+                "add_calendar_event instead. Do NOT tell the user it's saved until you "
+                "have called one of those.")
+    if re.search(r"\b(means|stands for|short for|shorthand|abbreviation)\b", f) \
+            or " = " in (fact or ""):
+        return ("That looks like calendar/email shorthand - an abbreviation and what "
+                "it means. Save it with add_glossary_term (term + meaning) now, NOT "
+                "memory, so it's understood everywhere INCLUDING in email. Do NOT tell "
+                "the user it's saved until you have called add_glossary_term. (If it is "
+                "genuinely a plain fact and not shorthand, rephrase it without the word "
+                "'means' and I'll keep it in memory.)")
     conn = db()
     conn.execute("INSERT INTO memories (fact, about, added_by, created_at) VALUES (?,?,?,?)",
                  (fact, about, added_by, now_local().isoformat()))
@@ -8820,4 +8841,16 @@ try:
     _audit_guide_coverage()
 except Exception as e:
     print(f"[guide] coverage audit failed: {e}")
+try:
+    _cc = db()
+    _g = _cc.execute("SELECT COUNT(*) FROM glossary").fetchone()[0]
+    _o = _cc.execute("SELECT COUNT(*) FROM occasions").fetchone()[0]
+    _m = _cc.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    _l = _cc.execute("SELECT COUNT(DISTINCT list_name) FROM list_items").fetchone()[0]
+    _cc.close()
+    print(f"[data] on this volume: glossary={_g} terms, occasions={_o}, "
+          f"memories={_m}, lists={_l}. If glossary/occasions unexpectedly read 0, the "
+          f"data was routed to memory - see 'what do you remember'.")
+except Exception as _e:
+    print(f"[data] startup count failed: {_e}")
 start_scheduler()
