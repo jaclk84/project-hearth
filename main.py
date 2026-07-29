@@ -5981,6 +5981,14 @@ not storage.
   dates, or a "heads up", pass those on exactly - don't soften "you and Kim" into "you" or
   drop a caveat.
 
+- A REPLY TO WHAT YOU JUST SENT refers to what you just sent. Your own recent messages
+  (a digest, an alert, a reminder, an offer) are in the conversation above. When the
+  person answers with "yes", "do it", "that one", "reply to that", "stay on me", or names
+  no subject at all, resolve it from YOUR last message - the email you flagged, the offer
+  you made, the item you listed - and act on it. Do NOT ask them to repeat what you
+  already have in front of you; only ask if your own last message genuinely doesn't
+  identify it.
+
 - DO WHAT WAS ASKED FIRST. Handle and confirm the actual request before adding any
   unprompted observation; an aside ("your calendar isn't connected") must never replace
   what they asked for.
@@ -6167,6 +6175,8 @@ def send_message(chat_id, body, markdown=True, proactive=False):
     if res is not None:
         if proactive:
             bump_count("messages")   # only unprompted messages count toward the cap
+            # Trap 118: record what we said on our own, so a reply to it has context.
+            save_assistant_turn(chat_id, body)
         print(f"[tg] sent to {chat_id}: {body[:60]}")
         return True
     return False
@@ -6530,6 +6540,19 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     # keep it clean). This is what lets "yes" refer to Guppi's last message.
     history = get_history(hist_key)
     messages = history + [this_turn]
+    # Proactive messages saved to history (Trap 118) can put two assistant turns in a
+    # row; the Messages API wants alternating roles. Coalesce consecutive PLAIN-TEXT
+    # same-role turns (never touch an image/document turn, whose content is a list).
+    coalesced = []
+    for _m in messages:
+        if (coalesced and coalesced[-1]["role"] == _m["role"]
+                and isinstance(coalesced[-1]["content"], str)
+                and isinstance(_m["content"], str)):
+            coalesced[-1] = {"role": _m["role"],
+                             "content": coalesced[-1]["content"] + "\n\n" + _m["content"]}
+        else:
+            coalesced.append(_m)
+    messages = coalesced
 
     tools = tools_for_role(sender_role, is_group)
     # B4: in overheard mode the prompt says "do NOT record or add anything - just offer",
@@ -6686,6 +6709,31 @@ def save_history(chat_id, user_text, assistant_text):
         conn.commit(); conn.close()
     except Exception as e:
         print(f"[history] save failed for {key}: {e}")
+
+
+def save_assistant_turn(chat_id, text):
+    """Record a message Guppi SENT ON ITS OWN (a digest, an urgent alert, a tickler
+    nudge, a reminder) into the chat's history, so the person's reply - 'yes', 'that
+    one', 'reply to it', 'stay on me' - resolves against what Guppi just offered
+    instead of arriving with no context (Trap 118). Private chats only: a group's
+    history is shared and proactive messages never go there anyway."""
+    key = str(chat_id)
+    if key.startswith("-"):
+        return                       # a group chat id - never record proactive there
+    try:
+        hist = get_history(key)
+        hist.append({"role": "assistant", "content": text})
+        _HISTORY[key] = hist[-(_HISTORY_TURNS * 2):]
+        conn = db()
+        conn.execute("INSERT INTO chat_history (chat_id, role, content, created_at) "
+                     "VALUES (?,?,?,?)", (key, "assistant", text, now_local().isoformat()))
+        conn.execute(
+            "DELETE FROM chat_history WHERE chat_id = ? AND id NOT IN "
+            "(SELECT id FROM chat_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?)",
+            (key, key, _HISTORY_TURNS * 2))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[history] proactive save failed for {key}: {e}")
 
 
 @app.get("/")
