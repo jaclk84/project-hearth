@@ -3534,6 +3534,19 @@ def tool_add_occasion(title, kind, month, day, year=None, scope="family",
     # for_chat NULL => all parents get it (family); a specific chat => only that person.
     for_chat = str(creator_chat) if (scope == "just_me" and creator_chat) else None
     conn = db()
+    # Duplicate guard (Trap 121): the same title on the same date is already tracked -
+    # don't add a second and double the reminders. Title matched case-insensitively.
+    dup = conn.execute(
+        "SELECT id FROM occasions WHERE LOWER(TRIM(title)) = LOWER(TRIM(?)) "
+        "AND kind = ? AND month = ? AND day = ? AND "
+        "((year IS NULL AND ? IS NULL) OR year = ?)",
+        (title, kind, month, day, year, year)).fetchone()
+    if dup:
+        conn.close()
+        when = datetime.date(2000, month, day).strftime("%B %-d")
+        return (f"Already tracking {title} ({kind}) on {when} (id {dup['id']}) - I did "
+                f"NOT add a second one. Tell the user it was already saved rather than "
+                f"claiming a new one.")
     conn.execute(
         "INSERT INTO occasions (title, kind, month, day, year, for_chat, notes, "
         "created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -8874,7 +8887,33 @@ def set_webhook(secret: str = ""):
     return {"ok": res is not None, "result": res}
 
 
+def _dedup_occasions():
+    """Remove EXACT-duplicate occasions (same title+kind+month+day+year), keeping the
+    earliest id. Safe: only collapses genuine duplicates - the four 'Federal tax
+    installment due' entries on different months are NOT duplicates and are kept.
+    Runs at boot so the doubles created by the pre-Batch-17 re-add are cleaned up."""
+    try:
+        conn = db()
+        rows = conn.execute(
+            "SELECT id, LOWER(TRIM(title)) t, kind, month, day, "
+            "COALESCE(year,'') y FROM occasions ORDER BY id").fetchall()
+        seen, gone = {}, 0
+        for r in rows:
+            sig = (r["t"], r["kind"], r["month"], r["day"], r["y"])
+            if sig in seen:
+                conn.execute("DELETE FROM occasions WHERE id = ?", (r["id"],))
+                gone += 1
+            else:
+                seen[sig] = r["id"]
+        conn.commit(); conn.close()
+        if gone:
+            print(f"[data] removed {gone} duplicate occasion(s) (kept one of each)")
+    except Exception as e:
+        print(f"[data] occasion dedup failed: {e}")
+
+
 init_db()
+_dedup_occasions()
 try:
     _audit_guide_coverage()
 except Exception as e:
