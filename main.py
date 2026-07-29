@@ -5752,6 +5752,44 @@ def _live_state_block(sender_name, sender_role, is_group):
     except Exception as e:
         print(f"[state] could not load memories: {e}")
 
+    # OCCASIONS - the tracked recurring dates. Injected here (like memory) so the model
+    # SEES them every turn and cannot answer "I'm not tracking any occasions" without
+    # looking - the same false-negative the memory block was built to kill (Trap 120).
+    try:
+        today = now_local().date()
+        conn = db()
+        occ_rows = conn.execute(
+            "SELECT id, title, kind, month, day, year FROM occasions").fetchall()
+        conn.close()
+        upcoming = []
+        for r in occ_rows:
+            try:
+                nd = _occasion_next_date(r["month"], r["day"], r["year"], today)
+            except Exception:
+                nd = None
+            if nd:
+                upcoming.append(((nd - today).days, r["id"], r["title"], r["kind"], nd))
+        if upcoming:
+            upcoming.sort()
+            lines = "\n".join(
+                f"  [{oid}] {title} ({kind}) - {nd.strftime('%b %-d')}, "
+                f"{days} day{'s' if days != 1 else ''} away"
+                for days, oid, title, kind, nd in upcoming[:30])
+            parts.append(
+                "OCCASIONS YOU ARE TRACKING (live from the database, this turn):\n"
+                + lines +
+                "\n  These ARE the special dates you track (birthdays, anniversaries, "
+                "vacations, renewals). If asked 'what occasions/dates are you tracking' "
+                "or 'when is X's birthday', answer from THIS list - never say you track "
+                "none when entries appear here. The bracketed numbers are ids for "
+                "delete_occasion.")
+        else:
+            parts.append("YOU ARE TRACKING NO OCCASIONS RIGHT NOW (live from the "
+                         "database). If someone teaches a birthday/anniversary/vacation/"
+                         "renewal, save it with add_occasion.")
+    except Exception as e:
+        print(f"[state] could not load occasions: {e}")
+
     if sender_role == "adult":
         # What the email poll most recently flagged for this person, so an immediate
         # "what's in that email?" / "read the pickup one" resolves without them having to
