@@ -5308,7 +5308,9 @@ GUIDE_TOPICS = [
             "things and emails I'm watching for still come immediately.",
             "ALWAYS TELL ME: \"always flag emails from the school\", \"the coach is "
             "important\".",
-            "NEVER TELL ME: \"never flag newsletters\", \"ignore Robinhood\".",
+            "NEVER TELL ME: \"never flag newsletters\", \"ignore Robinhood\", "
+            "\"ignore Zelle payments to Breanna\" - I match the sender AND the "
+            "subject, so a name in the subject line works too.",
             "STOP CHASING DEADLINES FROM ONE SENDER: \"stop flagging deadlines from "
             "Todoist\" - different from ignoring them entirely.",
             "SEE THE RULES: \"what are my email priorities?\"",
@@ -7397,8 +7399,8 @@ def tool_manage_deadline_ignores(action, sender=None):
             return f"I was already ignoring {key} for deadline alerts."
         current.append(key)
         set_setting("deadline_ignore_senders", "|".join(current[:50]))
-        return (f"Done - I'll no longer flag deadlines from emails matching \"{key}\". "
-                f"You can undo this by saying 'stop ignoring {key}'.")
+        return (f"Done - I'll no longer flag emails matching \"{key}\" in the sender "
+                f"or subject. You can undo this by saying 'stop ignoring {key}'.")
     if action == "remove":
         if key not in current:
             return f"I wasn't ignoring {key}."
@@ -8289,9 +8291,15 @@ def job_urgent_email_poll():
         for m in fresh:
             frm = (m.get("from") or "").lower()
             is_priority = any(p in frm for p in priority)
-            # Ignore filter applies UNLESS the sender is explicitly a priority (explicit
-            # priority always wins over ignore).
-            if not is_priority and any(bad in frm for bad in ignore):
+            # Ignore matches the SENDER or the SUBJECT (Trap 117). Kim's "ignore Zelle
+            # about Breanna" stored 'breanna garcia', but that name is the PAYEE in the
+            # subject, not the sender (Zelle mail comes from the bank) - so a
+            # sender-only match never fired and she kept getting the alert. Subject is
+            # where a payee/topic lives; the body is deliberately NOT searched, to keep
+            # this from over-suppressing (e.g. a school note that merely mentions the
+            # name). Explicit PRIORITY (sender) still wins over ignore.
+            ignore_hay = f"{frm} {(m.get('subject') or '').lower()}"
+            if not is_priority and any(bad in ignore_hay for bad in ignore):
                 skipped.append({"from": m.get("from", ""), "subject": m.get("subject", ""),
                                 "received": m.get("received", "")})
                 continue
@@ -8347,7 +8355,10 @@ def job_urgent_email_poll():
                     f"happening TODAY or TOMORROW, a same-day closure, a safety issue, "
                     f"or a bill due within a day. Everything else goes in 'items' for "
                     f"the next digest. A canceled sleepover tonight is urgent; a form "
-                    f"due in three weeks is an item.\n\n"
+                    f"due in three weeks is an item. A payment/transfer that ALREADY "
+                    f"HAPPENED (a Zelle/Venmo confirmation, a receipt, 'your payment "
+                    f"was sent', a charge notice) is NOT urgent and usually not even an "
+                    f"item - it is a record of something done, needing no action.\n\n"
                     f"For every email you surface, CROSS-CHECK any event it describes against "
                     f"the calendar above and set cal_status to exactly one of:\n"
                     f"  not_on  - the event is not on the calendar\n"
