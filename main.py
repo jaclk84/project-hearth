@@ -7188,6 +7188,35 @@ async def telegram_webhook(request: Request):
             print(f"[guide] served menu to {name} (natural-language ask)")
             return {"ok": True}
 
+    # ---- Glossary VIEW, model-free (Trap 123) -----------------------------------
+    # "what's in the glossary" used to get a paraphrase of the block header instead of
+    # the entries; "show me the glossary" got the list. Guarantee the list on either.
+    # Only VIEW phrasings - a write ('add ... means ...', 'forget JA') still goes to
+    # the model. Everyone may view the shared glossary, in private or group.
+    _gl = re.sub(rf"^(hey |ok )?({'|'.join(_BOT_NAMES)})[,: ]+", "", _t).strip("?!. ")
+    _GLOSSARY_VIEW = (
+        "what is in the glossary", "what's in the glossary", "whats in the glossary",
+        "what is in glossary", "whats in glossary", "show me the glossary",
+        "show the glossary", "show glossary", "list the glossary", "list glossary",
+        "the family glossary", "what is the glossary", "what's the glossary",
+        "whats the glossary", "family glossary", "view glossary", "my glossary",
+        "what shorthand do you know", "what shorthand do you have",
+        "what shorthand do we have", "what abbreviations do you know",
+        "what does the glossary say", "whats in the family glossary",
+        "what is in the family glossary")
+    _is_write = any(w in _gl for w in
+                    (" means ", " stands for", "add ", "remove", "delete", "forget",
+                     "=", "update"))
+    if not _is_write and (_gl in _GLOSSARY_VIEW
+                          or (("glossary" in _gl or "shorthand" in _gl)
+                              and any(_gl.startswith(v) for v in
+                                      ("what", "show", "list", "view")))):
+        name, role = identify_sender(sender_chat_id)
+        if role in ("adult", "caregiver", "child"):
+            send_message(chat_id, tool_list_glossary())
+            print(f"[glossary] served list to {name or 'unknown'} (model-free view)")
+            return {"ok": True}
+
     _t = text.strip().lower()
     if _t in ("/help", "/menu") or (not is_group and _t in ("help", "menu")):
         name, role = identify_sender(sender_chat_id)
