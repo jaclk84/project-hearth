@@ -6752,6 +6752,7 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
     system = build_system_prompt(sender_name, sender_role, is_group)
 
     tools_ran = []
+    tool_texts = []   # user-facing tool result strings, for the empty-reply fallback
     # 800 was too low the moment email reading started returning real content. A request
     # like "add the 4 camp days and include the details" has to emit four tool calls, each
     # carrying a details block drawn from a 4,000-char email - that blows past 800 tokens
@@ -6802,6 +6803,9 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                         out = (f"That didn't work just now ({block.name} ran into a "
                                f"problem). Let the user know and offer to try again.")
                     tools_ran.append(block.name)
+                    tool_texts.append(out if isinstance(out, str)
+                                      else (out.get("text", "") if isinstance(out, dict)
+                                            else ""))
                     # A tool normally returns a plain string. read_email may instead return
                     # {"text": ..., "images": [...]} when the email carried a picture worth
                     # looking at - a parking map, a schedule graphic, a flyer. The API
@@ -6830,7 +6834,23 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
             # report failure for a turn that succeeded.
             if tools_ran:
                 print(f"[guppi] empty reply after tools ran: {tools_ran}")
-                reply = "Done - that's taken care of."
+                # Trap 124: relay what the tools SAID (a draft preview, an ignore
+                # confirmation) rather than a generic "Done - that's taken care of",
+                # which swallowed the draft and implied an email had been sent. Skip
+                # any tool output written AT the model, so nothing internal leaks.
+                _INTERNAL = ("tell the user", "do not tell", "never claim",
+                             "say it was already", "[truncated", "rather than claiming",
+                             "never say the", "do it now", "relay ", "do NOT ".lower(),
+                             "instead rather", "so it fires", "call add_")
+                clean = [t.strip() for t in tool_texts
+                         if isinstance(t, str) and t.strip()
+                         and not any(m in t.lower() for m in _INTERNAL)]
+                if clean:
+                    reply = "\n\n".join(clean[-3:])
+                else:
+                    # Nothing safe to show verbatim - acknowledge WITHOUT implying an
+                    # email was sent (the send gate is separate and explicit).
+                    reply = "Okay - I've done that. Anything else?"
             else:
                 # Don't blame the person's phrasing for the model returning nothing.
                 print(f"[guppi] empty reply, no tools ran, "
@@ -7215,6 +7235,32 @@ async def telegram_webhook(request: Request):
         if role in ("adult", "caregiver", "child"):
             send_message(chat_id, tool_list_glossary())
             print(f"[glossary] served list to {name or 'unknown'} (model-free view)")
+            return {"ok": True}
+
+    # ---- Show the pending email DRAFT, model-free (Trap 124) --------------------
+    # "Show draft" kept returning "Done - that's taken care of" (the model re-ran
+    # draft_email then said nothing). Re-display the STORED pending draft directly -
+    # reliable, private only, and it never implies the email was sent.
+    if not is_group and _gl in (
+            "show draft", "show the draft", "show me the draft", "see the draft",
+            "show the email draft", "show me the email draft", "show the email",
+            "what's the draft", "whats the draft", "what is the draft",
+            "read the draft", "read me the draft"):
+        name, role = identify_sender(sender_chat_id)
+        if role in ("adult", "caregiver"):
+            pend = _PENDING_EMAIL.get(name)
+            if pend:
+                send_message(chat_id,
+                    "Here's the draft (nothing sent yet - say \"send it\" to send, or "
+                    "tell me what to change):\n\n"
+                    f"To: {pend.get('to','')}\n"
+                    f"Subject: {pend.get('subject','(no subject)')}\n\n"
+                    f"{pend.get('body','')}")
+            else:
+                send_message(chat_id,
+                    "You don't have an email draft waiting. Tell me what to say and who "
+                    "it's for, and I'll draft it first.")
+            print(f"[draft] served pending draft to {name or 'unknown'} (model-free)")
             return {"ok": True}
 
     _t = text.strip().lower()
