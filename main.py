@@ -7263,6 +7263,27 @@ async def telegram_webhook(request: Request):
             print(f"[draft] served pending draft to {name or 'unknown'} (model-free)")
             return {"ok": True}
 
+    # ---- Send a pending draft, model-free (Trap 125) ---------------------------
+    # "Send it" must ACTUALLY send. The model once replied "Sent." without calling the
+    # send tool at all. Here, when a draft is genuinely pending and the message is a
+    # bare send confirmation, call send_pending_email directly and relay its real
+    # result - so a send can never be hallucinated, and the confirmation is the truth.
+    # Only bare confirmations qualify; anything longer ("send it and also...") goes to
+    # the model so nothing else is dropped.
+    if not is_group:
+        _sname, _srole = identify_sender(sender_chat_id)
+        if (_srole in ("adult", "caregiver") and _sname
+                and _PENDING_EMAIL.get(_sname)
+                and _looks_like_send_confirmation(text.strip())):
+            # Stamp a fresh turn so the H4 same-turn guard (draft must have been shown
+            # in a PRIOR turn) passes correctly - this bare "send it" IS a later turn.
+            _CURRENT_TURN[_sname] = f"send-intercept:{time.time()}"
+            _res = tool_send_pending_email(_sname, text.strip())
+            send_message(chat_id, _res)
+            save_assistant_turn(chat_id, _res)
+            print(f"[draft] model-free send for {_sname}: {_res[:50]!r}")
+            return {"ok": True}
+
     _t = text.strip().lower()
     if _t in ("/help", "/menu") or (not is_group and _t in ("help", "menu")):
         name, role = identify_sender(sender_chat_id)
