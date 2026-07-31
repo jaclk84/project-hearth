@@ -3516,6 +3516,35 @@ def tool_add_reminder(text, due_iso, for_chat, created_by, repeat="none"):
     return f"Reminder set — I'll remind you {humanize_when(due_iso)}: {text}{tail}."
 
 
+def tool_message_person(target, message, sender_name, sender_role):
+    """Relay a message to another family member's Telegram RIGHT NOW (parents only).
+    Different from nudge, which schedules a reminder for later. The message lands in
+    the recipient's PRIVATE chat, attributed to who asked, and is recorded in their
+    history so a reply ('which hotel?') has context."""
+    if sender_role != "adult":
+        return "Only a parent can send a message to someone else."
+    if not (message or "").strip():
+        return "What would you like me to tell them?"
+    people = resolve_targets(target)
+    if not people:
+        return (f"{target} isn't set up with me yet, so I can't message them. A parent "
+                f"can invite them, then they send me /start.")
+    who = sender_name or "A parent"
+    body = f"{who} asked me to pass this along:\n\n{message.strip()}"
+    sent, missed = [], []
+    for name, chat in people:
+        if chat and send_message(chat, body, proactive=True):
+            sent.append(name)
+        else:
+            missed.append(name)
+    if not sent:
+        return "I couldn't reach them just now - I'll not have delivered that."
+    line = f"Sent to {', '.join(sent)}."
+    if missed:
+        line += f" (Couldn't reach {', '.join(missed)}.)"
+    return line
+
+
 def tool_nudge(target, text, due_iso, created_by, sender_role, repeat="none"):
     """Set a reminder FOR someone else (or a group). Parents only for others; anyone
     can effectively remind themselves via the normal add_reminder path."""
@@ -4885,6 +4914,22 @@ def tools_for_role(role, is_group=False):
                 "repeat": {"type": "string"}},
                 "required": ["target", "text", "due_iso"]}})
         tools.append({
+            "name": "message_person",
+            "description": ("Send a message to another family member's Telegram RIGHT "
+                            "NOW (parents only). Use for 'tell Kim ...', 'let Kim know "
+                            "...', 'message the girls that ...', 'send Kim a note "
+                            "saying ...'. target is a name ('Kim') or a group ('the "
+                            "girls', 'the kids'). This is IMMEDIATE - for a reminder at "
+                            "a later time use nudge instead; for an EMAIL use "
+                            "draft_email. It goes to their private chat and I'll say who "
+                            "it's from."),
+            "input_schema": {"type": "object", "properties": {
+                "target": {"type": "string",
+                           "description": "Who to message - a name or group alias."},
+                "message": {"type": "string",
+                            "description": "What to tell them, in the sender's words."}},
+                "required": ["target", "message"]}})
+        tools.append({
             "name": "invite_person",
             "description": ("Invite a family member (child or caregiver) to use Guppi. "
                             "Give their name; they then send /start to the bot and get "
@@ -5277,6 +5322,9 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "nudge":
         return tool_nudge(tool_input["target"], tool_input["text"], tool_input["due_iso"],
                           sender_name, sender_role, tool_input.get("repeat", "none"))
+    if name == "message_person":
+        return tool_message_person(tool_input["target"], tool_input["message"],
+                                   sender_name, sender_role)
 
     if name == "add_to_list":
         return tool_add_to_list(tool_input["list_name"], tool_input["item"], sender_name)
@@ -5393,7 +5441,8 @@ GUIDE_TOPICS = [
     {
         "key": "reminders", "title": "Reminders and nudges",
         "roles": ("adult", "caregiver", "child"), "private_only": False,
-        "tools": ["add_reminder", "list_reminders", "delete_reminder", "nudge"],
+        "tools": ["add_reminder", "list_reminders", "delete_reminder", "nudge",
+                  "message_person"],
         "summary": "Get pinged about something - yourself, or someone else in the family.",
         "body": [
             "FOR YOURSELF: \"remind me to call the dentist Thursday at 10am\", "
@@ -5401,6 +5450,10 @@ GUIDE_TOPICS = [
             "REPEATING: \"every Sunday at 7pm remind me to take out the recycling\".",
             "FOR SOMEONE ELSE (parents only): \"remind the girls about permission slips "
             "tomorrow at 7:30am\", \"remind Kim at 5 to collect the prescription\".",
+            "MESSAGE SOMEONE NOW (parents): \"tell Kim the hotel is booked\", \"let "
+            "the girls know dinner is at 6\" - I send it to their Telegram right away "
+            "and say it's from you. (For a later reminder use \"remind\"; for an email "
+            "say \"email\".)",
             "SEE AND REMOVE: \"what reminders do I have?\", \"delete the recycling one\".",
             "If you ask twice for the same thing at the same time I won't create a second "
             "one - I'll tell you it's already set.",
