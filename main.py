@@ -3366,7 +3366,8 @@ def tool_list_glossary():
     out = ["Here's the calendar/email shorthand I know:"]
     for cat, items in _grouped_glossary(rows):
         out.append(f"\n{cat}")
-        out.extend(f"  [{r['id']}] {r['term']} = {r['meaning']}" for r in items)
+        # IDs are kept internal (they confused the user); remove works by term name.
+        out.extend(f"  {r['term']} = {r['meaning']}" for r in items)
     return "\n".join(out)
 
 
@@ -3402,6 +3403,117 @@ def _glossary_block(header="THE FAMILY'S CALENDAR/EMAIL SHORTHAND"):
     return (f"{header} (use these to interpret entries; they are the household's own "
             f"abbreviations, but never let a shorthand override an explicit time on the "
             f"calendar):\n" + "\n".join(lines))
+
+
+# ---- Batch 25: make teaching a definition actually save ----------------------------
+# The model has replied "Got it, I've saved those" to "PowerSchool is..." and
+# "Lily's friends = ..." WITHOUT calling add_glossary_term - so the terms were lost
+# (proven by the boot count not moving). Two guards close that gap:
+#   * _glossary_capture: when a whole message is explicit definitions, save them
+#     deterministically in the webhook (a guarantee, model-free).
+#   * _looks_like_teaching + _claims_saved: an honesty backstop in ask_guppi that
+#     stops Guppi claiming a save it never made (covers the ambiguous "X is Y" form).
+_GLOSSARY_FILLER = {
+    "", "add the following to the glossary", "add the following", "add these",
+    "add these to the glossary", "add this to the glossary", "add to the glossary",
+    "add to glossary", "for the glossary", "to the glossary", "glossary",
+    "please add these", "here are some", "note these", "remember these",
+    "save these to the glossary", "here you go", "and", "also",
+}
+_QUESTION_LEADS = ("what", "who", "where", "when", "why", "how", "does", "do",
+                   "is", "are", "can", "could", "should", "will", "would")
+
+
+def _clean_term(term):
+    """Trim a parsed term of command lead-ins and quotes so 'add to glossary that SRS'
+    -> 'SRS' and 'on the calendar JA' -> 'JA'. Strips repeatedly, longest first."""
+    t = (term or "").strip().strip(":").strip().strip('"').strip("'").strip()
+    leads = ("add to the glossary that ", "add to glossary that ",
+             "add to the glossary ", "add to glossary ", "add the following ",
+             "add these ", "please add ", "add that ", "add ", "note that ", "note ",
+             "remember that ", "remember ", "save that ", "save ",
+             "for the glossary ", "glossary ", "on the calendar, ", "on the calendar ",
+             "in emails ", "in email ", "the term ", "the word ", "also ", "and ")
+    changed = True
+    while changed:
+        changed = False
+        for lead in leads:
+            if t.lower().startswith(lead):
+                t = t[len(lead):].strip()
+                changed = True
+                break
+    return t
+
+
+def _parse_one_definition(clause):
+    """Parse a single clause into (term, meaning) for the EXPLICIT forms only:
+    'TERM = MEANING', 'TERM means MEANING', 'TERM stands for MEANING'. None otherwise."""
+    c = (clause or "").strip()
+    term = meaning = None
+    if "=" in c:
+        term, meaning = c.split("=", 1)
+    else:
+        m = re.search(r"\bstands for\b", c, re.I) or re.search(r"\bmeans\b", c, re.I)
+        if m:
+            term, meaning = c[:m.start()], c[m.end():]
+    if term is None:
+        return None
+    term = _clean_term(term)
+    meaning = (meaning or "").strip().strip(".,;").strip()
+    if not term or not meaning:
+        return None
+    if len(term) > 40 or len(term.split()) > 5:
+        return None
+    if term.split()[0].lower() in _QUESTION_LEADS:   # it was a question, not a teaching
+        return None
+    # A tacked-on second request ("...Lillian, and remind me to call the dentist") means
+    # this is a MIXED message, not a clean definition - hand the whole thing to the model
+    # so the reminder/scheduling part isn't dropped. Precise: only "and <verb>".
+    if re.search(r"\band\s+(remind|schedule|email|send|text|call|add|put|set|draft|"
+                 r"book|cancel|create|make)\b", meaning, re.I):
+        return None
+    return (term, meaning)
+
+
+def _glossary_capture(text):
+    """If a message is ENTIRELY explicit definitions (plus filler like 'add to the
+    glossary'), return [(term, meaning), ...]. Otherwise [] - so a mixed message
+    ('Lily means Lillian, and remind me...') or the ambiguous 'X is Y' form falls
+    through to the model untouched."""
+    t = (text or "").strip()
+    if not t or "?" in t:
+        return []
+    parts = re.split(r"[\n;]+|\.\s+", t)
+    defs = []
+    for raw in parts:
+        clause = raw.strip().strip(".").strip()
+        if clause.lower().strip(":.") in _GLOSSARY_FILLER:
+            continue
+        d = _parse_one_definition(clause)
+        if not d:
+            return []            # a non-definition, non-filler clause -> hand to the model
+        defs.append(d)
+    return defs
+
+
+def _looks_like_teaching(text):
+    """Broad detector (incl. the 'X is a/the/our Y' form) for the honesty backstop."""
+    if not text or "?" in text:
+        return False
+    return bool(re.search(r"\bmeans\b|\bstands for\b|=|"
+                          r"\bis (the|a|an|our|my|his|her|their) ",
+                          text.lower()))
+
+
+def _claims_saved(reply):
+    """Does the reply assert it stored something? (Used only alongside 'no save tool ran'
+    and a teaching-shaped message, so the triple gate keeps false positives rare.)"""
+    low = (reply or "").lower()
+    return any(p in low for p in (
+        "saved", "i've saved", "ive saved", "i have saved", "added to the glossary",
+        "added that", "i have that", "i've got that", "ive got that", "i've added",
+        "ive added", "i've noted", "ive noted", "noted that", "i'll remember",
+        "ill remember", "in the glossary", "got it. i have", "got it, i have"))
 
 
 def tool_remember(fact, about, added_by):
@@ -4984,8 +5096,8 @@ def tools_for_role(role, is_group=False):
                 "required": ["term"]}})
         tools.append({
             "name": "remove_glossary_term",
-            "description": ("Remove a shorthand definition. Pass the term or its id (from "
-                            "list_glossary)."),
+            "description": ("Remove a shorthand definition. Pass the term itself (e.g. "
+                            "'JA'); an id also works if you have one."),
             "input_schema": {"type": "object", "properties": {
                 "term_or_id": {"type": "string"}}, "required": ["term_or_id"]}})
         tools.append({
@@ -6998,6 +7110,20 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                       f"stop_reason={response.stop_reason}")
                 reply = ("I didn't manage to put an answer together for that one. Try "
                          "rephrasing it, or break it into smaller steps.")
+        # ---- Honesty backstop (Batch 25) --------------------------------------
+        # A definition-shaped message ("PowerSchool is the school's portal") must not be
+        # answered with a false "saved"/"I have that" when no save tool actually ran.
+        # Replace that claim with an honest nudge to phrase it so it WILL save. Gated by
+        # three conditions together, so ordinary replies are never rewritten.
+        if (_looks_like_teaching(user_message)
+                and not any(t in ("add_glossary_term", "remember", "add_occasion")
+                            for t in tools_ran)
+                and _claims_saved(reply)):
+            reply = ("I didn't actually save that. Say it as \"X means Y\" - for example "
+                     "\"PowerSchool means the school's parent portal\" - and I'll file it "
+                     "in the glossary.")
+            print("[glossary] honesty backstop: claimed a save with no save tool -> nudge")
+
         # Remember this exchange for next time (store the raw user text, not the
         # time-hint wrapper, so history stays readable and doesn't pile up stale clocks).
         placeholder = "(sent a photo)" if image_data else ("(sent an attachment)" if doc_data else None)
@@ -7424,6 +7550,27 @@ async def telegram_webhook(request: Request):
             save_assistant_turn(chat_id, _res)
             print(f"[draft] model-free send for {_sname}: {_res[:50]!r}")
             return {"ok": True}
+
+    # ---- Capture explicit glossary definitions, model-free (Batch 25) ------------
+    # A parent teaching shorthand ("Lily means Lillian", "Lily's friends = Mia, Mattie")
+    # must actually be saved - the model has replied "Got it, I've saved those" without
+    # calling the tool, so the terms were lost. When the WHOLE message is explicit
+    # definitions, save them here directly and confirm for real. Mixed messages and the
+    # ambiguous "X is Y" form fall through to the model (+ the honesty backstop).
+    if not is_group:
+        _sname, _srole = identify_sender(sender_chat_id)
+        if _srole == "adult":
+            _defs = _glossary_capture(text)
+            if _defs:
+                _saved = []
+                for _term, _meaning in _defs:
+                    tool_add_glossary_term(_term, _meaning, _sname)
+                    _saved.append(_term)
+                _msg = "Saved to the glossary: " + ", ".join(_saved) + "."
+                send_message(chat_id, _msg)
+                save_assistant_turn(chat_id, _msg)
+                print(f"[glossary] model-free capture saved {len(_saved)}: {_saved}")
+                return {"ok": True}
 
     _t = text.strip().lower()
     if _t in ("/help", "/menu") or (not is_group and _t in ("help", "menu")):
