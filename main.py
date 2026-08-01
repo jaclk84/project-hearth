@@ -3516,6 +3516,102 @@ def _claims_saved(reply):
         "ill remember", "in the glossary", "got it. i have", "got it, i have"))
 
 
+# ---- Batch 26: guided tidy - sort the "Other" terms into categories in one pass ----
+# All terms saved before Batch 24 sit in "Other". This proposes a category for each
+# (from keywords in the term + meaning), shows the grouping for approval, and files them
+# on "yes". Heuristic on purpose - it's a suggestion the parent confirms and can correct
+# afterward with "put X under <category>" (Batch 24 re-file).
+_PENDING_TIDY = {}
+
+# Precedence order matters: a "tutor at SRS" is People, not Schools; a "soccer team" is
+# Activities, not Schools. Earlier buckets win.
+_CAT_KEYWORDS = [
+    ("People", ("nanny", "tutor", "teacher", "coach", "therapist", "doctor", "dentist",
+                "pediatrician", "instructor", "sitter", "babysitter", "friend",
+                "grandma", "grandpa", "grandmother", "grandfather", "granddad", "nana",
+                "mom", "dad", "mother", "father", "aunt", "uncle", "cousin", "sister",
+                "brother", "step-", "stepmom", "stepdad", "wife", "husband", "in-law",
+                "neighbor", "neighbour", "classmate", "teammate", "our son", "our daughter")),
+    ("Activities & Clubs", ("team", "club", "league", "lacrosse", "soccer", "baseball",
+                "softball", "basketball", "hockey", "gymnastics", "dance", "ballet",
+                "music lesson", "lessons", "practice", "rehearsal", "camp", "scouts",
+                "troop", " fc", "f.c.", "martial", "karate", "swim team", "choir",
+                "band", "school of rock", "sport", "tournament")),
+    ("Schools", ("school", "elementary", "middle school", "high school", "preschool",
+                "pre-school", "kindergarten", "district", "powerschool", "portal",
+                "classroom", " pta", " pto", "academy")),
+    ("Work & Travel", ("work", "working", "remote", "commut", "the office", "job",
+                "employer", "airport", "flight", "airline", "hotel", "business trip")),
+    ("Places", ("hospital", "salon", "spa", "gym", "studio", "field", "park", "center",
+                "centre", "store", "shop", "restaurant", "cafe", "mall", "clinic",
+                "library", "church", "address", "street", "avenue", " road", "lane",
+                "boulevard", "city", "town", "borough", "rink", "pool", "arena")),
+    ("Dates & Occasions", ("birthday", "anniversary", "holiday", "vacation", "renewal",
+                "graduation", "reunion")),
+]
+
+
+def _suggest_category(term, meaning):
+    """Best-guess bucket for one term from keywords in term+meaning; a bare name or short
+    name-list falls to People; otherwise Other."""
+    blob = f"{term} {meaning}".lower()
+    for cat, kws in _CAT_KEYWORDS:
+        if any(kw in blob for kw in kws):
+            return cat
+    parts = [w.strip() for w in re.split(r"[,/&]| and ", meaning or "") if w.strip()]
+    if 1 <= len(parts) <= 5 and all(re.fullmatch(r"[A-Za-z][a-z'.-]*", w) for w in parts):
+        return "People"           # "Lillian" / "Mia, Mattie, cohen, Bridget"
+    return "Other"
+
+
+def _looks_like_yes(text):
+    t = (text or "").strip().lower().strip("!. ")
+    return t in ("yes", "y", "yes please", "yep", "yeah", "apply", "do it", "go ahead",
+                 "confirm", "looks good", "sounds good", "ok", "okay", "yes do it",
+                 "file them", "apply it", "go for it", "proceed", "sure", "yes file them")
+
+
+def _glossary_tidy_preview(name):
+    """Build a proposed filing for every unsorted (NULL/Other) term, stash it pending,
+    and return (proposal, preview_text). (None, msg) when there's nothing to sort."""
+    conn = db()
+    rows = conn.execute("SELECT term, meaning FROM glossary "
+                        "WHERE category IS NULL OR category='Other' "
+                        "ORDER BY term").fetchall()
+    conn.close()
+    if not rows:
+        return None, "Your glossary is already sorted - nothing sitting in Other."
+    proposal = {r["term"]: _suggest_category(r["term"], r["meaning"]) for r in rows}
+    _PENDING_TIDY[name] = {"proposal": proposal, "ts": time.time()}
+    buckets = {}
+    for term, cat in proposal.items():
+        buckets.setdefault(cat, []).append(term)
+    lines = [f"Here's how I'd file your {len(rows)} unsorted term(s):"]
+    for cat in _GLOSSARY_CATEGORIES:
+        if cat in buckets:
+            lines.append(f"\n{cat}: " + ", ".join(sorted(buckets[cat])))
+    lines.append("\nReply \"yes\" to file them this way. You can move any afterward, "
+                 "e.g. \"put JA under Places\".")
+    return proposal, "\n".join(lines)
+
+
+def _glossary_tidy_apply(name):
+    """File the pending proposal. Only touches terms STILL in Other/NULL, so a manual
+    move made in the meantime is never overwritten."""
+    pend = _PENDING_TIDY.pop(name, None)
+    if not pend or (time.time() - pend.get("ts", 0)) > 3600:
+        return "I don't have a glossary tidy waiting. Say \"tidy the glossary\" first."
+    conn = db()
+    moved = 0
+    for term, cat in pend["proposal"].items():
+        cur = conn.execute("UPDATE glossary SET category=? WHERE LOWER(term)=LOWER(?) "
+                           "AND (category IS NULL OR category='Other')", (cat, term))
+        moved += cur.rowcount
+    conn.commit(); conn.close()
+    return (f"Done - filed {moved} term(s). Say \"what's in the glossary\" to see them "
+            f"grouped, or move any with \"put X under <category>\".")
+
+
 def tool_remember(fact, about, added_by):
     # Trap 119: keep recurring dates and calendar shorthand OUT of plain memory. The
     # model has buried birthdays in memory (where they fire no reminders) and shorthand
@@ -7502,6 +7598,33 @@ async def telegram_webhook(request: Request):
         if role in ("adult", "caregiver", "child"):
             send_message(chat_id, tool_list_glossary())
             print(f"[glossary] served list to {name or 'unknown'} (model-free view)")
+            return {"ok": True}
+
+    # ---- Tidy the glossary into categories, model-free (Batch 26) ----------------
+    # "organize the glossary into categories" -> propose a filing for the unsorted terms
+    # and show it; a following "yes" files them. Parents only (a write).
+    _TIDY_TRIGGERS = ("tidy the glossary", "tidy glossary", "organize the glossary",
+        "organize glossary", "organise the glossary", "sort the glossary",
+        "sort glossary", "categorize the glossary", "categorise the glossary",
+        "categorize glossary", "file the glossary", "clean up the glossary",
+        "put the glossary into categories", "group the glossary",
+        "organize the glossary into categories", "sort the glossary into categories")
+    if not is_group and any(t in _gl for t in _TIDY_TRIGGERS):
+        name, role = identify_sender(sender_chat_id)
+        if role == "adult":
+            _prop, _msg = _glossary_tidy_preview(name)
+            send_message(chat_id, _msg)
+            save_assistant_turn(chat_id, _msg)
+            print(f"[glossary] tidy preview to {name} ({len(_prop or {})} terms)")
+            return {"ok": True}
+    # a bare "yes" right after a preview files the proposal
+    if not is_group and _PENDING_TIDY:
+        name, role = identify_sender(sender_chat_id)
+        if role == "adult" and _PENDING_TIDY.get(name) and _looks_like_yes(_gl):
+            _msg = _glossary_tidy_apply(name)
+            send_message(chat_id, _msg)
+            save_assistant_turn(chat_id, _msg)
+            print(f"[glossary] tidy applied for {name}")
             return {"ok": True}
 
     # ---- Show the pending email DRAFT, model-free (Trap 124) --------------------
