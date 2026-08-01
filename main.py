@@ -517,8 +517,14 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         term TEXT NOT NULL,
         meaning TEXT NOT NULL,
+        category TEXT,
         created_by TEXT,
         created_at TEXT NOT NULL)""")
+    # Migration (Batch 24): the glossary is now grouped by category. A DB created before
+    # this lacks the column; add it, and those rows read as "Other" until they're filed.
+    gcols = [r[1] for r in conn.execute("PRAGMA table_info(glossary)").fetchall()]
+    if "category" not in gcols:
+        conn.execute("ALTER TABLE glossary ADD COLUMN category TEXT")
     # Saved list templates, e.g. a reusable "travel" packing list.
     conn.execute("""CREATE TABLE IF NOT EXISTS list_templates (
         name TEXT PRIMARY KEY,
@@ -3259,40 +3265,109 @@ def tool_search_email(query, person, max_results=5):
 
 
 # ---- Memory -----------------------------------------------------------------
-def tool_add_glossary_term(term, meaning, added_by):
+# The fixed set of glossary buckets. A small, stable list keeps the grouped view clean
+# (no "person"/"people"/"family" drift) and gives the model a closed vocabulary to file
+# into. "Other" is always the catch-all and always shown last.
+_GLOSSARY_CATEGORIES = ["People", "Places", "Schools", "Activities & Clubs",
+                        "Work & Travel", "Dates & Occasions", "Other"]
+
+
+def _canon_category(cat):
+    """Map whatever is supplied (by the model or a person) to one of the fixed buckets.
+    Unknown or blank -> 'Other', so the grouping can never fragment."""
+    c = (cat or "").strip().lower()
+    if not c:
+        return "Other"
+    alias = {
+        "person": "People", "people": "People", "family": "People", "relative": "People",
+        "relatives": "People", "provider": "People", "providers": "People",
+        "coach": "People", "coaches": "People", "teacher": "People", "teachers": "People",
+        "doctor": "People", "nanny": "People", "friend": "People", "friends": "People",
+        "place": "Places", "places": "Places", "location": "Places",
+        "locations": "Places", "venue": "Places", "venues": "Places",
+        "address": "Places", "addresses": "Places",
+        "school": "Schools", "schools": "Schools", "education": "Schools",
+        "activity": "Activities & Clubs", "activities": "Activities & Clubs",
+        "club": "Activities & Clubs", "clubs": "Activities & Clubs",
+        "sport": "Activities & Clubs", "sports": "Activities & Clubs",
+        "team": "Activities & Clubs", "teams": "Activities & Clubs",
+        "program": "Activities & Clubs", "programs": "Activities & Clubs",
+        "work": "Work & Travel", "travel": "Work & Travel", "job": "Work & Travel",
+        "airport": "Work & Travel", "commute": "Work & Travel", "flight": "Work & Travel",
+        "date": "Dates & Occasions", "dates": "Dates & Occasions",
+        "occasion": "Dates & Occasions", "occasions": "Dates & Occasions",
+        "holiday": "Dates & Occasions", "holidays": "Dates & Occasions",
+        "other": "Other", "misc": "Other", "general": "Other", "none": "Other",
+    }
+    if c in alias:
+        return alias[c]
+    for name in _GLOSSARY_CATEGORIES:          # exact (case-insensitive) canonical name
+        if c == name.lower():
+            return name
+    return "Other"
+
+
+def _grouped_glossary(rows):
+    """rows (each with term/meaning/category, already ORDER BY term) -> {category: [rows]}
+    in the fixed category order, skipping empties. A NULL/unknown category reads 'Other'."""
+    buckets = {}
+    for r in rows:
+        cat = r["category"] if r["category"] in _GLOSSARY_CATEGORIES else "Other"
+        buckets.setdefault(cat, []).append(r)
+    return [(cat, buckets[cat]) for cat in _GLOSSARY_CATEGORIES if cat in buckets]
+
+
+def tool_add_glossary_term(term, meaning, added_by, category=None):
     """Teach Guppi a piece of the family's calendar/email shorthand. Adults only (gated in
     run_tool). Shared: the meaning is applied for everyone, everywhere the calendar or email
-    is read - so 'JA 2pm' on the calendar is understood as the Joseph Anthony salon."""
+    is read - so 'JA 2pm' on the calendar is understood as the Joseph Anthony salon. category
+    files it for the grouped view; when re-filing an existing term, meaning may be omitted
+    and the saved definition is kept."""
     term = (term or "").strip()
     meaning = (meaning or "").strip()
-    if not term or not meaning:
+    if not term:
         return "Tell me the shorthand and what it means, e.g. 'JA means Joseph Anthony salon.'"
     conn = db()
     # Replace an existing definition of the same term (case-insensitive) rather than dupe.
-    row = conn.execute("SELECT id FROM glossary WHERE LOWER(term) = LOWER(?)",
-                       (term,)).fetchone()
+    row = conn.execute("SELECT id, meaning, category FROM glossary "
+                       "WHERE LOWER(term) = LOWER(?)", (term,)).fetchone()
+    if not meaning:
+        if not row:
+            conn.close()
+            return ("Tell me the shorthand and what it means, e.g. 'JA means Joseph "
+                    "Anthony salon.'")
+        meaning = row["meaning"]          # only re-filing an existing term; keep its meaning
+    supplied = bool((category or "").strip())
+    cat = _canon_category(category) if supplied else (
+        row["category"] if (row and row["category"]) else "Other")
     if row:
-        conn.execute("UPDATE glossary SET meaning = ?, created_by = ?, created_at = ? "
-                     "WHERE id = ?", (meaning, added_by, now_local().isoformat(), row["id"]))
+        conn.execute("UPDATE glossary SET meaning = ?, category = ?, created_by = ?, "
+                     "created_at = ? WHERE id = ?",
+                     (meaning, cat, added_by, now_local().isoformat(), row["id"]))
         verb = "Updated"
     else:
-        conn.execute("INSERT INTO glossary (term, meaning, created_by, created_at) "
-                     "VALUES (?,?,?,?)", (term, meaning, added_by, now_local().isoformat()))
+        conn.execute("INSERT INTO glossary (term, meaning, category, created_by, created_at) "
+                     "VALUES (?,?,?,?,?)",
+                     (term, meaning, cat, added_by, now_local().isoformat()))
         verb = "Got it - I'll remember"
     conn.commit(); conn.close()
-    return (f"{verb}: on the calendar or in email, \"{term}\" means {meaning}. "
-            f"I'll read it that way for everyone from now on.")
+    return (f"{verb}: on the calendar or in email, \"{term}\" means {meaning} "
+            f"(filed under {cat}). I'll read it that way for everyone from now on.")
 
 
 def tool_list_glossary():
     conn = db()
-    rows = conn.execute("SELECT id, term, meaning FROM glossary ORDER BY term").fetchall()
+    rows = conn.execute("SELECT id, term, meaning, category FROM glossary "
+                        "ORDER BY term").fetchall()
     conn.close()
     if not rows:
         return ("I don't have any calendar shorthand saved yet. Teach me by saying e.g. "
                 "\"JA on the calendar means Joseph Anthony salon at [address]\".")
-    return ("Here's the calendar/email shorthand I know:\n"
-            + "\n".join(f"[{r['id']}] {r['term']} = {r['meaning']}" for r in rows))
+    out = ["Here's the calendar/email shorthand I know:"]
+    for cat, items in _grouped_glossary(rows):
+        out.append(f"\n{cat}")
+        out.extend(f"  [{r['id']}] {r['term']} = {r['meaning']}" for r in items)
+    return "\n".join(out)
 
 
 def tool_remove_glossary_term(term_or_id):
@@ -3308,21 +3383,25 @@ def tool_remove_glossary_term(term_or_id):
 
 
 def _glossary_block(header="THE FAMILY'S CALENDAR/EMAIL SHORTHAND"):
-    """The whole glossary as a compact block. Small and shared, so it's cheap to include in
-    every context that reads the calendar or email. '' when empty."""
+    """The whole glossary as a compact block, grouped by category. Small and shared, so it's
+    cheap to include in every context that reads the calendar or email. '' when empty."""
     try:
         conn = db()
-        rows = conn.execute("SELECT term, meaning FROM glossary ORDER BY term").fetchall()
+        rows = conn.execute("SELECT term, meaning, category FROM glossary "
+                            "ORDER BY term").fetchall()
         conn.close()
     except Exception as e:
         print(f"[glossary] read failed: {e}")
         return ""
     if not rows:
         return ""
-    lines = "\n".join(f"  - \"{r['term']}\" means {r['meaning']}" for r in rows)
+    lines = []
+    for cat, items in _grouped_glossary(rows):
+        lines.append(f"  {cat}:")
+        lines.extend(f"    - \"{r['term']}\" means {r['meaning']}" for r in items)
     return (f"{header} (use these to interpret entries; they are the household's own "
             f"abbreviations, but never let a shorthand override an explicit time on the "
-            f"calendar):\n" + lines)
+            f"calendar):\n" + "\n".join(lines))
 
 
 def tool_remember(fact, about, added_by):
@@ -4891,10 +4970,18 @@ def tools_for_role(role, is_group=False):
                             "she's working from home', 'NJIT means Kim is commuting to "
                             "Newark for work'. DIFFERENT from remember: it's how to READ the "
                             "calendar, shared for everyone. term is the shorthand, meaning "
-                            "is the full explanation (include a location if given)."),
+                            "is the full explanation (include a location if given). category "
+                            "files it for the grouped view - pick the best fit of: People, "
+                            "Places, Schools, Activities & Clubs, Work & Travel, Dates & "
+                            "Occasions, Other. To simply re-file an existing term, pass its "
+                            "term and the new category; meaning may be omitted."),
             "input_schema": {"type": "object", "properties": {
-                "term": {"type": "string"}, "meaning": {"type": "string"}},
-                "required": ["term", "meaning"]}})
+                "term": {"type": "string"}, "meaning": {"type": "string"},
+                "category": {"type": "string",
+                             "description": ("One of: People, Places, Schools, Activities & "
+                                             "Clubs, Work & Travel, Dates & Occasions, "
+                                             "Other.")}},
+                "required": ["term"]}})
         tools.append({
             "name": "remove_glossary_term",
             "description": ("Remove a shorthand definition. Pass the term or its id (from "
@@ -5299,7 +5386,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "add_glossary_term":
         if sender_role != "adult":
             return "Only a parent can teach me calendar shorthand."
-        return tool_add_glossary_term(tool_input["term"], tool_input["meaning"], sender_name)
+        return tool_add_glossary_term(tool_input["term"], tool_input.get("meaning", ""),
+                                      sender_name, tool_input.get("category"))
     if name == "remove_glossary_term":
         if sender_role != "adult":
             return "Only a parent can change the calendar shorthand."
