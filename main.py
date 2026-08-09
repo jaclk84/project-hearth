@@ -8061,6 +8061,21 @@ def _ignored_senders():
     return [s for s in raw.split("|") if s]
 
 
+# Batch 29: obvious no-value-for-a-family-digest sources, dropped BEFORE triage so the
+# model can never surface a LinkedIn ping or a weather.gov alert (both leaked into Kim's
+# digest despite "ignore routine notifications" - prompts are suggestions). Matched
+# against the SENDER only (never the subject), so a school note that merely mentions a
+# flood warning is not suppressed. A PRIORITY sender still overrides this. Domains carry
+# a leading "@" or ".com" so a substring like "@x.com" can't match "@fedex.com".
+_DEFAULT_NOISE_SENDERS = (
+    "@linkedin.com", "linkedin.com", "@facebookmail.com", "facebookmail.com",
+    "@facebook.com", "mail.instagram.com", "@instagram.com", "@twitter.com",
+    "notify.twitter.com", "pinterest.com", "nextdoor.com", "@tiktok.com",
+    "@meetup.com", "@snapchat.com", "@quora.com", "@reddit.com", "@medium.com",
+    "weather.gov", "accuweather.com", "@weather.com", "noreply@nextdoor",
+)
+
+
 def _priority_senders(person):
     """Sender substrings this person always wants surfaced (e.g. 'school', a coach's
     address). Per-person, since priorities differ between parents. Lowercased."""
@@ -8646,21 +8661,33 @@ def _briefing_calendar():
     return "\n\n".join(out) if out else "TODAY: nothing on the calendar."
 
 
-def _briefing_reminders(chat):
+def _briefing_reminders(chat, scope="all"):
     """Reminders split into today and tomorrow, instead of 36 hours labelled 'due today'.
 
     A6c: reminders_for_briefing(horizon_hours=36) at 6am Monday reaches 6pm TUESDAY, and
     every one of them was printed under the heading "Reminders due today" - so tomorrow's
-    reminders were announced as today's."""
+    reminders were announced as today's.
+
+    scope (Batch 29, for the shared-briefing fix): "all" = this chat's + family-wide;
+    "shared" = family-wide only (for_chat IS NULL); "person" = this chat's only."""
     now = now_local()
     today = now.date()
     tomorrow = today + datetime.timedelta(days=1)
     conn = db()
     try:
-        rows = conn.execute(
-            "SELECT text, due_at FROM reminders WHERE fired = 0 "
-            "AND (for_chat = ? OR for_chat IS NULL) ORDER BY due_at",
-            (str(chat),)).fetchall()
+        if scope == "shared":
+            rows = conn.execute(
+                "SELECT text, due_at FROM reminders WHERE fired = 0 "
+                "AND for_chat IS NULL ORDER BY due_at").fetchall()
+        elif scope == "person":
+            rows = conn.execute(
+                "SELECT text, due_at FROM reminders WHERE fired = 0 "
+                "AND for_chat = ? ORDER BY due_at", (str(chat),)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT text, due_at FROM reminders WHERE fired = 0 "
+                "AND (for_chat = ? OR for_chat IS NULL) ORDER BY due_at",
+                (str(chat),)).fetchall()
     finally:
         conn.close()
     today_l, tom_l = [], []
@@ -8684,6 +8711,37 @@ def _briefing_reminders(chat):
         parts.append("REMINDERS DUE TOMORROW (mention only if it needs prep today):\n"
                      + "\n".join(tom_l))
     return "\n\n".join(parts)
+
+
+def _briefing_person_tail(chat):
+    """This person's OWN reminders due today (for_chat = them), as a short user-facing tail
+    appended after the SHARED briefing body (Batch 29). Family-wide reminders already live
+    in the shared body, so only person-specific ones surface here. '' when none."""
+    now = now_local()
+    today = now.date()
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT text, due_at FROM reminders WHERE fired = 0 AND for_chat = ? "
+            "ORDER BY due_at", (str(chat),)).fetchall()
+    finally:
+        conn.close()
+    items = []
+    for r in rows:
+        try:
+            due = datetime.datetime.fromisoformat(r["due_at"])
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=TIMEZONE)
+        except (ValueError, TypeError):
+            continue
+        if due < now or due.date() != today:
+            continue
+        items.append(f"{due.strftime('%-I:%M %p')} - {r['text']}")
+    if not items:
+        return ""
+    if len(items) == 1:
+        return f"Just for you: {items[0]}."
+    return "Just for you:\n" + "\n".join(f"  - {i}" for i in items)
 
 
 def _briefing_occasions():
@@ -8769,54 +8827,65 @@ def job_morning_briefing():
     # says 6pm" can be pinned on the data vs. the model instead of guessed at.
     print(f"[briefing] calendar block:\n{calendar}")
 
+    # Consistency fix (Batch 29): the calendar, trips, weather and occasions are IDENTICAL
+    # for every parent, so generate that SHARED body ONCE and reuse it. Two independent
+    # generations previously framed the same trip differently to each parent ("for the
+    # week" vs "starting Saturday"). Family-wide reminders go in the shared body; a
+    # person's OWN reminders are appended as a short tail. Also one Claude call, not N.
+    if not claude_call_allowed():
+        return
+    shared_reminders = _briefing_reminders(None, scope="shared")
+    context = "\n\n".join(x for x in
+                            (when, glossary, occasions, memory, calendar, shared_reminders,
+                             weather or "WEATHER: unavailable - could not be fetched.")
+                            if x)
+    try:
+        resp = claude_create(
+            model=MODEL, max_tokens=1000,
+            system=("You are Guppi. Write ONE good-morning briefing for the family's "
+                    "parents, in plain text. You are given the current date and time - use "
+                    "them, and never describe something as today when the input puts it "
+                    "under TOMORROW.\n\n"
+                    "Cover, in this order: what is happening TODAY with times; "
+                    "anything IN PROGRESS RIGHT NOW (the action there is finishing or "
+                    "collecting, never preparing - do not tell someone to pack for a "
+                    "thing their child already left for); reminders due today; and the "
+                    "weather. Mention tomorrow ONLY if it needs doing something today. "
+                    "If the weather line says unavailable, omit weather entirely - "
+                    "NEVER invent a forecast.\n\n"
+                    "ACCURACY BEFORE INSIGHT. Report every time and detail EXACTLY as "
+                    "the calendar gives it - never shift, round, or invent a time, and "
+                    "if you're unsure of one, quote it rather than paraphrase. Keep "
+                    "each day separate: today's entries are today's, tomorrow's are "
+                    "tomorrow's - never merge an entry from one day into another or say "
+                    "something runs 'through tomorrow' unless a single event genuinely "
+                    "spans both. An all-day entry describes that person's whole day; "
+                    "read its meaning from WHAT YOU KNOW ABOUT THIS FAMILY above if it's "
+                    "the household's shorthand, and state it plainly for the right day. "
+                    "THEN, being accurate, add insight: note a genuine time collision or "
+                    "a too-tight gap, and what has to leave the house with someone. Only "
+                    "flag a conflict when two events actually overlap - do not invent "
+                    "one. Never state a birthday or fact that isn't in the context "
+                    "above.\n\n"
+                    "Address the reader as 'you'; do NOT use a name and do NOT open with a "
+                    "greeting - a personal 'Good morning' is added for you, so begin "
+                    "directly with the day.\n\n"
+                    "No markdown, no emoji. Aim for 400-700 characters - short enough "
+                    "to read at a glance, long enough to be specific. Warm but "
+                    "efficient."),
+            messages=[{"role": "user", "content": context}])
+        shared_body = "".join(b.text for b in resp.content if b.type == "text").strip()
+    except Exception as e:
+        print(f"[briefing] Claude failed: {e}")
+        return
+    if not shared_body:
+        print("[briefing] empty shared body; skipping")
+        return
+
     for name, chat in _adults_with_chats():
-        if not claude_call_allowed():
-            return
-        reminders = _briefing_reminders(chat)
-        context = "\n\n".join(x for x in
-                                (when, glossary, occasions, memory, calendar, reminders,
-                                 weather or "WEATHER: unavailable - could not be fetched.")
-                                if x)
-        try:
-            resp = claude_create(
-                model=MODEL, max_tokens=1000,
-                system=("You are Guppi. Write ONE good-morning briefing for a parent, in "
-                        "plain text. You are given the current date and time - use them, "
-                        "and never describe something as today when the input puts it "
-                        "under TOMORROW.\n\n"
-                        "Cover, in this order: what is happening TODAY with times; "
-                        "anything IN PROGRESS RIGHT NOW (the action there is finishing or "
-                        "collecting, never preparing - do not tell someone to pack for a "
-                        "thing their child already left for); reminders due today; and the "
-                        "weather. Mention tomorrow ONLY if it needs doing something today. "
-                        "If the weather line says unavailable, omit weather entirely - "
-                        "NEVER invent a forecast.\n\n"
-                        "ACCURACY BEFORE INSIGHT. Report every time and detail EXACTLY as "
-                        "the calendar gives it - never shift, round, or invent a time, and "
-                        "if you're unsure of one, quote it rather than paraphrase. Keep "
-                        "each day separate: today's entries are today's, tomorrow's are "
-                        "tomorrow's - never merge an entry from one day into another or say "
-                        "something runs 'through tomorrow' unless a single event genuinely "
-                        "spans both. An all-day entry describes that person's whole day; "
-                        "read its meaning from WHAT YOU KNOW ABOUT THIS FAMILY above if it's "
-                        "the household's shorthand, and state it plainly for the right day. "
-                        "THEN, being accurate, add insight: note a genuine time collision or "
-                        "a too-tight gap, and what has to leave the house with someone. Only "
-                        "flag a conflict when two events actually overlap - do not invent "
-                        "one. Never state a birthday or fact that isn't in the context "
-                        "above.\n\n"
-                        "No markdown, no emoji. Aim for 400-700 characters - short enough "
-                        "to read at a glance, long enough to be specific. Warm but "
-                        "efficient."),
-                messages=[{"role": "user", "content": context}])
-            text = "".join(b.text for b in resp.content if b.type == "text").strip()
-        except Exception as e:
-            print(f"[briefing] Claude failed for {name}: {e}")
-            continue
-        if not text:
-            print(f"[briefing] empty briefing for {name}; skipping")
-            continue
-        print(f"[briefing] sent to {name} ({len(text)} chars)")
+        tail = _briefing_person_tail(chat)
+        text = f"Good morning, {name}.\n\n{shared_body}" + (f"\n\n{tail}" if tail else "")
+        print(f"[briefing] sent to {name} ({len(text)} chars, shared body)")
         send_message(chat, text, proactive=True)
 
 
@@ -8834,15 +8903,40 @@ def job_weekly_digest():
     if not proactive_on():
         return  # scheduled digest fires at its set time; quiet hours only gates ad-hoc proactivity
     week = tool_check_calendar(days_ahead=7)
+    # Consistency fix (Batch 29): the week ahead is the SAME for both parents, so generate
+    # the adult summary ONCE and send that identical text to each. Independent generations
+    # framed the same trip differently ("for the week" vs "starting Saturday").
+    adult_text = None
+    adult_done = False
 
     for name, chat, role in _people_with_chats_by_role():
+        if role == "adult":
+            if not adult_done:
+                if not claude_call_allowed():
+                    return
+                try:
+                    resp = claude_create(
+                        model=MODEL, max_tokens=300,
+                        system=("You are Guppi. Write ONE short plain-text 'week ahead' "
+                                "summary for the family's parents: the key events across "
+                                "the next 7 days. No markdown, no emoji, keep it tight (a "
+                                "few lines). Address the reader as 'you'; do not use a "
+                                "name."),
+                        messages=[{"role": "user",
+                                   "content": f"The next 7 days on the family calendar:\n{week}"}])
+                    adult_text = "".join(b.text for b in resp.content
+                                         if b.type == "text").strip()
+                except Exception as e:
+                    print(f"[weekly] Claude failed for parents: {e}")
+                    adult_text = None
+                adult_done = True
+            if adult_text:
+                send_message(chat, adult_text, proactive=True)
+            continue
+
         if not claude_call_allowed():
             return
-        if role in ("adult",):
-            instr = ("Write ONE short plain-text 'week ahead' summary for a parent: the "
-                     "key events across the next 7 days. No markdown, no emoji, keep it "
-                     "tight (a few lines).")
-        elif role == "caregiver":
+        if role == "caregiver":
             instr = ("Write ONE short plain-text 'week ahead' note for the family's "
                      "caregiver. Include only childcare-relevant logistics (drop-offs, "
                      "pickups, activities, appointments they'd help with). Omit personal "
@@ -9256,7 +9350,11 @@ def job_urgent_email_poll():
             # this from over-suppressing (e.g. a school note that merely mentions the
             # name). Explicit PRIORITY (sender) still wins over ignore.
             ignore_hay = f"{frm} {(m.get('subject') or '').lower()}"
-            if not is_priority and any(bad in ignore_hay for bad in ignore):
+            # Default noise is matched on the SENDER only; the user list on sender+subject.
+            is_noise = any(nz in frm for nz in _DEFAULT_NOISE_SENDERS)
+            if not is_priority and (is_noise or any(bad in ignore_hay for bad in ignore)):
+                if is_noise:
+                    print(f"[poll] default-noise skip: {m.get('from','')[:50]}")
                 skipped.append({"from": m.get("from", ""), "subject": m.get("subject", ""),
                                 "received": m.get("received", "")})
                 continue
