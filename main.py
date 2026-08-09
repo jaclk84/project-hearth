@@ -62,6 +62,7 @@ import sqlite3
 import datetime
 from zoneinfo import ZoneInfo
 import base64
+import hashlib
 import hmac
 import html as html_lib
 import imaplib
@@ -611,8 +612,14 @@ def init_db():
         filename TEXT NOT NULL,
         media_type TEXT,
         size INTEGER,
+        sha256 TEXT,
         added_by TEXT,
         created_at TEXT NOT NULL)""")
+    # Migration (Batch 27): older DBs lack sha256; add it so identical re-uploads can be
+    # de-duplicated (a filed file re-sent under a new name becomes an alias, not a copy).
+    dcols = [r[1] for r in conn.execute("PRAGMA table_info(documents)").fetchall()]
+    if "sha256" not in dcols:
+        conn.execute("ALTER TABLE documents ADD COLUMN sha256 TEXT")
     conn.commit()
     for name, role in SEEDED_PEOPLE:
         conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
@@ -4139,22 +4146,48 @@ def tool_save_document(title, tags, person):
     title = (title or "").strip()
     if not title:
         return "What should I call it? Give me a short title, like 'camp map'."
+    try:
+        raw = base64.b64decode(att["data"])
+    except Exception as e:
+        print(f"[files] decode failed: {e}")
+        return "I couldn't read that file - try sending it again."
+    digest = hashlib.sha256(raw).hexdigest()
+
+    # De-dupe: if these exact bytes are already filed, don't make a second copy. Re-filing
+    # the same image under a new name (the "insurance card" loop from the logs) instead
+    # makes the existing file findable under the new name too - an alias, not a duplicate.
+    conn = db()
+    dup = conn.execute("SELECT id, title, tags FROM documents WHERE sha256 = ?",
+                       (digest,)).fetchone()
+    if dup:
+        if dup["title"].strip().lower() == title.lower():
+            conn.close()
+            return f"That's already filed as '{dup['title']}' - no need to file it twice."
+        alias_words = re.findall(r"[a-z0-9]+", title.lower())
+        have = set(re.findall(r"[a-z0-9]+", (dup["tags"] or "").lower()))
+        new_tags = " ".join(sorted(have | set(alias_words))) or None
+        conn.execute("UPDATE documents SET tags = ? WHERE id = ?", (new_tags, dup["id"]))
+        conn.commit(); conn.close()
+        print(f"[files] dedupe: same bytes as '{dup['title']}' (#{dup['id']}); "
+              f"aliased '{title}'")
+        return (f"That's the same file I already have as '{dup['title']}' - I didn't make "
+                f"a duplicate, but I've made it findable as '{title}' too.")
+
     ext = _DOC_EXT.get((att.get("media_type") or "").lower(), "bin")
     safe = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower()).strip("-")[:40] or "file"
     fname = f"{int(time.time())}_{safe}.{ext}"
     try:
         os.makedirs(FILES_DIR, exist_ok=True)
-        raw = base64.b64decode(att["data"])
         with open(os.path.join(FILES_DIR, fname), "wb") as f:
             f.write(raw)
     except Exception as e:
+        conn.close()
         print(f"[files] save failed: {e}")
         return "I couldn't save the file just now - try sending it again."
-    conn = db()
     conn.execute("INSERT INTO documents (title, tags, filename, media_type, size, "
-                 "added_by, created_at) VALUES (?,?,?,?,?,?,?)",
+                 "sha256, added_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
                  (title, (tags or "").strip().lower() or None, fname,
-                  att.get("media_type"), len(raw), person,
+                  att.get("media_type"), len(raw), digest, person,
                   now_local().isoformat()))
     conn.commit(); conn.close()
     print(f"[files] saved '{title}' as {fname} ({len(raw)} bytes)")
@@ -4173,25 +4206,34 @@ def _find_document(id_or_title):
     if key.isdigit():
         hit = [r for r in rows if r["id"] == int(key)]
         return (hit[0], None) if hit else (None, None)
-    want = set(re.findall(r"[a-z0-9]+", key.lower()))
+    low = key.lower().strip()
+    # An exact title match wins outright ("insurance card" -> that title, no ambiguity).
+    exact = [r for r in rows if r["title"].strip().lower() == low]
+    if len(exact) == 1:
+        return exact[0], None
+    want = set(re.findall(r"[a-z0-9]+", low))
     if not want:
         return None, None
 
     def _words(r):
         return set(re.findall(r"[a-z0-9]+", f"{r['title']} {r['tags'] or ''}".lower()))
     cands = [r for r in rows if want & _words(r)]
-    if len(cands) > 1:
-        # Prefer a document matching EVERY word asked for - "soccer map" should hit
-        # 'soccer map', not tie with 'camp map' on the shared word "map". Only ask
-        # when genuinely ambiguous.
-        full = [r for r in cands if want <= _words(r)]
-        if len(full) == 1:
-            return full[0], None
+    if not cands:
+        return None, None
     if len(cands) == 1:
         return cands[0], None
-    if cands:
-        return None, cands
-    return None, None
+    # Prefer documents that contain EVERY word asked for - "soccer map" should hit
+    # 'soccer map', not tie with 'camp map' on the shared word "map".
+    full = [r for r in cands if want <= _words(r)]
+    if len(full) == 1:
+        return full[0], None
+    pool = full or cands
+    # Among the pool, take the single strongest overlap if there's a clear winner.
+    best = max(len(want & _words(r)) for r in pool)
+    top = [r for r in pool if len(want & _words(r)) == best]
+    if len(top) == 1:
+        return top[0], None
+    return None, top
 
 
 def tool_list_documents():
@@ -7694,6 +7736,33 @@ async def telegram_webhook(request: Request):
                 save_assistant_turn(chat_id, _msg)
                 print(f"[glossary] model-free capture saved {len(_saved)}: {_saved}")
                 return {"ok": True}
+
+    # ---- Send a filed document, model-free (Batch 27) ---------------------------
+    # The model once replied "I don't have that file" WITHOUT searching (a hallucinated
+    # miss). When a parent plainly asks to be sent a file and exactly ONE filed document
+    # clearly matches, deliver it directly. Ambiguous or no-match falls through to the
+    # model, which can list options or disambiguate.
+    if not is_group:
+        _dn, _dr = identify_sender(sender_chat_id)
+        if _dr in ("adult", "caregiver"):
+            _m = re.match(r"^(?:can you |could you |please )?"
+                          r"(?:send|show|get|pull up|bring|find|open)\s+me\s+"
+                          r"(?:my |the |our |a )?(.+)$", text.strip(), re.I)
+            if _m:
+                _q = _m.group(1).strip().strip("?.!").strip()
+                _q = re.sub(r"\b(file|document|doc|photo|picture|pic|please)\s*$", "",
+                            _q, flags=re.I).strip()
+                if _q and _q.lower() not in ("it", "that", "this", "one", "them"):
+                    _row, _cands = _find_document(_q)
+                    if _row:
+                        _res = tool_get_document(_q, chat_id)
+                        _out = (f"Here's your '{_row['title']}' - it's the file above."
+                                if _res.startswith("Sent -") else _res)
+                        send_message(chat_id, _out)
+                        save_assistant_turn(chat_id, _out)
+                        print(f"[files] model-free retrieval for {_dn}: {_q!r} "
+                              f"-> #{_row['id']}")
+                        return {"ok": True}
 
     _t = text.strip().lower()
     if _t in ("/help", "/menu") or (not is_group and _t in ("help", "menu")):
