@@ -6353,6 +6353,53 @@ def capabilities_for_role(role, is_group=False):
             "things this person can actually do here:\n- " + "\n- ".join(lines))
 
 
+def _chat_calendar_snapshot(days=21):
+    """A compact upcoming-calendar block injected into the live state for EVERY private
+    chat turn, so timing questions are answered from the real schedule rather than guessed.
+
+    Trap 129: asked in chat 'isn't the flight close to that?', the model replied with a
+    flight ARRIVAL TIME and made NO calendar read at all - the schedule was simply never in
+    front of it (chat injects the clock, not the calendar). It recited a time, the user
+    corrected it, and it folded. Handing it the real events every turn removes the guess -
+    the same move the memory/occasions blocks make for stored state (Trap 69)."""
+    service = get_calendar_service()
+    if not service:
+        return ""
+    now = now_local()
+    try:
+        result = service.events().list(
+            calendarId=FAMILY_CALENDAR_ID,
+            timeMin=(now - datetime.timedelta(hours=6)).isoformat(),
+            timeMax=(now + datetime.timedelta(days=days)).isoformat(),
+            singleEvents=True, orderBy="startTime", maxResults=50).execute()
+    except Exception as e:
+        print(f"[state] calendar snapshot read failed: {e}")
+        return ""
+    lines = []
+    for e in result.get("items", []):
+        start = e["start"].get("dateTime", e["start"].get("date"))
+        try:
+            sdt = datetime.datetime.fromisoformat(start)
+            if "dateTime" in e["start"]:
+                when = sdt.strftime("%a %b %-d, %-I:%M %p")
+            else:
+                when = sdt.strftime("%a %b %-d (all day)")
+        except (ValueError, TypeError):
+            when = start
+        loc = f" @ {e['location']}" if e.get("location") else ""
+        lines.append(f"  - {when}: {e.get('summary', '(no title)')}{loc}")
+    if not lines:
+        return ("THE FAMILY CALENDAR (next few weeks, live this turn): nothing scheduled.")
+    return ("THE FAMILY CALENDAR (next ~3 weeks, live from the calendar THIS turn):\n"
+            + "\n".join(lines[:50]) +
+            "\n  ANSWER ANY 'when is...'/'what time...'/'how long until...' question FROM "
+            "THIS LIST - quote the date and time shown here; never a time you recall from "
+            "earlier in the chat, and never an estimate. If the event asked about is NOT "
+            "listed (it may be further out than three weeks), call check_calendar or "
+            "find_events BEFORE answering - do not guess. If a time here looks wrong, say "
+            "so plainly rather than inventing a corrected one.")
+
+
 def _live_state_block(sender_name, sender_role, is_group):
     """A snapshot of what Guppi ACTUALLY has stored, read fresh from the database on every
     turn and pasted into the system prompt.
@@ -6454,6 +6501,16 @@ def _live_state_block(sender_name, sender_role, is_group):
                          "renewal, save it with add_occasion.")
     except Exception as e:
         print(f"[state] could not load occasions: {e}")
+
+    # CALENDAR - the real upcoming events, so timing questions are grounded in the schedule
+    # instead of guessed (Trap 129). Family-wide and read-only, so it's fine for every
+    # private role; group is already excluded at the top of this function.
+    try:
+        cal_snap = _chat_calendar_snapshot()
+        if cal_snap:
+            parts.append(cal_snap)
+    except Exception as e:
+        print(f"[state] could not load calendar snapshot: {e}")
 
     if sender_role == "adult":
         # What the email poll most recently flagged for this person, so an immediate
