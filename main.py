@@ -1703,7 +1703,24 @@ def _lookup_flight(flight_number, date_iso, _retry=False):
     if not flights:
         print(f"[flight] no results for {fn} {date_iso}")
         return None
-    f = flights[0]
+    # Trap 128: pick the instance that DEPARTS on the requested date. Taking flights[0]
+    # blindly once resolved AA2010 "on 8/8" to a red-eye departing LAX 8/7 23:51 - a day
+    # before the connecting flight even landed. Match the departure date; if nothing
+    # departs that day, treat it as unresolved (ask) rather than stamp the wrong flight.
+    def _dep_date(fl):
+        st = ((fl.get("departure", {}) or {}).get("scheduledTime")
+              or (fl.get("departure", {}) or {}).get("revisedTime") or {})
+        local = st.get("local") if isinstance(st, dict) else None
+        return (local or "")[:10]
+    matched = [fl for fl in flights if _dep_date(fl) == date_iso]
+    if matched:
+        f = matched[0]
+    elif len(flights) == 1 and not _dep_date(flights[0]):
+        f = flights[0]            # API gave no departure date to check; trust it
+    else:
+        found = ", ".join(sorted({_dep_date(fl) or "?" for fl in flights}))
+        print(f"[flight] {fn}: no instance departs {date_iso} (departures found: {found})")
+        return None
     dep = f.get("departure", {}) or {}
     arr = f.get("arrival", {}) or {}
 
@@ -1875,6 +1892,42 @@ def tool_add_trip(person, outbound_numbers, outbound_date,
             details=f"{f['airline']} flight {f['number']}. Auto-added by Guppi.",
             color_id=TRAVEL_COLOR_ID)
 
+    all_legs = ob + rb
+    n_ob, n_rb = len(ob), len(rb)
+    exp_ob = len([x for x in (outbound_numbers or []) if x])
+    exp_rb = len([x for x in (return_numbers or []) if x])
+    origin = ob[0]["dep_airport"]
+    dest = ob[-1]["arr_airport"]      # where the outbound actually ends up
+    ob_path = "\u2192".join([ob[0]["dep_airport"]] + [l["arr_airport"] for l in ob])
+    rb_path = ("\u2192".join([rb[0]["dep_airport"]] + [l["arr_airport"] for l in rb])
+               if rb else "")
+
+    # If a leg the user named didn't resolve, do NOT build a trip block from a partial
+    # itinerary - its span would be wrong. The resolved legs are already on the calendar;
+    # ask for the rest, which the user can give as airports+times (-> add_flight_manual).
+    if n_ob < exp_ob or n_rb < exp_rb:
+        got = "; ".join(p for p in (f"outbound {ob_path}" if ob else "",
+                                    f"return {rb_path}" if rb else "") if p)
+        miss = (exp_ob - n_ob) + (exp_rb - n_rb)
+        return (f"I added the {n_ob + n_rb} leg(s) I could look up ({got}), but couldn't "
+                f"resolve {miss} more - the airline data didn't have them for that date. "
+                f"Tell me the airports and departure/arrival times for the missing leg(s) "
+                f"and I'll add them directly.")
+
+    # Chronological sanity: each leg must depart at or after the previous arrives. A
+    # violation means the lookup matched inconsistent instances (a red-eye on the wrong
+    # day) - flag it rather than stamp an impossible trip.
+    for a, b in zip(all_legs, all_legs[1:]):
+        try:
+            if (datetime.datetime.fromisoformat(b["dep_time"])
+                    < datetime.datetime.fromisoformat(a["arr_time"])):
+                return (f"The times don't line up - {b['number']} leaves "
+                        f"{b['dep_airport']} before {a['number']} gets there. That usually "
+                        f"means a number matched the wrong day. Check the numbers/dates, or "
+                        f"give me the airports and times and I'll add them directly.")
+        except (ValueError, TypeError):
+            pass
+
     # ONE trip block: first outbound departure -1h  ->  last arrival of the whole trip.
     try:
         dep_dt = datetime.datetime.fromisoformat(ob[0]["dep_time"])
@@ -1882,11 +1935,6 @@ def tool_add_trip(person, outbound_numbers, outbound_date,
     except (ValueError, TypeError):
         block_start = ob[0]["dep_time"]
     last_leg = rb[-1] if rb else ob[-1]
-    origin = ob[0]["dep_airport"]
-    dest = ob[-1]["arr_airport"]      # where the outbound actually ends up
-    ob_path = "\u2192".join([ob[0]["dep_airport"]] + [l["arr_airport"] for l in ob])
-    rb_path = ("\u2192".join([rb[0]["dep_airport"]] + [l["arr_airport"] for l in rb])
-               if rb else "")
     detail = f"Outbound {ob_path} ({', '.join(l['number'] for l in ob)})."
     if rb:
         detail += f" Return {rb_path} ({', '.join(l['number'] for l in rb)})."
@@ -1896,19 +1944,90 @@ def tool_add_trip(person, outbound_numbers, outbound_date,
         summary=f"{who} \u2708 Trip: {origin}\u2194{dest}",
         start_iso=block_start, end_iso=last_leg["arr_time"], tzname=tzname,
         location=dest, details=detail, color_id=TRAVEL_COLOR_ID)
-
-    n_ob, n_rb = len(ob), len(rb)
-    missing = ""
-    exp_ob = len([x for x in (outbound_numbers or []) if x])
-    exp_rb = len([x for x in (return_numbers or []) if x])
-    if n_ob < exp_ob or n_rb < exp_rb:
-        missing = (f" (I couldn't look up {exp_ob - n_ob} outbound and "
-                   f"{exp_rb - n_rb} return leg(s) - tell me those and I'll add them.)")
     parts = [f"outbound {ob_path}"]
     if rb:
         parts.append(f"return {rb_path}")
     return (f"Added your trip: {origin}\u2194{dest} - " + "; ".join(parts) +
-            f". One trip block plus {n_ob + n_rb} flight events on the calendar." + missing)
+            f". One trip block plus {n_ob + n_rb} flight events on the calendar.")
+
+
+def _norm_dt(s):
+    """Accept 'YYYY-MM-DD HH:MM', ISO, or with a trailing offset; return calendar-ready
+    ISO with seconds. None if unparseable. No offset is fine - the insert carries tzname."""
+    s = (s or "").strip().replace(" ", "T", 1)
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)\s*([+-]\d{2}:?\d{2}|Z)?$", s)
+    if not m:
+        return None
+    stamp, offset = m.group(1), m.group(2) or ""
+    if stamp.count(":") == 1:
+        stamp += ":00"
+    if offset and offset != "Z" and ":" not in offset:
+        offset = offset[:3] + ":" + offset[3:]
+    return stamp + offset
+
+
+def tool_add_flight_manual(person, legs):
+    """Build flight events from the airports and TIMES the user gives, when a number
+    lookup can't resolve them. legs: ordered [{number?, dep_airport, arr_airport,
+    dep_time, arr_time}]. One event per leg, plus a trip block when there's a connection."""
+    service = get_calendar_service(person)
+    err = _cal_guard(service, person)
+    if err:
+        return err
+    if not legs:
+        return ("Give me each leg's departure and arrival airport and time, in order, and "
+                "I'll add them (e.g. 'HNL 2026-08-08 08:00 -> LAX 15:30').")
+    who = person or "Trip"
+    tzname = str(TIMEZONE)
+    built = []
+    for leg in legs:
+        dep_ap = (leg.get("dep_airport") or "").strip().upper() or "?"
+        arr_ap = (leg.get("arr_airport") or "").strip().upper() or "?"
+        dt1, dt2 = _norm_dt(leg.get("dep_time")), _norm_dt(leg.get("arr_time"))
+        if not dt1 or not dt2:
+            return (f"I need both a departure and an arrival time for the "
+                    f"{dep_ap}→{arr_ap} leg (date and time, e.g. '2026-08-08 14:30'). "
+                    f"Give me that and I'll add it.")
+        num = (leg.get("number") or "").strip().upper()
+        _cal_insert_event(
+            service,
+            summary=f"{who} ✈{(' ' + num) if num else ''} {dep_ap}→{arr_ap}",
+            start_iso=dt1, end_iso=dt2, tzname=tzname,
+            location=f"{dep_ap} → {arr_ap}",
+            details=(f"{('Flight ' + num + '. ') if num else ''}Added from details you "
+                     f"gave me (not an automated lookup)."),
+            color_id=TRAVEL_COLOR_ID)
+        built.append({"dep_airport": dep_ap, "arr_airport": arr_ap,
+                      "dep_time": dt1, "arr_time": dt2, "number": num})
+
+    warn = ""
+    for a, b in zip(built, built[1:]):
+        try:
+            if (datetime.datetime.fromisoformat(b["dep_time"])
+                    < datetime.datetime.fromisoformat(a["arr_time"])):
+                warn = (" Heads up: one leg departs before the previous one arrives - "
+                        "double-check those times.")
+                break
+        except (ValueError, TypeError):
+            pass
+
+    path = "→".join([built[0]["dep_airport"]] + [l["arr_airport"] for l in built])
+    if len(built) >= 2:
+        try:
+            dep_dt = datetime.datetime.fromisoformat(built[0]["dep_time"])
+            block_start = (dep_dt - datetime.timedelta(hours=1)).isoformat()
+        except (ValueError, TypeError):
+            block_start = built[0]["dep_time"]
+        _cal_insert_event(
+            service,
+            summary=f"{who} ✈ Trip: {built[0]['dep_airport']}→{built[-1]['arr_airport']}",
+            start_iso=block_start, end_iso=built[-1]["arr_time"], tzname=tzname,
+            location=built[-1]["arr_airport"],
+            details=f"{path}. Block starts 1h before departure. Added from your details.",
+            color_id=TRAVEL_COLOR_ID)
+        return (f"Added your trip {path} - {len(built)} flight events plus a trip block "
+                f"on the calendar.{warn}")
+    return f"Added your flight {path} to the calendar.{warn}"
 
 
 # How a plain-English repeat maps to an iCalendar rule. Kept small on purpose - these
@@ -4988,6 +5107,27 @@ def tools_for_role(role, is_group=False):
                                    "description": "Return legs in order."},
                 "return_date": {"type": "string", "description": "YYYY-MM-DD"}},
                 "required": ["outbound_numbers", "outbound_date"]}})
+        tools.append({
+            "name": "add_flight_manual",
+            "description": ("Add flight leg(s) from the AIRPORTS and TIMES the user gives - "
+                            "use this when add_flight/add_trip couldn't resolve a number, "
+                            "or the user has airports and times but no numbers. After you "
+                            "say you couldn't look one up and the user replies with the "
+                            "airports and times ('HNL depart 8am, arrive LAX 3:30pm; then "
+                            "LAX 6pm, arrive PHL 2am next day'), call THIS - do not keep "
+                            "asking. legs are IN ORDER of travel; each needs dep_airport, "
+                            "arr_airport, dep_time, arr_time (number optional). Times as "
+                            "'YYYY-MM-DD HH:MM' (include the right date for an overnight "
+                            "leg)."),
+            "input_schema": {"type": "object", "properties": {
+                "legs": {"type": "array", "items": {"type": "object", "properties": {
+                    "number": {"type": "string"},
+                    "dep_airport": {"type": "string"},
+                    "arr_airport": {"type": "string"},
+                    "dep_time": {"type": "string", "description": "YYYY-MM-DD HH:MM"},
+                    "arr_time": {"type": "string", "description": "YYYY-MM-DD HH:MM"}},
+                    "required": ["dep_airport", "arr_airport", "dep_time", "arr_time"]}}},
+                "required": ["legs"]}})
 
     if perms["email"]:
         tools.append({
@@ -5561,6 +5701,10 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return tool_add_trip(
             sender_name, tool_input["outbound_numbers"], tool_input["outbound_date"],
             tool_input.get("return_numbers"), tool_input.get("return_date"))
+    if name == "add_flight_manual":
+        if not perms["calendar_write"]:
+            return "Only a parent or caregiver can add calendar events."
+        return tool_add_flight_manual(sender_name, tool_input["legs"])
 
     if name == "search_email":
         if not perms["email"]:
@@ -5986,14 +6130,15 @@ GUIDE_TOPICS = [
     {
         "key": "extras", "title": "Travel, weather, photos and questions",
         "roles": ("adult", "caregiver", "child"), "private_only": False,
-        "tools": ["add_flight", "add_trip", "weather", "web_search"],
+        "tools": ["add_flight", "add_trip", "add_flight_manual", "weather", "web_search"],
         "summary": "Flights, forecasts, reading documents, general questions.",
         "body": [
             "FLIGHTS (parents): \"I'm on AA1234 July 22, back AA1428 the 29th\" - I look "
             "up the real times and put the trip and both flights on the calendar. Has a "
             "CONNECTION? Just list them in order - \"out on AA2386 then AA3475 the 11th, "
             "back AA3721 then AA1725 the 13th\" - and I'll build one trip with all the "
-            "legs.",
+            "legs. If I can't find a flight number (or you don't have one), just tell me "
+            "the airports and times and I'll add it from those.",
             "WEATHER: \"what's the weather tomorrow?\" - today through three days out, "
             "for your town.",
             "PHOTOS AND PDFs: send me a school flyer, permission slip or handwritten list - "
