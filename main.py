@@ -6397,6 +6397,111 @@ def capabilities_for_role(role, is_group=False):
             "things this person can actually do here:\n- " + "\n- ".join(lines))
 
 
+def _clip(s, n):
+    s = (s or "").strip()
+    return s if len(s) <= n else s[:max(1, n - 1)].rstrip() + "…"
+
+
+def _overview_text(person, chat):
+    """Batch 32: ONE 'what do you have for me' answer across every store, so a person never
+    has to know the internal categories (memory vs occasions vs lists vs tickler vs files).
+    A count and a headline or two per store, each with the phrase to see the full list."""
+    now = now_local()
+    today = now.date()
+    conn = db()
+    sections = []
+    try:
+        mem = conn.execute("SELECT fact FROM memories ORDER BY id").fetchall()
+        if mem:
+            eg = "; ".join(_clip(r["fact"], 45) for r in mem[:2])
+            sections.append(f"Memory: {len(mem)} fact(s) - e.g. {eg}. "
+                            f"(say \"what do you remember\")")
+    except Exception as e:
+        print(f"[overview] memory: {e}")
+    try:
+        occ = conn.execute("SELECT title, month, day, year FROM occasions").fetchall()
+        up = []
+        for r in occ:
+            try:
+                nd = _occasion_next_date(r["month"], r["day"], r["year"], today)
+            except Exception:
+                nd = None
+            if nd:
+                up.append(((nd - today).days, r["title"], nd))
+        up.sort()
+        if up:
+            nxt = ", ".join(f"{t} ({nd.strftime('%b %-d')})" for _, t, nd in up[:2])
+            sections.append(f"Occasions: {len(up)} tracked - next {nxt}. "
+                            f"(say \"what occasions\")")
+    except Exception as e:
+        print(f"[overview] occasions: {e}")
+    try:
+        rem = conn.execute(
+            "SELECT text, due_at FROM reminders WHERE fired = 0 "
+            "AND (for_chat = ? OR for_chat IS NULL) ORDER BY due_at", (str(chat),)).fetchall()
+        fut = []
+        for r in rem:
+            try:
+                due = datetime.datetime.fromisoformat(r["due_at"])
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=TIMEZONE)
+            except (ValueError, TypeError):
+                continue
+            if due >= now:
+                fut.append((due, r["text"]))
+        if fut:
+            d, txt = fut[0]
+            sections.append(f"Reminders: {len(fut)} upcoming - next \"{_clip(txt, 40)}\" "
+                            f"{d.strftime('%b %-d, %-I:%M %p')}. (say \"my reminders\")")
+    except Exception as e:
+        print(f"[overview] reminders: {e}")
+    try:
+        lists = conn.execute("SELECT list_name, COUNT(*) c FROM list_items "
+                             "GROUP BY list_name ORDER BY list_name").fetchall()
+        if lists:
+            named = ", ".join(f"{r['list_name']} ({r['c']})" for r in lists[:5])
+            sections.append(f"Lists: {named}. (say \"show my lists\")")
+    except Exception as e:
+        print(f"[overview] lists: {e}")
+    try:
+        trk = conn.execute("SELECT title FROM tracked_deadlines WHERE done = 0 "
+                           "ORDER BY due_date").fetchall()
+        if trk:
+            sections.append(f"Chasing to done: {len(trk)} item(s) - e.g. "
+                            f"{_clip(trk[0]['title'], 40)}. (say \"what are you tracking\")")
+    except Exception as e:
+        print(f"[overview] tracked: {e}")
+    try:
+        com = conn.execute("SELECT task, who FROM commitments WHERE done = 0 "
+                           "ORDER BY id").fetchall()
+        if com:
+            eg = "; ".join(f"{r['who']}: {_clip(r['task'], 28)}" for r in com[:2])
+            sections.append(f"Who's-got-what: {len(com)} - {eg}. "
+                            f"(say \"what's on our plate\")")
+    except Exception as e:
+        print(f"[overview] commitments: {e}")
+    try:
+        docs = conn.execute("SELECT title FROM documents ORDER BY id").fetchall()
+        if docs:
+            titles = ", ".join(_clip(r["title"], 28) for r in docs[:3])
+            sections.append(f"Files: {len(docs)} - {titles}. (say \"what's in the files\")")
+    except Exception as e:
+        print(f"[overview] documents: {e}")
+    try:
+        g = conn.execute("SELECT COUNT(*) c FROM glossary").fetchone()["c"]
+        if g:
+            sections.append(f"Glossary: {g} shorthand term(s). (say \"show the glossary\")")
+    except Exception as e:
+        print(f"[overview] glossary: {e}")
+    conn.close()
+    if not sections:
+        return ("I'm not holding anything for you yet - no reminders, lists, occasions, "
+                "tracked items, files, or saved facts. Teach me something and it'll show "
+                "up here.")
+    return ("Here's everything I'm keeping for you:\n\n"
+            + "\n".join(f"- {s}" for s in sections))
+
+
 def _chat_calendar_snapshot(days=21):
     """A compact upcoming-calendar block injected into the live state for EVERY private
     chat turn, so timing questions are answered from the real schedule rather than guessed.
@@ -7925,6 +8030,24 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, _msg)
             save_assistant_turn(chat_id, _msg)
             print(f"[glossary] tidy applied for {name}")
+            return {"ok": True}
+
+    # ---- Unified overview, model-free (Batch 32) --------------------------------
+    # "what do you have for me / what are you keeping / what are you tracking" - one answer
+    # across every store, so an umbrella question doesn't hit "I don't have that feature"
+    # (the contacts moment). Private only; memory is in it, so adults/caregiver only.
+    _OVERVIEW_KEYS = ("what do you have for", "what do you have on", "what do you have going",
+        "what do you have saved", "what are you keeping", "everything you're tracking",
+        "everything you are tracking", "everything you have", "what are you tracking",
+        "give me an overview", "what all do you have", "what are you holding",
+        "what do you have for us", "what do you have for me")
+    if not is_group and (_gl == "overview" or any(k in _gl for k in _OVERVIEW_KEYS)):
+        name, role = identify_sender(sender_chat_id)
+        if role in ("adult", "caregiver"):
+            _msg = _overview_text(name, chat_id)
+            send_message(chat_id, _msg)
+            save_assistant_turn(chat_id, _msg)
+            print(f"[overview] served to {name}")
             return {"ok": True}
 
     # ---- Show the pending email DRAFT, model-free (Trap 124) --------------------
