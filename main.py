@@ -3642,6 +3642,50 @@ def _claims_saved(reply):
         "ill remember", "in the glossary", "got it. i have", "got it, i have"))
 
 
+# ---- Batch 31: generalized honesty backstop -----------------------------------------
+# The recurring trust bug across every log: Guppi NARRATES an action ("Done", "added it
+# to your calendar", "reminder set") without calling the tool that performs it. We hard-
+# wired guarantees for send/glossary/file/timing; this closes the rest of the class. When
+# the user clearly asked for an ACTION, the reply claims it's done, and NO tool ran this
+# turn, the completion claim is a fiction - replace it with an honest line, so a claim of
+# doing is always backed by a tool call.
+_ACTION_VERBS = {
+    "add", "set", "schedule", "put", "create", "make", "remind", "remember", "save",
+    "file", "track", "move", "reschedule", "update", "change", "delete", "remove",
+    "cancel", "book", "note", "log", "send", "text", "message", "email", "draft",
+}
+
+
+def _looks_like_action_request(text):
+    """Did the user ask Guppi to DO something (not ask a question)? Imperative opener or a
+    'remind me' phrasing. Deliberately narrow to keep the backstop from firing on chat."""
+    t = (text or "").strip().lower()
+    if not t or t.endswith("?"):
+        return False
+    t = re.sub(r"^(hey |ok |okay |please |can you |could you |would you |i need you to |"
+               r"guppi[ ,]*)+", "", t).strip()
+    first = (t.split() or [""])[0].strip(",.:;")
+    if first in _ACTION_VERBS:
+        return True
+    return ("remind me" in t or "remind us" in t or "add a reminder" in t
+            or "set a reminder" in t or "put it on the calendar" in t)
+
+
+def _claims_action(reply):
+    """Does the reply assert a completed action? Strong completion claims only, so it never
+    trips on 'got it' / 'sure' / a clarifying question."""
+    low = (reply or "").lower()
+    return any(p in low for p in (
+        "done.", "done!", "all set", "taken care of", "i've added", "ive added",
+        "added it", "added to your", "added to the", "i've set", "ive set", "set it",
+        "i've scheduled", "scheduled it", "i've created", "created it", "i've put",
+        "put it on", "on your calendar", "reminder is set", "reminder set",
+        "i'll remind you", "ill remind you", "i've saved", "saved it", "i've booked",
+        "booked it", "i've moved", "moved it", "i've updated", "updated it",
+        "i've removed", "removed it", "i've cancel", "i've logged", "i've noted",
+        "i've sent", "sent it", "message sent")) or low.strip() in ("done", "done.")
+
+
 # ---- Batch 26: guided tidy - sort the "Other" terms into categories in one pass ----
 # All terms saved before Batch 24 sit in "Other". This proposes a category for each
 # (from keywords in the term + meaning), shows the grouping for approval, and files them
@@ -7463,6 +7507,18 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                      "\"PowerSchool means the school's parent portal\" - and I'll file it "
                      "in the glossary.")
             print("[glossary] honesty backstop: claimed a save with no save tool -> nudge")
+        # ---- Generalized honesty backstop (Batch 31) --------------------------
+        # The user asked for an ACTION, the reply claims it's done, and NO tool ran this
+        # turn: the claim is fiction (an action needs a tool). Replace it with an honest
+        # line so "done" is never said over nothing. Gated by all three, so a normal chat
+        # reply is never rewritten. Runs only if the teaching backstop above didn't fire.
+        elif (not tools_ran
+                and _looks_like_action_request(user_message)
+                and _claims_action(reply)):
+            reply = ("Actually - I'm not sure that went through; I didn't complete it this "
+                     "turn. Tell me once more exactly what you'd like and I'll do it for "
+                     "real.")
+            print("[backstop] claimed an action with no tool call -> honest retry ask")
 
         # Remember this exchange for next time (store the raw user text, not the
         # time-hint wrapper, so history stays readable and doesn't pile up stale clocks).
@@ -8571,7 +8627,14 @@ def _event_notes(e, limit=280):
     if not desc:
         return ""
     desc = re.split(r"—\s*(?:Added|Edited) by Guppi", desc)[0].strip()
-    desc = re.sub(r"\s+", " ", desc)
+    # Batch 31: some descriptions arrive as HTML (a school pastes a <table> email into the
+    # event). Strip tags and decode entities so the model reads plain text, not markup -
+    # the Waterdogs entry came through as literal "<table><tbody><tr>...".
+    if "<" in desc and ">" in desc:
+        desc = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", desc)
+        desc = re.sub(r"<[^>]+>", " ", desc)
+        desc = html_lib.unescape(desc)
+    desc = re.sub(r"\s+", " ", desc).strip()
     if not desc:
         return ""
     return desc[:limit] + ("…" if len(desc) > limit else "")
