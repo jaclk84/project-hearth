@@ -6536,14 +6536,21 @@ def _chat_calendar_snapshot(days=21):
         except (ValueError, TypeError):
             when = start
         loc = f" @ {e['location']}" if e.get("location") else ""
-        lines.append(f"  - {when}: {e.get('summary', '(no title)')}{loc}")
+        owner = _event_owner(e)
+        who = f" [{owner}'s]" if owner else ""   # structured owner, when Guppi set one
+        lines.append(f"  - {when}: {e.get('summary', '(no title)')}{who}{loc}")
     if not lines:
         return ("THE FAMILY CALENDAR (next few weeks, live this turn): nothing scheduled.")
     return ("THE FAMILY CALENDAR (next ~3 weeks, live from the calendar THIS turn):\n"
             + "\n".join(lines[:50]) +
             "\n  ANSWER ANY 'when is...'/'what time...'/'how long until...' question FROM "
             "THIS LIST - quote the date and time shown here; never a time you recall from "
-            "earlier in the chat, and never an estimate. If the event asked about is NOT "
+            "earlier in the chat, and never an estimate. For a PER-PERSON question ('what's "
+            "Charlotte got this week', 'when is Lily's next tutoring', 'is Kim free "
+            "Saturday'), list ONLY that person's items: match their name OR a known "
+            "nickname (use the shorthand/glossary above - e.g. Lily = Lillian) against each "
+            "entry's title and its [owner's] tag, and if they have nothing in the window "
+            "say so plainly rather than listing everyone. If the event asked about is NOT "
             "listed (it may be further out than three weeks), call check_calendar or "
             "find_events BEFORE answering - do not guess. If a time here looks wrong, say "
             "so plainly rather than inventing a corrected one.")
