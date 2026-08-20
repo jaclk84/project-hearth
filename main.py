@@ -6502,6 +6502,25 @@ def _overview_text(person, chat):
             + "\n".join(f"- {s}" for s in sections))
 
 
+def _rel_day(d, today):
+    """A calendar date -> its day RELATIVE to today, in words: TODAY / TOMORROW /
+    YESTERDAY / 'this Friday' / 'in 5 days' / '3 days ago'. So the model never has to
+    compute which day an absolute date falls on (Trap 130: it read 'Wed Aug 19' and said
+    'tonight' on a Tuesday)."""
+    n = (d - today).days
+    if n == 0:
+        return "TODAY"
+    if n == 1:
+        return "TOMORROW"
+    if n == -1:
+        return "YESTERDAY"
+    if 2 <= n <= 6:
+        return f"this {d.strftime('%A')}"
+    if n > 6:
+        return f"in {n} days"
+    return f"{-n} days ago"
+
+
 def _chat_calendar_snapshot(days=21):
     """A compact upcoming-calendar block injected into the live state for EVERY private
     chat turn, so timing questions are answered from the real schedule rather than guessed.
@@ -6510,11 +6529,16 @@ def _chat_calendar_snapshot(days=21):
     flight ARRIVAL TIME and made NO calendar read at all - the schedule was simply never in
     front of it (chat injects the clock, not the calendar). It recited a time, the user
     corrected it, and it folded. Handing it the real events every turn removes the guess -
-    the same move the memory/occasions blocks make for stored state (Trap 69)."""
+    the same move the memory/occasions blocks make for stored state (Trap 69).
+
+    Trap 130: even WITH the calendar in front of it, it read an absolute date ('Wed Aug 19')
+    and called it 'tonight' on a Tuesday - a relative-day miscompute. So each entry is now
+    tagged TODAY/TOMORROW/... and the model is told to use the tag, never recompute."""
     service = get_calendar_service()
     if not service:
         return ""
     now = now_local()
+    today = now.date()
     try:
         result = service.events().list(
             calendarId=FAMILY_CALENDAR_ID,
@@ -6527,21 +6551,29 @@ def _chat_calendar_snapshot(days=21):
     lines = []
     for e in result.get("items", []):
         start = e["start"].get("dateTime", e["start"].get("date"))
+        rel = ""
         try:
             sdt = datetime.datetime.fromisoformat(start)
             if "dateTime" in e["start"]:
                 when = sdt.strftime("%a %b %-d, %-I:%M %p")
             else:
                 when = sdt.strftime("%a %b %-d (all day)")
+            rel = _rel_day(sdt.date(), today)
         except (ValueError, TypeError):
             when = start
         loc = f" @ {e['location']}" if e.get("location") else ""
         owner = _event_owner(e)
         who = f" [{owner}'s]" if owner else ""   # structured owner, when Guppi set one
-        lines.append(f"  - {when}: {e.get('summary', '(no title)')}{who}{loc}")
+        rel_tag = f" ({rel})" if rel else ""
+        lines.append(f"  - {when}{rel_tag}: {e.get('summary', '(no title)')}{who}{loc}")
     if not lines:
-        return ("THE FAMILY CALENDAR (next few weeks, live this turn): nothing scheduled.")
-    return ("THE FAMILY CALENDAR (next ~3 weeks, live from the calendar THIS turn):\n"
+        return (f"Today is {now.strftime('%A, %B %-d, %Y')}, {now.strftime('%-I:%M %p')}. "
+                f"THE FAMILY CALENDAR (next few weeks, live this turn): nothing scheduled.")
+    return (f"Today is {now.strftime('%A, %B %-d, %Y')}, {now.strftime('%-I:%M %p')}.\n"
+            "THE FAMILY CALENDAR (next ~3 weeks, live from the calendar THIS turn). Each "
+            "entry is tagged with its day RELATIVE to today (TODAY / TOMORROW / this "
+            "<weekday> / in N days) - USE that tag when you say when something is; do NOT "
+            "recompute which day an absolute date lands on:\n"
             + "\n".join(lines[:50]) +
             "\n  ANSWER ANY 'when is...'/'what time...'/'how long until...' question FROM "
             "THIS LIST - quote the date and time shown here; never a time you recall from "
@@ -6667,6 +6699,51 @@ def _live_state_block(sender_name, sender_role, is_group):
             parts.append(cal_snap)
     except Exception as e:
         print(f"[state] could not load calendar snapshot: {e}")
+
+    # REMINDERS + TRACKED DEADLINES that are still open - so a "I already did that / done
+    # with it" can be ACTED ON, not just acknowledged (Trap 131). Told "I completed the
+    # registration", Guppi said "Got it" and the 9am reminder fired anyway - it never saw
+    # the reminder, so it couldn't cancel it. Handing it the pending items + their ids, with
+    # the instruction to cancel on completion, makes the stale "got it" impossible.
+    try:
+        conn = db()
+        prow = conn.execute("SELECT chat_id FROM people WHERE name = ?",
+                            (sender_name,)).fetchone()
+        my_chat = prow["chat_id"] if prow else None
+        now = now_local()
+        rrows = conn.execute(
+            "SELECT id, text, due_at FROM reminders WHERE fired = 0 "
+            "AND (for_chat = ? OR for_chat IS NULL) ORDER BY due_at", (str(my_chat),)
+        ).fetchall()
+        rlines = []
+        for r in rrows:
+            try:
+                due = datetime.datetime.fromisoformat(r["due_at"])
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=TIMEZONE)
+                w = due.strftime("%a %b %-d, %-I:%M %p")
+            except (ValueError, TypeError):
+                w = r["due_at"]
+            rlines.append(f"  [{r['id']}] {w} - {r['text']}")
+        if rlines:
+            parts.append(
+                "REMINDERS YOU HAVE SET (live). If the user says they've DONE / COMPLETED / "
+                "HANDLED / already did one of these, call delete_reminder with its bracketed "
+                "id to stop it - do NOT just say 'got it', or it will fire anyway:\n"
+                + "\n".join(rlines[:15]))
+        trows = conn.execute(
+            "SELECT id, title, due_date FROM tracked_deadlines WHERE done = 0 "
+            "AND stopped = 0 ORDER BY due_date").fetchall()
+        conn.close()
+        if trows:
+            tlines = "\n".join(f"  [{r['id']}] {r['title']} (due {r['due_date']})"
+                               for r in trows[:15])
+            parts.append(
+                "DEADLINES I'M CHASING TO DONE (live). If the user says one is DONE / "
+                "handled / completed, call complete_tracked with its id or title to stop "
+                "chasing it - acknowledging alone is not enough:\n" + tlines)
+    except Exception as e:
+        print(f"[state] could not load reminders/tracked: {e}")
 
     if sender_role == "adult":
         # What the email poll most recently flagged for this person, so an immediate
@@ -9600,9 +9677,15 @@ def job_urgent_email_poll():
             # this from over-suppressing (e.g. a school note that merely mentions the
             # name). Explicit PRIORITY (sender) still wins over ignore.
             ignore_hay = f"{frm} {(m.get('subject') or '').lower()}"
+            # An email that ADDRESSES Guppi by name is a direct instruction from a family
+            # member ("Guppi, please flag this for Jason") - always important, never
+            # filtered. Checked against subject + snippet/body (Batch 34).
+            _hay = f"{m.get('subject') or ''} {m.get('snippet') or ''}".lower()
+            mentions_bot = any(re.search(rf"\b{bn}\b", _hay) for bn in _BOT_NAMES)
             # Default noise is matched on the SENDER only; the user list on sender+subject.
             is_noise = any(nz in frm for nz in _DEFAULT_NOISE_SENDERS)
-            if not is_priority and (is_noise or any(bad in ignore_hay for bad in ignore)):
+            if (not is_priority and not mentions_bot
+                    and (is_noise or any(bad in ignore_hay for bad in ignore))):
                 if is_noise:
                     print(f"[poll] default-noise skip: {m.get('from','')[:50]}")
                 skipped.append({"from": m.get("from", ""), "subject": m.get("subject", ""),
@@ -9611,6 +9694,12 @@ def job_urgent_email_poll():
             rcv = f" [received {m['received']}]" if m.get("received") else ""
             snip = f" - {m['snippet']}" if m.get("snippet") else ""
             tag = " [PRIORITY SENDER]" if is_priority else ""
+            if mentions_bot:
+                tag += (" [ADDRESSES GUPPI BY NAME - a family member is instructing Guppi in "
+                        "this email (e.g. to flag or handle it for someone); treat as "
+                        "IMPORTANT, surface it and follow the instruction]")
+                print(f"[poll] email addresses Guppi by name -> forced important: "
+                      f"{m.get('from', '')[:40]}")
             summaries.append(f"From {m['from']}: {m['subject']}{rcv}{snip}{tag}")
             considered.append(m)
         # Keep this poll's skipped mail so a later "anything you ignored?" can show it.
