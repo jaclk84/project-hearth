@@ -1362,6 +1362,62 @@ def tool_show_settings():
     return "\n".join(lines)
 
 
+# ---- Batch 37: family briefing preferences ----------------------------------------
+# Personalization LAYERED OVER the hardcoded briefing/digest - it changes WHAT is included,
+# HOW URGENT things are treated, and length/detail, but never the accuracy machinery or the
+# required structure. Family-wide (one set for the household), captured in natural language.
+# Empty => the standard briefing runs unchanged (the backstop).
+def _briefing_prefs():
+    raw = get_setting("briefing_prefs") or "[]"
+    try:
+        v = json.loads(raw)
+        return [str(x).strip() for x in v if str(x).strip()] if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
+def _briefing_prefs_text():
+    """The prefs wrapped for injection into the briefing / triage prompts, or '' if none.
+    The wording makes clear these tune CONTENT and URGENCY but never override accuracy or a
+    real safety/same-day change."""
+    prefs = _briefing_prefs()
+    if not prefs:
+        return ""
+    return ("\n\nFAMILY BRIEFING PREFERENCES (the family set these - honor them for WHAT to "
+            "include, HOW URGENT to treat things, and length/detail; but NEVER at the "
+            "expense of accuracy, keeping each day separate, or a genuine safety issue or "
+            "same-day change, which always come through regardless):\n"
+            + "\n".join(f"- {p}" for p in prefs))
+
+
+def tool_manage_briefing_prefs(action, preference=None):
+    """Save/change how the family wants their briefing and digests. action: add / remove /
+    clear / show. Parents only (gated in run_tool)."""
+    action = (action or "").strip().lower()
+    prefs = _briefing_prefs()
+    if action in ("show", "list"):
+        if not prefs:
+            return "No briefing preferences set - you're on the standard briefing and digests."
+        return "Your briefing preferences:\n" + "\n".join(f"- {p}" for p in prefs)
+    if action == "clear":
+        set_setting("briefing_prefs", "[]")
+        return "Cleared - back to the standard briefing and digests."
+    p = (preference or "").strip()
+    if action == "remove":
+        kept = [x for x in prefs if p.lower() not in x.lower()]
+        set_setting("briefing_prefs", json.dumps(kept[:20]))
+        return (f"Removed {len(prefs) - len(kept)} preference(s)." if len(kept) < len(prefs)
+                else "I didn't find a preference matching that.")
+    if not p:
+        return ("Tell me the preference, e.g. 'keep my briefing brief', 'always include the "
+                "tickler', or 'only same-day changes are urgent'.")
+    if any(p.lower() == x.lower() for x in prefs):
+        return "You already have that preference."
+    prefs.append(p)
+    set_setting("briefing_prefs", json.dumps(prefs[:20]))
+    return f"Saved - I'll apply that to your briefing and digests: \"{p}\"."
+
+
 def tool_update_setting(key, value, requester_role):
     """Parents only. Guards against typos and nonsense values."""
     if requester_role != "adult":
@@ -5665,6 +5721,24 @@ def tools_for_role(role, is_group=False):
                 "input_schema": {"type": "object", "properties": {
                     "key": {"type": "string"}, "value": {"type": "string"}},
                     "required": ["key", "value"]}})
+            tools.append({
+                "name": "set_briefing_preference",
+                "description": ("Save or change how the family wants their morning briefing "
+                                "AND email digests - what to include, how urgent to treat "
+                                "things, how brief. Use whenever someone states a preference "
+                                "about their briefing/digests: 'keep my briefing brief', "
+                                "'always include the tickler', 'don't put weather in my "
+                                "briefing', 'only same-day changes are urgent', 'more "
+                                "detail'. It does NOT change accuracy or drop a real "
+                                "safety/same-day change. action: 'add' saves a preference, "
+                                "'remove' drops one, 'clear' resets to standard, 'show' "
+                                "lists them."),
+                "input_schema": {"type": "object", "properties": {
+                    "action": {"type": "string",
+                               "enum": ["add", "remove", "clear", "show"]},
+                    "preference": {"type": "string",
+                                   "description": "The preference text, for add/remove."}},
+                    "required": ["action"]}})
     return tools
 
 
@@ -5818,6 +5892,10 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
         return tool_show_settings()
     if name == "update_setting":
         return tool_update_setting(tool_input["key"], tool_input["value"], sender_role)
+    if name == "set_briefing_preference":
+        if sender_role != "adult":
+            return "Only a parent can change the briefing settings."
+        return tool_manage_briefing_prefs(tool_input["action"], tool_input.get("preference"))
 
     if name == "list_glossary":
         return tool_list_glossary()
@@ -6151,11 +6229,17 @@ GUIDE_TOPICS = [
     {
         "key": "settings", "title": "Settings and your accounts",
         "roles": ("adult",), "private_only": True,
-        "tools": ["show_settings", "update_setting", "connection_health", "connect_link",
+        "tools": ["show_settings", "update_setting", "set_briefing_preference",
+                  "connection_health", "connect_link",
                   "invite_person", "backup_now", "backup_link"],
         "summary": "Everything you can turn up, down or off.",
         "body": [
             "SEE EVERYTHING: \"show me your settings\".",
+            "YOUR BRIEFING, YOUR WAY: \"keep my briefing brief\", \"always include the "
+            "tickler\", \"drop the weather\", \"only same-day changes are urgent\" - I apply "
+            "these to your morning briefing and email digests (never at the cost of "
+            "accuracy or a real same-day change). \"show my briefing settings\" to see "
+            "them, \"reset my briefing\" to clear.",
             "HOW CHATTY I AM: \"set the daily message cap to 15\" - this limits messages I "
             "send on my OWN. Answers to you are never limited.",
             "QUIET HOURS: \"quiet hours from 9pm to 7am\" - I won't message unprompted then.",
@@ -7038,6 +7122,14 @@ not storage.
 - DO WHAT WAS ASKED FIRST. Handle and confirm the actual request before adding any
   unprompted observation; an aside ("your calendar isn't connected") must never replace
   what they asked for.
+
+- SHOW YOUR WORK ON TIMING AND RECORDS. When you answer a question about the calendar, a
+  date or time, an email, or a list, open with a few words naming what you actually checked
+  - "Checked your calendar -", "Looked at both inboxes -", "On your to-do list -" - then
+  give the answer. Only name what is genuinely in front of you this turn (the live state
+  above, or a tool you called); never claim to have checked something you didn't. Keep it
+  to a short lead-in, and skip it entirely for ordinary chat that isn't about dates,
+  events, email, or lists.
 
 PHOTOS/ATTACHMENTS: if someone sends a flyer, form, or handwritten list, read it and pull
 out everything useful - events (title, date, time, location, what to bring, cost, contacts)
@@ -8166,6 +8258,22 @@ async def telegram_webhook(request: Request):
             print(f"[overview] served to {name}")
             return {"ok": True}
 
+    # ---- Briefing settings VIEW / RESET, model-free (Batch 37) -------------------
+    _BPREF_VIEW = ("show my briefing settings", "show briefing settings", "my briefing "
+        "settings", "what are my briefing preferences", "briefing preferences", "briefing "
+        "settings", "show my briefing preferences", "what are my briefing settings")
+    _BPREF_RESET = ("reset my briefing", "reset briefing settings", "clear my briefing "
+        "settings", "clear briefing preferences", "reset my briefing settings",
+        "standard briefing", "default briefing")
+    if not is_group and (_gl in _BPREF_VIEW or _gl in _BPREF_RESET):
+        name, role = identify_sender(sender_chat_id)
+        if role == "adult":
+            _msg = tool_manage_briefing_prefs("clear" if _gl in _BPREF_RESET else "show")
+            send_message(chat_id, _msg)
+            save_assistant_turn(chat_id, _msg)
+            print(f"[briefing-prefs] {'reset' if _gl in _BPREF_RESET else 'view'} for {name}")
+            return {"ok": True}
+
     # ---- Show the pending email DRAFT, model-free (Trap 124) --------------------
     # "Show draft" kept returning "Done - that's taken care of" (the model re-ran
     # draft_email then said nothing). Re-display the STORED pending draft directly -
@@ -9224,14 +9332,20 @@ def job_morning_briefing():
                     "THEN, being accurate, add insight: note a genuine time collision or "
                     "a too-tight gap, and what has to leave the house with someone. Only "
                     "flag a conflict when two events actually overlap - do not invent "
-                    "one. Never state a birthday or fact that isn't in the context "
+                    "one. CONNECT RELATED ITEMS: if a reminder or a tracked deadline lines "
+                    "up with an event on the calendar, or an occasion falls near one, say "
+                    "them together in ONE line and name the single thing to do (e.g. "
+                    "'registration closes tonight for Friday's session' rather than the "
+                    "reminder and the event as two separate notes). Only connect items that "
+                    "genuinely relate - never force a link. Never state a birthday or fact "
+                    "that isn't in the context "
                     "above.\n\n"
                     "Address the reader as 'you'; do NOT use a name and do NOT open with a "
                     "greeting - a personal 'Good morning' is added for you, so begin "
                     "directly with the day.\n\n"
                     "No markdown, no emoji. Aim for 400-700 characters - short enough "
                     "to read at a glance, long enough to be specific. Warm but "
-                    "efficient."),
+                    "efficient." + _briefing_prefs_text()),
             messages=[{"role": "user", "content": context}])
         shared_body = "".join(b.text for b in resp.content if b.type == "text").strip()
     except Exception as e:
@@ -9794,6 +9908,13 @@ def job_urgent_email_poll():
                     f"  conflict - a DIFFERENT event already occupies that time (name it in "
                     f"'note')\n"
                     f"  none - the email has no schedulable event\n\n"
+                    f"SYNTHESIZE, don't just list: when an email touches something already "
+                    f"on the calendar (differs/conflict/already_on), the 'summary' should "
+                    f"NAME the connection in plain words - what the calendar shows vs. what "
+                    f"the email says - so the reader sees both at once ('practice moved to "
+                    f"TONIGHT 6pm; your calendar still has it Thursday'). Then prefer the ONE "
+                    f"combined action that resolves it (update the event AND set a reminder) "
+                    f"over listing the email in isolation.\n\n"
                     f"Suggest ONLY the actions that genuinely help, in 'suggest' (a list, any "
                     f"of): 'calendar' (offer to add/update it), 'reminder' (offer a reminder "
                     f"- put the time in 'remind_when'), 'reply' (ONLY if the email clearly "
@@ -9815,7 +9936,8 @@ def job_urgent_email_poll():
                     f'"proposed_reply": "<when suggesting a reply: ONE short sentence '
                     f'they could send as-is, else empty>"}}]}}\n'
                     f"EACH EMAIL GOES IN ONE PLACE ONLY (urgent OR items, never both). If "
-                    f"nothing qualifies, reply {{\"urgent\": \"\", \"items\": []}}."),
+                    f"nothing qualifies, reply {{\"urgent\": \"\", \"items\": []}}."
+                    + _briefing_prefs_text()),
                 messages=[{"role": "user", "content":
                            (gl + "\n\n" if gl else "")
                            + (cal_ctx + "\n\n" if cal_ctx else "")
