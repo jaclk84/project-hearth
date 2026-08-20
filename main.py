@@ -6745,6 +6745,38 @@ def _live_state_block(sender_name, sender_role, is_group):
     except Exception as e:
         print(f"[state] could not load reminders/tracked: {e}")
 
+    # YOUR LISTS - so "what's on my to-do list" reflects reality, not a denial or a stale
+    # recitation (Trap 132: asked "what's on my to do list", Guppi said "I don't have one"
+    # though a 6-item 'to do' list existed, then recited a stale copy after items were
+    # crossed off - it never re-read). Same structural fix as memory/occasions/calendar.
+    try:
+        conn = db()
+        lrows = conn.execute("SELECT list_name, item FROM list_items "
+                            "ORDER BY list_name, id").fetchall()
+        conn.close()
+        if lrows:
+            bylist = {}
+            for r in lrows:
+                bylist.setdefault(r["list_name"], []).append(r["item"])
+            budget, out = 1600, []
+            for lname, items in bylist.items():
+                line = f"  {lname} ({len(items)}): " + "; ".join(items)
+                if budget - len(line) < 0:
+                    out.append(f"  {lname} ({len(items)} items)")
+                    continue
+                budget -= len(line)
+                out.append(line)
+            parts.append(
+                "YOUR LISTS (live from the database THIS turn). These ARE the lists you "
+                "keep. If asked 'what's on my <name> list' or 'what are my lists', answer "
+                "from HERE - never say a list doesn't exist when it appears below, and never "
+                "recite a list from earlier in the chat; this current one is the truth:\n"
+                + "\n".join(out))
+        else:
+            parts.append("YOU HAVE NO LISTS YET (live from the database).")
+    except Exception as e:
+        print(f"[state] could not load lists: {e}")
+
     if sender_role == "adult":
         # What the email poll most recently flagged for this person, so an immediate
         # "what's in that email?" / "read the pickup one" resolves without them having to
