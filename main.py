@@ -1568,10 +1568,15 @@ def _cal_guard(service, person):
     return "The Google account isn't connected yet."
 
 
-def tool_find_events(query=None, days_ahead=30, person=None):
+def tool_find_events(query=None, days_ahead=180, person=None):
     """Find upcoming events, returning each with its ID so it can be edited or deleted.
     Optional `query` matches text in the title. This is how Guppi locates the specific
-    event before changing it — it never guesses an ID."""
+    event before changing it — it never guesses an ID.
+
+    Trap 133: the default reached only 30 days, so a "Charlotte BLAST Tournament" on Oct 17
+    (~35 days out) was invisible and Guppi insisted four times it wasn't on the calendar.
+    Default is now ~6 months, and the page cap is raised so a far event on a busy calendar
+    isn't truncated away before it's reached."""
     service = get_calendar_service(person)
     err = _cal_guard(service, person)
     if err:
@@ -1587,7 +1592,7 @@ def tool_find_events(query=None, days_ahead=30, person=None):
         result = service.events().list(
             calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(),
             timeMax=later.isoformat(), singleEvents=True, orderBy="startTime",
-            maxResults=50).execute()
+            maxResults=250).execute()
     except Exception as e:
         print(f"[cal] find_events failed: {e}")
         return f"Couldn't search the calendar: {e}"
@@ -3739,7 +3744,9 @@ def _claims_action(reply):
         "i'll remind you", "ill remind you", "i've saved", "saved it", "i've booked",
         "booked it", "i've moved", "moved it", "i've updated", "updated it",
         "i've removed", "removed it", "i've cancel", "i've logged", "i've noted",
-        "i've sent", "sent it", "message sent")) or low.strip() in ("done", "done.")
+        "i've sent", "sent it", "message sent",
+        "cleared the", "cleared it", "i've cleared", "deleted the", "deleted it",
+        "i've deleted", "removed the")) or low.strip() in ("done", "done.")
 
 
 # ---- Batch 26: guided tidy - sort the "Other" terms into categories in one pass ----
@@ -5138,13 +5145,20 @@ def tools_for_role(role, is_group=False):
                 "required": ["summary", "start_iso", "end_iso"]}})
         tools.append({
             "name": "find_events",
-            "description": ("Find upcoming events, each returned WITH its id. Use this "
-                            "FIRST whenever the user wants to change or cancel an event, "
-                            "so you know which event to act on. Optional `query` filters "
-                            "by title text (e.g. 'dentist', 'game')."),
+            "description": ("Find events by title, each returned WITH its id. Use this "
+                            "FIRST whenever the user wants to change or cancel an event, AND "
+                            "whenever they ask WHEN something is or whether it's on the "
+                            "calendar ('when is the next Blast tournament?', 'is the Oct 17 "
+                            "game scheduled?'). It searches about SIX MONTHS ahead by "
+                            "default, so use it - not just the 3-week live snapshot - for "
+                            "anything further out, and pass a larger days_ahead if the date "
+                            "could be beyond that. NEVER tell someone an event isn't on the "
+                            "calendar until this search, run far enough to cover the date "
+                            "they mean, comes up empty. Optional `query` filters by title."),
             "input_schema": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "Text to match in event titles."},
-                "days_ahead": {"type": "integer", "description": "How far ahead (default 30)."}}}})
+                "days_ahead": {"type": "integer",
+                               "description": "How far ahead to search (default 180)."}}}})
         tools.append({
             "name": "edit_calendar_event",
             "description": ("Change an existing event. Provide event_id (from find_events) "
@@ -6666,10 +6680,13 @@ def _chat_calendar_snapshot(days=21):
             "Saturday'), list ONLY that person's items: match their name OR a known "
             "nickname (use the shorthand/glossary above - e.g. Lily = Lillian) against each "
             "entry's title and its [owner's] tag, and if they have nothing in the window "
-            "say so plainly rather than listing everyone. If the event asked about is NOT "
-            "listed (it may be further out than three weeks), call check_calendar or "
-            "find_events BEFORE answering - do not guess. If a time here looks wrong, say "
-            "so plainly rather than inventing a corrected one.")
+            "say so plainly rather than listing everyone. This list is only the next ~3 "
+            "weeks: if the event asked about is NOT here, or the user names a date/month "
+            "beyond it (e.g. 'the Oct 17 tournament'), call find_events (it looks ~6 months "
+            "out; pass a bigger days_ahead if needed) BEFORE answering. NEVER say an event "
+            "isn't on the calendar based on this short window alone - only after a search "
+            "that actually reaches the date they mean comes up empty. If a time here looks "
+            "wrong, say so plainly rather than inventing a corrected one.")
 
 
 def _live_state_block(sender_name, sender_role, is_group):
