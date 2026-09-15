@@ -239,6 +239,13 @@ WEATHER_PLACE = os.environ.get("WEATHER_PLACE", "")
 FLIGHT_API_KEY = os.environ.get("FLIGHT_API_KEY", "")
 FLIGHT_API_HOST = os.environ.get("FLIGHT_API_HOST", "aerodatabox.p.rapidapi.com")
 
+# Google Maps Distance Matrix key, for driving times between events (Batch 39). Set
+# MAPS_API_KEY in Railway. Without it every drive lookup returns None and the feature stays
+# DORMANT - the briefing simply omits travel warnings and the travel tool says it's not set
+# up. Optional HOME_ADDRESS is the default origin for "leave home by" and one-ended asks.
+MAPS_API_KEY = os.environ.get("MAPS_API_KEY", "")
+HOME_ADDRESS = os.environ.get("HOME_ADDRESS", "")
+
 # Google Calendar color for travel events, so trips stand out. "2" is Sage (muted green)
 # in Google's fixed 11-color event palette. Override via env if you prefer another.
 TRAVEL_COLOR_ID = os.environ.get("TRAVEL_COLOR_ID", "2")
@@ -5085,6 +5092,27 @@ def tools_for_role(role, is_group=False):
             "when": {"type": "string", "enum": ["today", "tomorrow", "next_3_days"],
                      "description": "Which day(s) to report. Defaults to today."}}}})
 
+    tools.append({
+        "name": "travel_time",
+        "description": ("Look up the REAL driving time between two places, and - when the "
+                        "user gives a time to be there - the time to leave. You have NO "
+                        "other source for drive times: NEVER estimate or guess how long a "
+                        "drive takes or when to leave; call this. Use for 'how long from X "
+                        "to Y', 'can Charlotte make it from the Blast event to the game by "
+                        "11', 'when do I need to leave for the dentist'. from_place blank "
+                        "means home. If two back-to-back events are in different places and "
+                        "the user asks whether both are doable, call this with their two "
+                        "locations."),
+        "input_schema": {"type": "object", "properties": {
+            "from_place": {"type": "string",
+                           "description": "Origin address or place name (blank = home)."},
+            "to_place": {"type": "string",
+                         "description": "Destination address or place name."},
+            "arrive_by": {"type": "string",
+                          "description": ("Optional time they need to arrive, e.g. '11:00' "
+                                          "or '6:45 PM' - I'll compute when to leave.")}},
+            "required": ["to_place"]}})
+
     if perms["calendar_read"]:
         tools.append({
             "name": "check_calendar",
@@ -5868,6 +5896,9 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
 
     if name == "weather":
         return tool_weather(tool_input.get("when", "today"))
+    if name == "travel_time":
+        return tool_travel_time(tool_input.get("from_place"), tool_input.get("to_place"),
+                                tool_input.get("arrive_by"))
     if name == "backup_now":
         return run_backup(reason="you asked")
     if name == "backup_link":
@@ -6272,8 +6303,9 @@ GUIDE_TOPICS = [
     {
         "key": "extras", "title": "Travel, weather, photos and questions",
         "roles": ("adult", "caregiver", "child"), "private_only": False,
-        "tools": ["add_flight", "add_trip", "add_flight_manual", "weather", "web_search"],
-        "summary": "Flights, forecasts, reading documents, general questions.",
+        "tools": ["add_flight", "add_trip", "add_flight_manual", "weather", "travel_time",
+                  "web_search"],
+        "summary": "Flights, forecasts, drive times, reading documents, questions.",
         "body": [
             "FLIGHTS (parents): \"I'm on AA1234 July 22, back AA1428 the 29th\" - I look "
             "up the real times and put the trip and both flights on the calendar. Has a "
@@ -6283,6 +6315,10 @@ GUIDE_TOPICS = [
             "the airports and times and I'll add it from those.",
             "WEATHER: \"what's the weather tomorrow?\" - today through three days out, "
             "for your town.",
+            "DRIVE TIMES: \"how long from the salon to the field?\", \"can Charlotte make it "
+            "from the Blast event to the game by 11?\" - I look up the real driving time and "
+            "tell you when to leave. I'll also flag a too-tight back-to-back in the morning "
+            "briefing on my own.",
             "PHOTOS AND PDFs: send me a school flyer, permission slip or handwritten list - "
             "even a scan - and I'll read it, pull out the dates, check them against the "
             "calendar and offer to add them.",
@@ -7488,6 +7524,170 @@ def _weather_line(data, idx=0, prefix="Weather"):
     except Exception as e:
         print(f"[weather] could not format day {idx}: {e}")
         return None
+
+
+# ---- Batch 39: driving time between events (Google Maps Distance Matrix) -------------
+# Guppi used to GUESS drive times in the briefing and contradicted itself ("leave at 11 to
+# arrive by 11"). This looks up REAL driving minutes so it can flag a too-tight back-to-back
+# and answer "can I make it from X to Y by <time>". Dormant without MAPS_API_KEY. Base
+# (non-traffic) duration, cached per origin->destination for the process lifetime, so the
+# same pair isn't re-queried and a cached value stays valid all day. All time formatting
+# here is portable (no %-I) so the tests run on Windows too.
+_DRIVE_CACHE = {}
+
+
+def _ampm(dt):
+    """Portable 'H:MM AM/PM' (no platform-specific strftime directives)."""
+    h = dt.hour % 12 or 12
+    return f"{h}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
+
+
+def _drive_minutes(origin, dest):
+    """Driving minutes origin->dest via Distance Matrix, or None (no key / no route / error
+    / blank input). Fails SOFT on purpose - a None must never become a guessed time."""
+    o = (origin or "").strip()
+    d = (dest or "").strip()
+    if not MAPS_API_KEY or not o or not d:
+        return None
+    ck = (o.lower(), d.lower())
+    if ck in _DRIVE_CACHE:
+        return _DRIVE_CACHE[ck]
+    url = ("https://maps.googleapis.com/maps/api/distancematrix/json?"
+           + urllib.parse.urlencode({"origins": o, "destinations": d, "mode": "driving",
+                                     "units": "imperial", "key": MAPS_API_KEY}))
+    try:
+        with urllib.request.urlopen(url, timeout=12) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        print(f"[drive] lookup failed {o!r}->{d!r}: {e}")
+        return None
+    try:
+        el = data["rows"][0]["elements"][0]
+        if el.get("status") != "OK":
+            print(f"[drive] no route {o!r}->{d!r}: {el.get('status')}")
+            return None
+        mins = int(round(el["duration"]["value"] / 60))
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        print(f"[drive] unparseable response {o!r}->{d!r}: {e}")
+        return None
+    _DRIVE_CACHE[ck] = mins
+    print(f"[drive] {o!r} -> {d!r} = {mins} min")
+    return mins
+
+
+def _parse_clock(s):
+    """A user time ('11', '11:00', '6pm', '6:45 PM') or ISO datetime -> a datetime TODAY
+    (local). None if unparseable."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+        return dt.replace(tzinfo=TIMEZONE) if dt.tzinfo is None else dt
+    except ValueError:
+        pass
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?$", s.lower().strip())
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2) or 0)
+    ap = (m.group(3) or "").replace(".", "")
+    if ap == "pm" and hh < 12:
+        hh += 12
+    elif ap == "am" and hh == 12:
+        hh = 0
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+def tool_travel_time(from_place, to_place, arrive_by=None):
+    """Real driving time between two places, and (when arrive_by is given) the time to leave
+    to make it - the leave time is computed in CODE, never guessed. from_place blank = home."""
+    origin = (from_place or "").strip() or HOME_ADDRESS
+    dest = (to_place or "").strip()
+    if not dest:
+        return "Where do you want the driving time TO?"
+    if not MAPS_API_KEY:
+        return ("I can't look up driving times yet - the maps key isn't set up. A parent can "
+                "add MAPS_API_KEY in Railway and I'll be able to.")
+    if not origin:
+        return "Tell me where you're driving FROM - I don't have a home address saved."
+    mins = _drive_minutes(origin, dest)
+    if mins is None:
+        return (f"I couldn't find a driving route from {origin} to {dest} just now - "
+                f"double-check the place names, or I can try again shortly.")
+    line = f"The drive from {origin} to {dest} is about {mins} minutes."
+    if arrive_by:
+        adt = _parse_clock(arrive_by)
+        if adt:
+            leave = adt - datetime.timedelta(minutes=mins)
+            line += (f" To arrive by {_ampm(adt)}, leave by about {_ampm(leave)}.")
+    return line
+
+
+def _todays_located_events():
+    """Today's TIMED events that have a location, as (summary, start_dt, end_dt, location)
+    sorted by start - the input to the travel-gap check. [] on any problem."""
+    service = get_calendar_service()
+    if not service:
+        return []
+    now = now_local()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + datetime.timedelta(days=1)
+    try:
+        result = service.events().list(
+            calendarId=FAMILY_CALENDAR_ID, timeMin=day_start.isoformat(),
+            timeMax=day_end.isoformat(), singleEvents=True, orderBy="startTime",
+            maxResults=50).execute()
+    except Exception as e:
+        print(f"[drive] today read failed: {e}")
+        return []
+    out = []
+    for e in result.get("items", []):
+        loc = (e.get("location") or "").strip()
+        s = e["start"].get("dateTime")
+        en = e.get("end", {}).get("dateTime")
+        if not loc or not s:
+            continue
+        try:
+            sdt = datetime.datetime.fromisoformat(s)
+            edt = datetime.datetime.fromisoformat(en) if en else sdt
+        except (ValueError, TypeError):
+            continue
+        out.append((e.get("summary", "(event)"), sdt, edt, loc))
+    return out
+
+
+def _briefing_travel_warnings():
+    """A deterministic 'TRAVEL CHECK' block for the briefing: for consecutive located events
+    today, flag any gap tighter than the real drive plus a small buffer. '' when maps is off,
+    nothing is tight, or there's nothing to check. Never guesses."""
+    if not MAPS_API_KEY:
+        return ""
+    evs = _todays_located_events()
+    if len(evs) < 2:
+        return ""
+    lines = []
+    buffer_min = 10
+    for (a_sum, _a_s, a_e, a_loc), (b_sum, b_s, _b_e, b_loc) in zip(evs, evs[1:]):
+        if a_loc.strip().lower() == b_loc.strip().lower():
+            continue
+        drive = _drive_minutes(a_loc, b_loc)
+        if drive is None:
+            continue
+        gap = int((b_s - a_e).total_seconds() // 60)
+        if gap < drive + buffer_min:
+            tight = (f"they overlap by {-gap} min" if gap < 0
+                     else f"only {gap} min between them")
+            lines.append(
+                f"  - {a_sum} ends {_ampm(a_e)} at {a_loc}; {b_sum} starts {_ampm(b_s)} at "
+                f"{b_loc}. That's about a {drive} min drive but {tight} - tight; leave right "
+                f"at {_ampm(a_e)}, or see if one can shift.")
+    if not lines:
+        return ""
+    return ("TRAVEL CHECK (real driving times looked up just now - state these as facts, do "
+            "NOT recompute or soften them):\n" + "\n".join(lines))
 
 
 def get_weather_line():
@@ -9319,8 +9519,10 @@ def job_morning_briefing():
     if not claude_call_allowed():
         return
     shared_reminders = _briefing_reminders(None, scope="shared")
+    travel = _briefing_travel_warnings()   # Batch 39: real drive times for tight back-to-backs
     context = "\n\n".join(x for x in
                             (when, glossary, occasions, memory, calendar, shared_reminders,
+                             travel,
                              weather or "WEATHER: unavailable - could not be fetched.")
                             if x)
     try:
