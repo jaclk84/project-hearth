@@ -10625,6 +10625,76 @@ def _job_error_listener(event):
     poll is visible and diagnosable — and never silently stops the whole scheduler."""
     print(f"[scheduler] JOB '{event.job_id}' FAILED: {event.exception!r}")
 
+def _conflict_sig(c):
+    """A stable, order-independent signature for one conflict, so a standing clash is alerted
+    once (Batch 43). Keyed on owner + both events' title and start."""
+    a, b = c["a"], c["b"]
+    pair = sorted([f"{a['sum']}@{a['s'].isoformat()}", f"{b['sum']}@{b['s'].isoformat()}"])
+    return (c.get("owner", "") + "||" + "||".join(pair)).lower()
+
+
+def _word_conflict_haiku(line):
+    """Warm one deterministic conflict line into a 1-2 sentence heads-up with Haiku. Falls
+    back to the EXACT deterministic line on any failure - the alert's facts are already
+    correct, so it must never depend on the model call succeeding."""
+    if not claude_call_allowed():
+        return line
+    try:
+        resp = claude_create(
+            model=MODEL, max_tokens=200,
+            system=("You are Guppi. You are given ONE scheduling conflict already worked out "
+                    "from the family calendar. Rewrite it as a brief, warm heads-up (1-2 "
+                    "sentences) for a parent. Keep every name, event and time EXACTLY as "
+                    "given - never change, drop, or invent a detail, and do not assert a "
+                    "resolution the family has not chosen; you may end by asking how they'd "
+                    "like to handle it. No greeting, no markdown, no emoji."),
+            messages=[{"role": "user", "content": line}])
+        out = "".join(b.text for b in resp.content if b.type == "text").strip()
+        return out or line
+    except Exception as e:
+        print(f"[conflict-watch] haiku wording failed: {e}")
+        return line
+
+
+def job_conflict_watch():
+    """Near-real-time proactive conflict alerts, on the email-poll cadence (Batch 43). Re-scan
+    the calendar; for any conflict NOT already alerted, word it with Haiku (one call per
+    conflict) and push it to the adults. De-duped by a persisted signature set so a standing
+    conflict is announced once; a signature drops when its conflict resolves, so the same clash
+    returning later alerts again. The scan and facts are model-free - only the wording is
+    Haiku, and it falls back to the deterministic line if the model call fails."""
+    if not proactive_on() or in_quiet_hours():
+        return
+    conflicts = _scan_calendar_conflicts(days=3)
+    current = {_conflict_sig(c): c for c in conflicts}
+    try:
+        seen = set(json.loads(get_setting("alerted_conflicts") or "[]"))
+    except Exception:
+        seen = set()
+    adults = _adults_with_chats()
+    if not adults:
+        return
+    for sig, c in current.items():
+        if sig in seen:
+            continue
+        rendered = _render_conflicts([c])
+        if not rendered:
+            continue
+        worded = _word_conflict_haiku(rendered[0].strip().lstrip("- ").strip())
+        sent_any = False
+        for _name, chat in adults:
+            if send_message(chat, "Heads up - a scheduling conflict:\n\n" + worded,
+                            proactive=True):
+                sent_any = True
+        if sent_any:
+            seen.add(sig)
+            print(f"[conflict-watch] pushed new conflict: {sig}")
+    # Keep only signatures whose conflict is still active, so a resolved clash re-alerts if it
+    # returns; bound the store as a backstop.
+    keep = [s for s in seen if s in current]
+    set_setting("alerted_conflicts", json.dumps(keep[-50:]))
+
+
 def start_scheduler():
     from apscheduler.events import EVENT_JOB_ERROR
     scheduler.add_listener(_job_error_listener, EVENT_JOB_ERROR)
@@ -10635,6 +10705,8 @@ def start_scheduler():
                       replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_urgent_email_poll, "interval", minutes=poll_min,
                       id="email_poll", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(job_conflict_watch, "interval", minutes=poll_min,
+                      id="conflict_watch", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_weekly_digest, "cron", day_of_week="sun", hour=18, minute=0,
                       id="weekly_digest", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_daily_backup, "cron", hour=3, minute=30, id="daily_backup",
@@ -10645,7 +10717,7 @@ def start_scheduler():
                       replace_existing=True, max_instances=1, coalesce=True)
     _schedule_digest_jobs()
     scheduler.start()
-    print(f"[scheduler] started: reminders/min, briefing 6am, occasions 7am, weekly Sun 6pm, email poll/{poll_min}min, backup 3:30am (all sent PRIVATELY, never to the group)")
+    print(f"[scheduler] started: reminders/min, briefing 6am, occasions 7am, weekly Sun 6pm, email poll/{poll_min}min, conflict watch/{poll_min}min, backup 3:30am (all sent PRIVATELY, never to the group)")
     print("[boot] anti-repeat guards ACTIVE: IMAP high-water marker (Trap 116) + "
           "per-email-id dedupe (Trap 115). A repeated email flag now logs "
           "'skipped as already-seen'.")
