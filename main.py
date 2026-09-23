@@ -4875,6 +4875,13 @@ def tool_whats_open(person, chat):
     finally:
         conn.close()
 
+    # Schedule conflicts - overlapping events (Batch 42). Found in code, not eyeballed, so a
+    # double-booking can't be missed. Uses its own calendar read (outside the db conn above).
+    _conf = _render_conflicts(_scan_calendar_conflicts(days=7))
+    if _conf:
+        sections.append("SCHEDULE CONFLICTS (overlapping events - someone can't be in two "
+                        "places, or two things need a driver at once):\n" + "\n".join(_conf))
+
     # Email flags queued for the next digest, and flags never engaged with.
     conn = db()
     try:
@@ -5176,6 +5183,16 @@ def tools_for_role(role, is_group=False):
             "description": "Check upcoming events on the family's Google Calendar.",
             "input_schema": {"type": "object", "properties": {
                 "days_ahead": {"type": "integer", "description": "Days ahead (default 7)."}}}})
+        tools.append({
+            "name": "check_conflicts",
+            "description": ("Scan the calendar for SCHEDULING CONFLICTS - events whose times "
+                            "overlap (someone double-booked, or two things needing a driver "
+                            "at once). I find the clashes in code, so use this for 'any "
+                            "conflicts this week?', 'is Saturday clear?', 'does anything "
+                            "clash?' instead of eyeballing the calendar yourself."),
+            "input_schema": {"type": "object", "properties": {
+                "days_ahead": {"type": "integer",
+                               "description": "How many days ahead to scan (default 7)."}}}})
 
     if perms["calendar_write"]:
         tools.append({
@@ -5956,6 +5973,8 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "travel_time":
         return tool_travel_time(tool_input.get("from_place"), tool_input.get("to_place"),
                                 tool_input.get("arrive_by"))
+    if name == "check_conflicts":
+        return tool_check_conflicts(tool_input.get("days_ahead", 7))
     if name == "backup_now":
         return run_backup(reason="you asked")
     if name == "backup_link":
@@ -6361,7 +6380,7 @@ GUIDE_TOPICS = [
         "key": "extras", "title": "Travel, weather, photos and questions",
         "roles": ("adult", "caregiver", "child"), "private_only": False,
         "tools": ["add_flight", "add_trip", "add_flight_manual", "weather", "travel_time",
-                  "web_search"],
+                  "check_conflicts", "web_search"],
         "summary": "Flights, forecasts, drive times, reading documents, questions.",
         "body": [
             "FLIGHTS (parents): \"I'm on AA1234 July 22, back AA1428 the 29th\" - I look "
@@ -6376,6 +6395,9 @@ GUIDE_TOPICS = [
             "from the Blast event to the game by 11?\" - I look up the real driving time and "
             "tell you when to leave. I'll also flag a too-tight back-to-back in the morning "
             "briefing on my own.",
+            "CONFLICTS: \"any clashes this week?\", \"is Saturday clear?\" - I scan the "
+            "calendar for events that overlap (someone double-booked, or two things needing "
+            "a driver at once) and flag them in the morning briefing on my own too.",
             "PHOTOS AND PDFs: send me a school flyer, permission slip or handwritten list - "
             "even a scan - and I'll read it, pull out the dates, check them against the "
             "calendar and offer to add them.",
@@ -7751,6 +7773,108 @@ def _briefing_travel_warnings():
         return ""
     return ("TRAVEL CHECK (real driving times looked up just now - state these as facts, do "
             "NOT recompute or soften them):\n" + "\n".join(lines))
+
+
+# ---- Batch 42: proactive conflict detection (find clashes, don't wait to be asked) ----
+def _scan_calendar_conflicts(days=2):
+    """Deterministic overlap detector: timed events on the family calendar over the next
+    `days` whose times genuinely overlap - the guarantee behind proactive conflict alerts.
+    The model is TOLD which events collide; it never decides that itself. All-day entries
+    are skipped (no clock time to clash). Returns dicts sorted by start; [] on any problem
+    or when nothing overlaps."""
+    service = get_calendar_service()
+    if not service:
+        return []
+    now = now_local()
+    horizon = now + datetime.timedelta(days=days)
+    try:
+        result = service.events().list(
+            calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(),
+            timeMax=horizon.isoformat(), singleEvents=True, orderBy="startTime",
+            maxResults=100).execute()
+    except Exception as e:
+        print(f"[conflicts] calendar read failed: {e}")
+        return []
+    timed = []
+    for e in result.get("items", []):
+        s = e["start"].get("dateTime")
+        en = e.get("end", {}).get("dateTime")
+        if not s:
+            continue  # all-day entry: no time to collide
+        try:
+            sdt = datetime.datetime.fromisoformat(s)
+            edt = datetime.datetime.fromisoformat(en) if en else sdt
+        except (ValueError, TypeError):
+            continue
+        if edt <= now:
+            continue
+        timed.append({"sum": e.get("summary", "(event)"), "s": sdt, "e": edt,
+                      "loc": (e.get("location") or "").strip(), "owner": _event_owner(e)})
+    timed.sort(key=lambda x: x["s"])
+    conflicts = []
+    for i in range(len(timed)):
+        a = timed[i]
+        for j in range(i + 1, len(timed)):
+            b = timed[j]
+            if b["s"] >= a["e"]:
+                break  # sorted by start: nothing later can overlap a
+            if a["s"] < b["e"] and b["s"] < a["e"]:
+                oa, ob = a["owner"].strip(), b["owner"].strip()
+                same = bool(oa) and oa.lower() == ob.lower()
+                conflicts.append({"a": a, "b": b, "same_person": same,
+                                  "owner": oa if same else ""})
+    return conflicts
+
+
+def _render_conflicts(conflicts):
+    """Human lines for a conflict list. Same-person double-bookings first (hardest), then
+    cross-person 'two at once'. Portable date/time formatting only (this runs in tests)."""
+    if not conflicts:
+        return []
+    def span(x):
+        return f"{_ampm(x['s'])}-{_ampm(x['e'])}" if x["e"] > x["s"] else _ampm(x["s"])
+    def at(x):
+        return f" @ {x['loc']}" if x["loc"] else ""
+    lines = []
+    for c in sorted(conflicts, key=lambda c: (not c["same_person"], c["a"]["s"])):
+        a, b = c["a"], c["b"]
+        when = a["s"].strftime("%a %b ") + str(a["s"].day)
+        if c["same_person"]:
+            lines.append(f"  - {c['owner']} is double-booked {when}: {a['sum']} "
+                         f"({span(a)}{at(a)}) overlaps {b['sum']} ({span(b)}{at(b)}). "
+                         f"Cannot be at both.")
+        else:
+            lines.append(f"  - Two at once {when}: {a['sum']} ({span(a)}{at(a)}) overlaps "
+                         f"{b['sum']} ({span(b)}{at(b)}). Who's covering each?")
+    return lines
+
+
+def _briefing_conflicts():
+    """Deterministic 'CONFLICTS FOUND' block for the briefing - the guarantee a double-
+    booking is RAISED, not left for the model to spot. '' when none."""
+    lines = _render_conflicts(_scan_calendar_conflicts(days=2))
+    if not lines:
+        return ""
+    return ("CONFLICTS FOUND (real calendar overlaps - raise every one as a fact; use the "
+            "event notes and locations above to explain what each involves, then offer a "
+            "sensible option or ask who covers what - do NOT invent a resolution the family "
+            "has not chosen):\n" + "\n".join(lines))
+
+
+def tool_check_conflicts(days_ahead=7):
+    """Model-free conflict scan for the interactive path: overlapping events over the next N
+    days. The clashes are found in CODE, so a conflict is never missed or imagined."""
+    try:
+        days = int(days_ahead)
+    except (ValueError, TypeError):
+        days = 7
+    days = max(1, min(days, 30))
+    lines = _render_conflicts(_scan_calendar_conflicts(days=days))
+    if not lines:
+        return (f"No scheduling conflicts for the next {days} days - nothing on the "
+                "calendar overlaps. Say so plainly.")
+    return ("These calendar events overlap (state each as fact; suggest how to handle it or "
+            "ask who covers what, but do not invent a resolution):\n" + "\n".join(lines))
 
 
 def get_weather_line():
@@ -9609,9 +9733,10 @@ def job_morning_briefing():
         return
     shared_reminders = _briefing_reminders(None, scope="shared")
     travel = _briefing_travel_warnings()   # Batch 39: real drive times for tight back-to-backs
+    conflicts = _briefing_conflicts()      # Batch 42: real calendar overlaps to raise
     context = "\n\n".join(x for x in
                             (when, glossary, occasions, memory, calendar, shared_reminders,
-                             travel,
+                             conflicts, travel,
                              weather or "WEATHER: unavailable - could not be fetched.")
                             if x)
     try:
