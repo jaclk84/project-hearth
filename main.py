@@ -3756,6 +3756,23 @@ def _claims_action(reply):
         "i've deleted", "removed the")) or low.strip() in ("done", "done.")
 
 
+_DRIVE_CLAIM_PATTERNS = [
+    r"\b\d{1,3}\s*[-\s]?(?:min|mins|minute|minutes)\s+(?:drive|away|by car|commute)\b",
+    r"\b(?:drive|driving|commute)\b[^.\n]{0,40}?\b\d{1,3}\s*(?:min|mins|minute|minutes)\b",
+    r"\b\d{1,3}\s*(?:min|mins|minute|minutes)\b[^.\n]{0,40}?\bto get (?:to|there|from)\b",
+    r"\bto\s+[\w'.&/ -]{2,40}?\s+is\s+(?:(?:about|around|roughly|approximately|~)\s+)?"
+    r"\d{1,3}\s*(?:min|minute)",
+]
+
+
+def _claims_drive_time(reply):
+    """Batch 40: does the reply state a DRIVE/travel time (not an event's duration)?
+    Paired with 'travel_time was not called' to catch a GUESSED drive time - Guppi said
+    'about 15 minutes' from its own sense instead of looking it up (the 9/14 log)."""
+    low = (reply or "").lower()
+    return any(re.search(p, low) for p in _DRIVE_CLAIM_PATTERNS)
+
+
 # ---- Batch 26: guided tidy - sort the "Other" terms into categories in one pass ----
 # All terms saved before Batch 24 sit in "Other". This proposes a category for each
 # (from keywords in the term + meaning), shows the grouping for approval, and files them
@@ -7184,6 +7201,12 @@ not storage.
   to a short lead-in, and skip it entirely for ordinary chat that isn't about dates,
   events, email, or lists.
 
+- NEVER GUESS A LOOKED-UP FACT. A drive time, distance, weather, flight time, or what's
+  on the calendar comes from a TOOL - call it (travel_time for any drive or "X minutes
+  away", weather, find_events) rather than estimating from your own sense of it, however
+  obvious it seems. If for any reason you give a figure you did NOT look up, say plainly it
+  is an estimate, not a looked-up number.
+
 PHOTOS/ATTACHMENTS: if someone sends a flyer, form, or handwritten list, read it and pull
 out everything useful - events (title, date, time, location, what to bring, cost, contacts)
 or list items - then offer to add to the calendar or save the list. Don't invent details
@@ -8049,6 +8072,16 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                      "turn. Tell me once more exactly what you'd like and I'll do it for "
                      "real.")
             print("[backstop] claimed an action with no tool call -> honest retry ask")
+
+        # ---- Drive-time guess backstop (Batch 40) ----------------------------
+        # travel_time exists, but the model still GUESSED a drive time ("about 15 min")
+        # instead of calling it (the 9/14 log). If the reply asserts a drive/travel time and
+        # travel_time did NOT run this turn, it is an estimate - say so (Jason's rule: if you
+        # guess, tell the user). Appended, not a replacement, so the planning content stays.
+        if _claims_drive_time(reply) and "travel_time" not in tools_ran:
+            reply += ("\n\n(Heads up: I estimated that drive time rather than looking it "
+                      "up. Ask me to check it and I'll get the real number.)")
+            print("[drive] stated a drive time with no travel_time call -> flagged estimate")
 
         # Remember this exchange for next time (store the raw user text, not the
         # time-hint wrapper, so history stays readable and doesn't pile up stale clocks).
