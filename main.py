@@ -3773,6 +3773,46 @@ def _claims_drive_time(reply):
     return any(re.search(p, low) for p in _DRIVE_CLAIM_PATTERNS)
 
 
+# ---- Batch 41: make the model KNOW what it actually did this turn ---------------
+# The honesty layer used to be pure after-the-fact regex on the reply, so the model
+# could contradict its own turn: on 9/23 it called travel_time, got a real 19 min, then
+# apologized "I shouldn't have guessed" - a confession as false as a hallucinated claim,
+# and no backstop caught it (the drive-time flag only fires when the tool did NOT run).
+# Root-cause fix: hand the model a plain record of what it REALLY ran, injected right
+# after the tool results, so its reply is built from real actions - not its guess about
+# what it did. The regex backstops below stay as the deterministic net.
+def _turn_ledger(tools_ran):
+    """A plain-language record of the turn's real tool calls, injected so the reply
+    describes only what actually happened. Empty when no tool ran (nothing to anchor)."""
+    if not tools_ran:
+        return ""
+    seen = list(dict.fromkeys(tools_ran))  # de-dupe, preserve order
+    return ("[turn record - NOT a message from the user] This turn you actually ran these "
+            "tools, and their real results appear above: " + ", ".join(seen) + ". Write "
+            "your reply from those real actions and results only. Do NOT say you guessed "
+            "or estimated a fact you looked up with a tool, do NOT apologize for an action "
+            "you performed correctly, and do NOT claim any action that is not in this list.")
+
+
+_GUESS_CONFESSION = [
+    r"should(?:n't| ?not) have guessed",
+    r"\bi guessed\b",
+    r"\bthat was (?:a|just a) guess\b",
+    r"\bmy (?:estimate|guess)\b",
+    r"\bi (?:estimated|guessed)\b",
+    r"rather than looking it up",
+    r"should(?:n't| ?not) have estimated",
+]
+
+
+def _confesses_guess(reply):
+    """Batch 41: does the reply apologize for GUESSING/ESTIMATING a fact? Paired with
+    'the relevant tool DID run this turn' to catch a false confession - Guppi looked it
+    up correctly, then wrongly said it had guessed (the 9/23 log)."""
+    low = (reply or "").lower()
+    return any(re.search(p, low) for p in _GUESS_CONFESSION)
+
+
 # ---- Batch 26: guided tidy - sort the "Other" terms into categories in one pass ----
 # All terms saved before Batch 24 sit in "Other". This proposes a category for each
 # (from keywords in the term + meaning), shows the grouping for approval, and files them
@@ -8013,6 +8053,11 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                         content = out
                     results.append({"type": "tool_result", "tool_use_id": block.id,
                                     "content": content})
+            _led = _turn_ledger(tools_ran)
+            if _led:
+                # A user content array may hold tool_result blocks AND a trailing text
+                # block; the ledger rides after the results so the model reads it last.
+                results.append({"type": "text", "text": _led})
             messages.append({"role": "user", "content": results})
             continue
 
@@ -8082,6 +8127,17 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
             reply += ("\n\n(Heads up: I estimated that drive time rather than looking it "
                       "up. Ask me to check it and I'll get the real number.)")
             print("[drive] stated a drive time with no travel_time call -> flagged estimate")
+
+        # ---- False-confession backstop (Batch 41) ----------------------------
+        # The reply apologizes for "guessing/estimating" a fact it ACTUALLY looked up
+        # with a tool this turn (the 9/23 log: travel_time ran, then "I shouldn't have
+        # guessed"). A confession that contradicts the turn record is as dishonest as a
+        # false claim - replace it with the truth. Mutually exclusive with the drive-time
+        # flag above, which fires only when travel_time did NOT run.
+        if _confesses_guess(reply) and "travel_time" in tools_ran:
+            reply = ("I looked that up with the maps tool just now - that's a real driving "
+                     "estimate from the routing data, not a guess.")
+            print("[backstop] confessed to guessing a fact it looked up -> corrected")
 
         # Remember this exchange for next time (store the raw user text, not the
         # time-hint wrapper, so history stays readable and doesn't pile up stale clocks).
