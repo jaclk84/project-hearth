@@ -6230,6 +6230,9 @@ GUIDE_TOPICS = [
             "SEND: \"reply to the coach that we'll be late\", \"email Kim the grocery "
             "list\". I ALWAYS show you the draft first and send NOTHING until you say "
             "\"send it\". You can say \"change the wording\" or \"discard that\".",
+            "FORWARD IT TO ME: forward any email to your connected address with \"Guppi\" "
+            "in the subject and I'll pick it up within a few minutes and offer to act on it - "
+            "handy when someone sends you something to add or reply to.",
             "This is your own inbox only, and only in a private chat - never in the group.",
             "(Needs your email connected. Say \"connect my email\" and I'll send a link. "
             "If you connected before sending existed, reconnect once to allow it.)",
@@ -10802,6 +10805,85 @@ def job_conflict_watch():
     set_setting("alerted_conflicts", json.dumps(keep[-50:]))
 
 
+# ---- Batch 45: forward-to-Guppi - "guppi" in an email subject = handle it now ----
+def _subject_tags_guppi(subject):
+    """True when an email subject calls Guppi by name - a parent forwarding something and
+    tagging me to deal with it. Reuses the same name set as group-chat addressing."""
+    low = (subject or "").lower()
+    return any(n in low for n in _BOT_NAMES)
+
+
+def _fast_email_body(person, m):
+    """A body preview for one matched email. IMAP ids ('i:UID') get a real body fetch;
+    Gmail ids already carry a snippet. '' if nothing is available."""
+    mid = m.get("id") or ""
+    if mid.startswith("i:"):
+        try:
+            got = _imap_snippets_for_uids(person, [mid[2:]])
+            if got:
+                return next(iter(got.values()))
+        except Exception as e:
+            print(f"[guppi-inbox] body fetch failed for {mid}: {e}")
+    return m.get("snippet", "") or ""
+
+
+def _word_guppi_forward(m, body):
+    """Read a Guppi-tagged forward and produce a short heads-up + OFFER (Haiku). Falls back to
+    a plain, honest notice on any failure. Never claims an action was taken - it only surfaces."""
+    frm = m.get("from", "someone")
+    subj = m.get("subject", "(no subject)")
+    fallback = (f"You've got mail tagged for me from {frm}: \"{subj}\".\n\n"
+                f"{(body or '').strip()[:400]}\n\nWant me to act on it - add it to the "
+                f"calendar, set a reminder, or draft a reply?")
+    if not claude_call_allowed():
+        return fallback
+    try:
+        ctx = f"From: {frm}\nSubject: {subj}\n\n{(body or '')[:1500]}"
+        resp = claude_create(
+            model=MODEL, max_tokens=350,
+            system=("You are Guppi. A parent forwarded this email and put your name in the "
+                    "subject, meaning they want you to handle it. In 2-4 sentences: say who "
+                    "it's from and what it's asking, then OFFER the concrete next step (add a "
+                    "calendar event using the date/time you can see, set a reminder, or draft "
+                    "a reply). Do NOT claim you've already done anything - you are only "
+                    "surfacing it and the parent confirms. Quote any date or time EXACTLY as "
+                    "written; never invent one. No greeting, no markdown, no emoji."),
+            messages=[{"role": "user", "content": ctx}])
+        out = "".join(b.text for b in resp.content if b.type == "text").strip()
+        return out or fallback
+    except Exception as e:
+        print(f"[guppi-inbox] wording failed: {e}")
+        return fallback
+
+
+def job_guppi_inbox_check():
+    """Fast lane (every few minutes): an unread email with 'guppi' in the SUBJECT is a direct
+    ask - a parent forwards something and tags me. Surface it to that inbox's owner right away
+    with a short read of what it wants, instead of waiting up to 30 min for the full poll. Marks
+    it handled in the SHARED seen-set so the main poll never re-surfaces the same email (Batch
+    45). Only calls Claude when a tagged email actually exists, so idle cycles cost nothing."""
+    if not proactive_on() or in_quiet_hours():
+        return
+    for name, chat in _adults_with_chats():
+        if not connected_providers(name):
+            continue
+        try:
+            msgs = _poll_unread(name)
+        except Exception as e:
+            print(f"[guppi-inbox] poll failed for {name}: {e}")
+            continue
+        seen = set(_surfaced_email_ids(name))
+        tagged = [m for m in msgs
+                  if m.get("id") and m.get("id") not in seen
+                  and _subject_tags_guppi(m.get("subject"))]
+        for m in tagged:
+            body = _fast_email_body(name, m)
+            note = _word_guppi_forward(m, body)
+            if send_message(chat, note, proactive=True):
+                _mark_email_ids_surfaced(name, [m.get("id")])
+                print(f"[guppi-inbox] surfaced tagged mail {m.get('id')} to {name}")
+
+
 def start_scheduler():
     from apscheduler.events import EVENT_JOB_ERROR
     scheduler.add_listener(_job_error_listener, EVENT_JOB_ERROR)
@@ -10814,6 +10896,8 @@ def start_scheduler():
                       id="email_poll", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_conflict_watch, "interval", minutes=poll_min,
                       id="conflict_watch", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(job_guppi_inbox_check, "interval", minutes=5,
+                      id="guppi_inbox", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_weekly_digest, "cron", day_of_week="sun", hour=18, minute=0,
                       id="weekly_digest", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_daily_backup, "cron", hour=3, minute=30, id="daily_backup",
@@ -10824,7 +10908,7 @@ def start_scheduler():
                       replace_existing=True, max_instances=1, coalesce=True)
     _schedule_digest_jobs()
     scheduler.start()
-    print(f"[scheduler] started: reminders/min, briefing 6am, occasions 7am, weekly Sun 6pm, email poll/{poll_min}min, conflict watch/{poll_min}min, backup 3:30am (all sent PRIVATELY, never to the group)")
+    print(f"[scheduler] started: reminders/min, briefing 6am, occasions 7am, weekly Sun 6pm, email poll/{poll_min}min, conflict watch/{poll_min}min, guppi-inbox/5min, backup 3:30am (all sent PRIVATELY, never to the group)")
     print("[boot] anti-repeat guards ACTIVE: IMAP high-water marker (Trap 116) + "
           "per-email-id dedupe (Trap 115). A repeated email flag now logs "
           "'skipped as already-seen'.")
