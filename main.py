@@ -478,6 +478,16 @@ def init_db():
         created_by TEXT,
         fired INTEGER NOT NULL DEFAULT 0,
         repeat TEXT DEFAULT 'none')""")
+    # Batch 44: a small log of reversible things Guppi just did, so "undo" can cleanly take
+    # back the most recent one for a chat. Only Guppi's own creations land here.
+    conn.execute("""CREATE TABLE IF NOT EXISTS recent_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat TEXT,
+        kind TEXT NOT NULL,
+        ref TEXT,
+        descr TEXT,
+        created_at TEXT NOT NULL,
+        undone INTEGER NOT NULL DEFAULT 0)""")
     # Migration: older DBs created before Phase 4 Batch 2 lack the 'repeat' column.
     cols = [r[1] for r in conn.execute("PRAGMA table_info(reminders)").fetchall()]
     if "repeat" not in cols:
@@ -2211,7 +2221,7 @@ def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
         body["recurrence"] = rrule
 
     try:
-        service.events().insert(calendarId=FAMILY_CALENDAR_ID, body=body).execute()
+        _created = service.events().insert(calendarId=FAMILY_CALENDAR_ID, body=body).execute()
     except Exception as e:
         print(f"[cal] insert failed: {e}")
         if rrule:
@@ -2221,6 +2231,10 @@ def tool_add_calendar_event(summary, start_iso, end_iso, person=None,
                     "occurrence has to start and end on the SAME day - set the start and "
                     "end to one day's times and let the repeat cover the rest.")
         return f"I couldn't add that to the calendar: {e}"
+
+    _LAST_ACTION.clear()
+    _LAST_ACTION.update({"kind": "calendar_event", "ref": _created.get("id"),
+                         "descr": summary})
 
     at_loc = f" at {location}" if location else ""
     whose = f"{for_person}'s " if for_person else ""
@@ -4090,11 +4104,14 @@ def tool_add_reminder(text, due_iso, for_chat, created_by, repeat="none"):
         except (ValueError, TypeError):
             pass
     conn = db()
-    conn.execute(
+    _cur = conn.execute(
         "INSERT INTO reminders (text, due_at, for_chat, created_by, repeat) VALUES (?,?,?,?,?)",
         (text, due_iso, for_chat, created_by, repeat))
     conn.commit()
+    _rid = _cur.lastrowid
     conn.close()
+    _LAST_ACTION.clear()
+    _LAST_ACTION.update({"kind": "reminder", "ref": _rid, "descr": text})
     _disp = "monthly" if repeat.startswith("monthly") else repeat.replace(":", " ")
     tail = "" if repeat == "none" else f", repeating {_disp}"
     return f"Reminder set — I'll remind you {humanize_when(due_iso)}: {text}{tail}."
@@ -7877,6 +7894,84 @@ def tool_check_conflicts(days_ahead=7):
             "ask who covers what, but do not invent a resolution):\n" + "\n".join(lines))
 
 
+# ---- Batch 44: undo - cleanly reverse the last thing Guppi did ----
+# A tool that CREATES something sets _LAST_ACTION on success; ask_guppi's tool loop records
+# it (keyed by chat) into recent_actions. "undo" then reverses the newest one.
+_LAST_ACTION = {}
+
+_UNDO_PHRASES = {"undo", "undo that", "undo it", "undo last", "undo the last",
+                 "undo that last one", "undo the last thing", "scratch that",
+                 "take that back", "undo please", "actually undo that"}
+
+
+def _looks_like_undo(text):
+    """Narrow, so a long sentence that merely contains 'undo' can't hijack a real request -
+    only a short, clearly-undo message reverses an action."""
+    t = re.sub(r"\s+", " ", (text or "").strip().lower().strip("!.?"))
+    return t in _UNDO_PHRASES or (t.startswith("undo") and len(t) <= 24)
+
+
+def _record_reversible(chat, kind, ref, descr):
+    """Log a reversible action Guppi just took (Batch 44). Best-effort; never fatal."""
+    if not chat or not kind:
+        return
+    try:
+        conn = db()
+        conn.execute("INSERT INTO recent_actions (chat, kind, ref, descr, created_at) "
+                     "VALUES (?,?,?,?,?)",
+                     (str(chat), kind, str(ref) if ref is not None else None, descr,
+                      now_local().isoformat()))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[undo] could not record action: {e}")
+
+
+def tool_undo_last(chat):
+    """Reverse the most recent reversible action for this chat, if it's recent (<=60 min).
+    Model-free: the reversal happens in code, and the confirmation names exactly what was
+    undone so nothing is taken back silently."""
+    conn = db()
+    try:
+        row = conn.execute("SELECT * FROM recent_actions WHERE chat = ? AND undone = 0 "
+                           "ORDER BY id DESC LIMIT 1", (str(chat),)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return "There's nothing recent of mine to undo."
+    try:
+        made = datetime.datetime.fromisoformat(row["created_at"])
+        if made.tzinfo is None:
+            made = made.replace(tzinfo=TIMEZONE)
+        if (now_local() - made) > datetime.timedelta(minutes=60):
+            return ("The last thing I did was a while ago, so I won't undo it automatically - "
+                    "tell me exactly what to remove and I'll do it.")
+    except (ValueError, TypeError):
+        pass
+    kind, ref, descr = row["kind"], row["ref"], row["descr"]
+    done = False
+    if kind == "calendar_event":
+        res = tool_delete_calendar_event(ref)
+        done = res.strip().lower().startswith("deleted")
+        msg = (f"Undone - removed \"{descr}\" from the calendar." if done else
+               f"I tried to undo that calendar event but couldn't: {res}")
+    elif kind == "reminder":
+        try:
+            c = db(); c.execute("DELETE FROM reminders WHERE id = ?", (ref,))
+            c.commit(); c.close(); done = True
+            msg = f"Undone - cancelled the reminder: {descr}."
+        except Exception as e:
+            msg = f"I couldn't cancel that reminder just now ({e})."
+    else:
+        msg = "I'm not sure how to undo that one - tell me what to remove."
+    if done:
+        try:
+            c = db(); c.execute("UPDATE recent_actions SET undone = 1 WHERE id = ?",
+                                (row["id"],)); c.commit(); c.close()
+        except Exception:
+            pass
+    return msg
+
+
 def get_weather_line():
     """Today's forecast line for the morning briefing. None when unavailable - and the
     briefing must then say nothing about weather rather than fill the gap."""
@@ -8024,6 +8119,13 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
         _CURRENT_TURN[sender_name] = f"{who_id}:{time.time()}"
         _LAST_USER_TEXT[sender_name] = user_message
 
+    # Undo (Batch 44): reverse Guppi's most recent action, model-free, private chats only.
+    if not is_group and _looks_like_undo(user_message):
+        reply = tool_undo_last(who_id)
+        save_history(hist_key, user_message, reply)
+        print(f"[undo] '{user_message.strip()}' -> {reply[:60]!r}")
+        return reply
+
     # Give Claude the current DATE AND TIME, with the timezone offset. Date alone is
     # not enough: "in 2 minutes", "in an hour", "tonight" all need a clock to anchor
     # to. Without this the model invents a plausible-looking time, which lands in the
@@ -8157,6 +8259,11 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
                         out = (f"That didn't work just now ({block.name} ran into a "
                                f"problem). Let the user know and offer to try again.")
                     tools_ran.append(block.name)
+                    if _LAST_ACTION:
+                        _record_reversible(who_id, _LAST_ACTION.get("kind"),
+                                           _LAST_ACTION.get("ref"),
+                                           _LAST_ACTION.get("descr"))
+                        _LAST_ACTION.clear()
                     tool_texts.append(out if isinstance(out, str)
                                       else (out.get("text", "") if isinstance(out, dict)
                                             else ""))
