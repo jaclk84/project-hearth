@@ -4892,13 +4892,6 @@ def tool_whats_open(person, chat):
     finally:
         conn.close()
 
-    # Schedule conflicts - overlapping events (Batch 42). Found in code, not eyeballed, so a
-    # double-booking can't be missed. Uses its own calendar read (outside the db conn above).
-    _conf = _render_conflicts(_scan_calendar_conflicts(days=7))
-    if _conf:
-        sections.append("SCHEDULE CONFLICTS (overlapping events - someone can't be in two "
-                        "places, or two things need a driver at once):\n" + "\n".join(_conf))
-
     # Email flags queued for the next digest, and flags never engaged with.
     conn = db()
     try:
@@ -5200,16 +5193,6 @@ def tools_for_role(role, is_group=False):
             "description": "Check upcoming events on the family's Google Calendar.",
             "input_schema": {"type": "object", "properties": {
                 "days_ahead": {"type": "integer", "description": "Days ahead (default 7)."}}}})
-        tools.append({
-            "name": "check_conflicts",
-            "description": ("Scan the calendar for SCHEDULING CONFLICTS - events whose times "
-                            "overlap (someone double-booked, or two things needing a driver "
-                            "at once). I find the clashes in code, so use this for 'any "
-                            "conflicts this week?', 'is Saturday clear?', 'does anything "
-                            "clash?' instead of eyeballing the calendar yourself."),
-            "input_schema": {"type": "object", "properties": {
-                "days_ahead": {"type": "integer",
-                               "description": "How many days ahead to scan (default 7)."}}}})
 
     if perms["calendar_write"]:
         tools.append({
@@ -5990,8 +5973,6 @@ def run_tool(name, tool_input, sender_name, sender_role, sender_chat, is_group=F
     if name == "travel_time":
         return tool_travel_time(tool_input.get("from_place"), tool_input.get("to_place"),
                                 tool_input.get("arrive_by"))
-    if name == "check_conflicts":
-        return tool_check_conflicts(tool_input.get("days_ahead", 7))
     if name == "backup_now":
         return run_backup(reason="you asked")
     if name == "backup_link":
@@ -6400,7 +6381,7 @@ GUIDE_TOPICS = [
         "key": "extras", "title": "Travel, weather, photos and questions",
         "roles": ("adult", "caregiver", "child"), "private_only": False,
         "tools": ["add_flight", "add_trip", "add_flight_manual", "weather", "travel_time",
-                  "check_conflicts", "web_search"],
+                  "web_search"],
         "summary": "Flights, forecasts, drive times, reading documents, questions.",
         "body": [
             "FLIGHTS (parents): \"I'm on AA1234 July 22, back AA1428 the 29th\" - I look "
@@ -6415,9 +6396,6 @@ GUIDE_TOPICS = [
             "from the Blast event to the game by 11?\" - I look up the real driving time and "
             "tell you when to leave. I'll also flag a too-tight back-to-back in the morning "
             "briefing on my own.",
-            "CONFLICTS: \"any clashes this week?\", \"is Saturday clear?\" - I scan the "
-            "calendar for events that overlap (someone double-booked, or two things needing "
-            "a driver at once) and flag them in the morning briefing on my own too.",
             "PHOTOS AND PDFs: send me a school flyer, permission slip or handwritten list - "
             "even a scan - and I'll read it, pull out the dates, check them against the "
             "calendar and offer to add them.",
@@ -7793,108 +7771,6 @@ def _briefing_travel_warnings():
         return ""
     return ("TRAVEL CHECK (real driving times looked up just now - state these as facts, do "
             "NOT recompute or soften them):\n" + "\n".join(lines))
-
-
-# ---- Batch 42: proactive conflict detection (find clashes, don't wait to be asked) ----
-def _scan_calendar_conflicts(days=2):
-    """Deterministic overlap detector: timed events on the family calendar over the next
-    `days` whose times genuinely overlap - the guarantee behind proactive conflict alerts.
-    The model is TOLD which events collide; it never decides that itself. All-day entries
-    are skipped (no clock time to clash). Returns dicts sorted by start; [] on any problem
-    or when nothing overlaps."""
-    service = get_calendar_service()
-    if not service:
-        return []
-    now = now_local()
-    horizon = now + datetime.timedelta(days=days)
-    try:
-        result = service.events().list(
-            calendarId=FAMILY_CALENDAR_ID, timeMin=now.isoformat(),
-            timeMax=horizon.isoformat(), singleEvents=True, orderBy="startTime",
-            maxResults=100).execute()
-    except Exception as e:
-        print(f"[conflicts] calendar read failed: {e}")
-        return []
-    timed = []
-    for e in result.get("items", []):
-        s = e["start"].get("dateTime")
-        en = e.get("end", {}).get("dateTime")
-        if not s:
-            continue  # all-day entry: no time to collide
-        try:
-            sdt = datetime.datetime.fromisoformat(s)
-            edt = datetime.datetime.fromisoformat(en) if en else sdt
-        except (ValueError, TypeError):
-            continue
-        if edt <= now:
-            continue
-        timed.append({"sum": e.get("summary", "(event)"), "s": sdt, "e": edt,
-                      "loc": (e.get("location") or "").strip(), "owner": _event_owner(e)})
-    timed.sort(key=lambda x: x["s"])
-    conflicts = []
-    for i in range(len(timed)):
-        a = timed[i]
-        for j in range(i + 1, len(timed)):
-            b = timed[j]
-            if b["s"] >= a["e"]:
-                break  # sorted by start: nothing later can overlap a
-            if a["s"] < b["e"] and b["s"] < a["e"]:
-                oa, ob = a["owner"].strip(), b["owner"].strip()
-                same = bool(oa) and oa.lower() == ob.lower()
-                conflicts.append({"a": a, "b": b, "same_person": same,
-                                  "owner": oa if same else ""})
-    return conflicts
-
-
-def _render_conflicts(conflicts):
-    """Human lines for a conflict list. Same-person double-bookings first (hardest), then
-    cross-person 'two at once'. Portable date/time formatting only (this runs in tests)."""
-    if not conflicts:
-        return []
-    def span(x):
-        return f"{_ampm(x['s'])}-{_ampm(x['e'])}" if x["e"] > x["s"] else _ampm(x["s"])
-    def at(x):
-        return f" @ {x['loc']}" if x["loc"] else ""
-    lines = []
-    for c in sorted(conflicts, key=lambda c: (not c["same_person"], c["a"]["s"])):
-        a, b = c["a"], c["b"]
-        when = a["s"].strftime("%a %b ") + str(a["s"].day)
-        if c["same_person"]:
-            lines.append(f"  - {c['owner']} is double-booked {when}: {a['sum']} "
-                         f"({span(a)}{at(a)}) overlaps {b['sum']} ({span(b)}{at(b)}). "
-                         f"Cannot be at both.")
-        else:
-            lines.append(f"  - Two at once {when}: {a['sum']} ({span(a)}{at(a)}) overlaps "
-                         f"{b['sum']} ({span(b)}{at(b)}). Who's covering each?")
-    return lines
-
-
-def _briefing_conflicts():
-    """Deterministic 'CONFLICTS FOUND' block for the briefing - the guarantee a double-
-    booking is RAISED, not left for the model to spot. '' when none."""
-    lines = _render_conflicts(_scan_calendar_conflicts(days=2))
-    if not lines:
-        return ""
-    return ("CONFLICTS FOUND (real calendar overlaps - raise every one as a fact; use the "
-            "event notes and locations above to explain what each involves, then offer a "
-            "sensible option or ask who covers what - do NOT invent a resolution the family "
-            "has not chosen):\n" + "\n".join(lines))
-
-
-def tool_check_conflicts(days_ahead=7):
-    """Model-free conflict scan for the interactive path: overlapping events over the next N
-    days. The clashes are found in CODE, so a conflict is never missed or imagined."""
-    try:
-        days = int(days_ahead)
-    except (ValueError, TypeError):
-        days = 7
-    days = max(1, min(days, 30))
-    lines = _render_conflicts(_scan_calendar_conflicts(days=days))
-    if not lines:
-        return (f"No scheduling conflicts for the next {days} days - nothing on the "
-                "calendar overlaps. Say so plainly.")
-    return ("These calendar events overlap (state each as fact; suggest how to handle it or "
-            "ask who covers what, but do not invent a resolution):\n" + "\n".join(lines))
 
 
 # ---- Batch 44: undo - cleanly reverse the last thing Guppi did ----
@@ -9843,10 +9719,9 @@ def job_morning_briefing():
         return
     shared_reminders = _briefing_reminders(None, scope="shared")
     travel = _briefing_travel_warnings()   # Batch 39: real drive times for tight back-to-backs
-    conflicts = _briefing_conflicts()      # Batch 42: real calendar overlaps to raise
     context = "\n\n".join(x for x in
                             (when, glossary, occasions, memory, calendar, shared_reminders,
-                             conflicts, travel,
+                             travel,
                              weather or "WEATHER: unavailable - could not be fetched.")
                             if x)
     try:
@@ -10735,76 +10610,6 @@ def _job_error_listener(event):
     poll is visible and diagnosable — and never silently stops the whole scheduler."""
     print(f"[scheduler] JOB '{event.job_id}' FAILED: {event.exception!r}")
 
-def _conflict_sig(c):
-    """A stable, order-independent signature for one conflict, so a standing clash is alerted
-    once (Batch 43). Keyed on owner + both events' title and start."""
-    a, b = c["a"], c["b"]
-    pair = sorted([f"{a['sum']}@{a['s'].isoformat()}", f"{b['sum']}@{b['s'].isoformat()}"])
-    return (c.get("owner", "") + "||" + "||".join(pair)).lower()
-
-
-def _word_conflict_haiku(line):
-    """Warm one deterministic conflict line into a 1-2 sentence heads-up with Haiku. Falls
-    back to the EXACT deterministic line on any failure - the alert's facts are already
-    correct, so it must never depend on the model call succeeding."""
-    if not claude_call_allowed():
-        return line
-    try:
-        resp = claude_create(
-            model=MODEL, max_tokens=200,
-            system=("You are Guppi. You are given ONE scheduling conflict already worked out "
-                    "from the family calendar. Rewrite it as a brief, warm heads-up (1-2 "
-                    "sentences) for a parent. Keep every name, event and time EXACTLY as "
-                    "given - never change, drop, or invent a detail, and do not assert a "
-                    "resolution the family has not chosen; you may end by asking how they'd "
-                    "like to handle it. No greeting, no markdown, no emoji."),
-            messages=[{"role": "user", "content": line}])
-        out = "".join(b.text for b in resp.content if b.type == "text").strip()
-        return out or line
-    except Exception as e:
-        print(f"[conflict-watch] haiku wording failed: {e}")
-        return line
-
-
-def job_conflict_watch():
-    """Near-real-time proactive conflict alerts, on the email-poll cadence (Batch 43). Re-scan
-    the calendar; for any conflict NOT already alerted, word it with Haiku (one call per
-    conflict) and push it to the adults. De-duped by a persisted signature set so a standing
-    conflict is announced once; a signature drops when its conflict resolves, so the same clash
-    returning later alerts again. The scan and facts are model-free - only the wording is
-    Haiku, and it falls back to the deterministic line if the model call fails."""
-    if not proactive_on() or in_quiet_hours():
-        return
-    conflicts = _scan_calendar_conflicts(days=3)
-    current = {_conflict_sig(c): c for c in conflicts}
-    try:
-        seen = set(json.loads(get_setting("alerted_conflicts") or "[]"))
-    except Exception:
-        seen = set()
-    adults = _adults_with_chats()
-    if not adults:
-        return
-    for sig, c in current.items():
-        if sig in seen:
-            continue
-        rendered = _render_conflicts([c])
-        if not rendered:
-            continue
-        worded = _word_conflict_haiku(rendered[0].strip().lstrip("- ").strip())
-        sent_any = False
-        for _name, chat in adults:
-            if send_message(chat, "Heads up - a scheduling conflict:\n\n" + worded,
-                            proactive=True):
-                sent_any = True
-        if sent_any:
-            seen.add(sig)
-            print(f"[conflict-watch] pushed new conflict: {sig}")
-    # Keep only signatures whose conflict is still active, so a resolved clash re-alerts if it
-    # returns; bound the store as a backstop.
-    keep = [s for s in seen if s in current]
-    set_setting("alerted_conflicts", json.dumps(keep[-50:]))
-
-
 # ---- Batch 45: forward-to-Guppi - "guppi" in an email subject = handle it now ----
 def _subject_tags_guppi(subject):
     """True when an email subject calls Guppi by name - a parent forwarding something and
@@ -10894,8 +10699,6 @@ def start_scheduler():
                       replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_urgent_email_poll, "interval", minutes=poll_min,
                       id="email_poll", replace_existing=True, max_instances=1, coalesce=True)
-    scheduler.add_job(job_conflict_watch, "interval", minutes=poll_min,
-                      id="conflict_watch", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_guppi_inbox_check, "interval", minutes=5,
                       id="guppi_inbox", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(job_weekly_digest, "cron", day_of_week="sun", hour=18, minute=0,
@@ -10908,7 +10711,7 @@ def start_scheduler():
                       replace_existing=True, max_instances=1, coalesce=True)
     _schedule_digest_jobs()
     scheduler.start()
-    print(f"[scheduler] started: reminders/min, briefing 6am, occasions 7am, weekly Sun 6pm, email poll/{poll_min}min, conflict watch/{poll_min}min, guppi-inbox/5min, backup 3:30am (all sent PRIVATELY, never to the group)")
+    print(f"[scheduler] started: reminders/min, briefing 6am, occasions 7am, weekly Sun 6pm, email poll/{poll_min}min, guppi-inbox/5min, backup 3:30am (all sent PRIVATELY, never to the group)")
     print("[boot] anti-repeat guards ACTIVE: IMAP high-water marker (Trap 116) + "
           "per-email-id dedupe (Trap 115). A repeated email flag now logs "
           "'skipped as already-seen'.")
