@@ -1067,7 +1067,7 @@ def welcome_message(name, role):
                 "• \"What am I forgetting?\" — one sweep of everything still open\n"
                 "• Files — send a flyer or card and say \"file that\"; ask for it back "
                 "any time\n\n"
-                "I'll also send a morning briefing.\n\nNew here? Say \"set up the family\" and I'll walk you through the basics - who's who, your shorthand, and key dates.")
+                "I'll also send a morning briefing.\n\nNew here? Say \"set up the family\" and I'll walk you through the basics - who's who, your shorthand, and key dates. Prefer thorough? say \"in-depth setup\".")
     elif role == "caregiver":
         body = ("Here's what I can help with:\n"
                 "• Calendar — \"what's on the kids' schedule today?\", \"add gymnastics "
@@ -7738,7 +7738,7 @@ def _parse_clock(s):
 def tool_travel_time(from_place, to_place, arrive_by=None):
     """Real driving time between two places, and (when arrive_by is given) the time to leave
     to make it - the leave time is computed in CODE, never guessed. from_place blank = home."""
-    origin = (from_place or "").strip() or HOME_ADDRESS
+    origin = (from_place or "").strip() or (get_setting("home_address") or "") or HOME_ADDRESS
     dest = (to_place or "").strip()
     if not dest:
         return "Where do you want the driving time TO?"
@@ -8027,6 +8027,16 @@ def run_onboarding(chat, who_id, sender_name, sender_role, text):
     low = t.lower().strip("!.?")
     step = get_setting(f"onboard_{chat}") or ""
 
+    if get_setting(f"onboard_deep_{chat}"):
+        return _run_deep(chat, who_id, sender_name, sender_role, text)
+    if not step and _looks_like_deep_setup(text):
+        if sender_role != "adult":
+            return "Only a parent can run family setup."
+        _deep_set(chat, {"step": "name", "children": [], "ci": 0})
+        return ("Great - the in-depth setup. I'll ask specific questions and save each answer "
+                "as we go. Say skip for any question or cancel to stop.\n\n"
+                "First: what should I call you?")
+
     if not step:
         if sender_role != "adult":
             return "Only a parent can run family setup."
@@ -8103,6 +8113,201 @@ def run_onboarding(chat, who_id, sender_name, sender_role, text):
         return f"Saved: {title} ({kind}) on {mo}/{dy}.\n\nAnother? (or done)"
 
     set_setting(f"onboard_{chat}", "")
+    return _ob_wrapup()
+
+
+# ---- Batch 50: in-depth interview (rigid, granular fields) -------------------
+_DEEP_TRIGGER = {"in-depth setup", "in depth setup", "indepth setup", "detailed setup",
+                 "deep setup", "full setup", "thorough setup", "in-depth", "in depth"}
+
+
+def _looks_like_deep_setup(text):
+    return (text or "").strip().lower().strip("!.?") in _DEEP_TRIGGER
+
+
+def _deep_get(chat):
+    try:
+        return json.loads(get_setting(f"onboard_deep_{chat}") or "")
+    except Exception:
+        return None
+
+
+def _deep_set(chat, state):
+    set_setting(f"onboard_deep_{chat}", json.dumps(state) if state else "")
+
+
+def _deep_children(chat):
+    conn = db()
+    rows = conn.execute("SELECT name FROM people WHERE role='child' ORDER BY id").fetchall()
+    conn.close()
+    return [r["name"] for r in rows]
+
+
+def _run_deep(chat, who_id, sender_name, sender_role, text):
+    """The in-depth interview: rigid, one-field-at-a-time questions, each saved + confirmed.
+    Richer JSON state (which child, which field). Model-free."""
+    t = (text or "").strip()
+    low = t.lower().strip("!.?")
+    st = _deep_get(chat)
+    if st is None:
+        _deep_set(chat, "")
+        return "Something got tangled in setup - say \"in-depth setup\" to start again."
+    if low in ("cancel", "stop", "quit", "stop setup"):
+        _deep_set(chat, "")
+        return "Okay, I've paused the in-depth setup. Say \"in-depth setup\" to resume."
+    step = st.get("step")
+    skip = low in ("skip", "none", "na", "n/a")
+
+    if step == "name":
+        if low not in ("skip",):
+            name = t.title()
+            if name and len(name) <= 40:
+                conn = db()
+                clash = conn.execute("SELECT chat_id FROM people WHERE LOWER(name)=?",
+                                     (name.lower(),)).fetchone()
+                if clash and str(clash["chat_id"]) != str(who_id):
+                    conn.close()
+                    return f"I already have a {name} on the list. What else can I call you?"
+                me = conn.execute("SELECT 1 FROM people WHERE chat_id=?", (str(who_id),)).fetchone()
+                if me:
+                    conn.execute("UPDATE people SET name=? WHERE chat_id=?", (name, str(who_id)))
+                else:
+                    conn.execute("INSERT INTO people (name,role,chat_id) VALUES (?,'adult',?)",
+                                 (name, str(who_id)))
+                conn.commit(); conn.close()
+        st["step"] = "people"; _deep_set(chat, st)
+        return ("Got it. Now the family - add each person one at a time, like:\n"
+                "  - Kim, parent\n  - Charlotte, daughter  (daughter/son sets girl/boy)\n"
+                "  - Bree, caregiver\nSay done when everyone's in.")
+
+    if step == "people":
+        if low in ("done", "next", "skip"):
+            kids = _deep_children(chat)
+            st["children"] = kids; st["ci"] = 0
+            if kids:
+                st["step"] = "cs"; _deep_set(chat, st)
+                return (f"Now some detail on each child. First, {kids[0]}:\n\n"
+                        f"What school does {kids[0]} go to? (or skip)")
+            st["step"] = "home"; _deep_set(chat, st)
+            return "What's your home address? (used for drive times; or skip)"
+        p = _parse_person_line(t)
+        if not p:
+            return "Try `Name, role` - e.g. `Kim, parent`, `Charlotte, daughter`. Or done."
+        existed = _upsert_person(p["name"], p["role"], p["gender"])
+        if p["role"] == "adult":
+            tail = f" Have {p['name']} send /start with the family code to link their phone."
+        else:
+            link_person(p["name"], "adult")
+            tail = f" Have {p['name']} open a chat with me and send /start."
+        g = f", {p['gender']}" if p["gender"] else ""
+        return (f"{'Updated' if existed else 'Added'}: {p['name']} ({p['role']}{g}).{tail}"
+                f"\n\nAnyone else? (or done)")
+
+    if step in ("cs", "cg", "ct", "ca"):
+        kids = st.get("children", []); ci = st.get("ci", 0)
+        child = kids[ci] if ci < len(kids) else None
+        if child is None:
+            st["step"] = "home"; _deep_set(chat, st)
+            return "What's your home address? (used for drive times; or skip)"
+        if step == "cs":
+            if not skip and t:
+                tool_remember(f"{child}'s school is {t}", child, sender_name or "setup")
+            st["step"] = "cg"; _deep_set(chat, st)
+            return f"What grade is {child} in? (or skip)"
+        if step == "cg":
+            if not skip and t:
+                tool_remember(f"{child} is in grade {t}", child, sender_name or "setup")
+            st["step"] = "ct"; _deep_set(chat, st)
+            return f"Who is {child}'s teacher? (or skip)"
+        if step == "ct":
+            if not skip and t:
+                tool_remember(f"{child}'s teacher is {t}", child, sender_name or "setup")
+            st["step"] = "ca"; _deep_set(chat, st)
+            return (f"What sports or activities is {child} in? Include team names, "
+                    f"comma-separated. (or skip)")
+        if step == "ca":
+            if not skip and t:
+                for act in [a.strip() for a in re.split(r"[,;\n]", t) if a.strip()]:
+                    tool_remember(f"{child} does {act}", child, sender_name or "setup")
+            ci += 1; st["ci"] = ci
+            if ci < len(kids):
+                st["step"] = "cs"; _deep_set(chat, st)
+                return f"Now {kids[ci]}. What school does {kids[ci]} go to? (or skip)"
+            st["step"] = "home"; _deep_set(chat, st)
+            return "That's the kids. What's your home address? (used for drive times; or skip)"
+
+    if step == "home":
+        if not skip and t:
+            set_setting("home_address", t)
+        st["step"] = "places"; _deep_set(chat, st)
+        return ("Any key places I should know, for drive times? Add like:\n"
+                "  - Agnes Irwin = 275 S Ithan Ave, Rosemont PA\n"
+                "  - Soccer field = 100 Field Rd, Newtown Square\nSay done to move on.")
+
+    if step == "places":
+        if low in ("done", "next", "skip"):
+            st["step"] = "priority"; _deep_set(chat, st)
+            return ("Whose emails should I ALWAYS flag for you? Add one at a time - a name, "
+                    "email, or domain (the school's domain, a coach, the pediatrician). "
+                    "Say done to move on.")
+        if "=" not in t:
+            return "Use `Place = address`. Or done."
+        place, addr = t.split("=", 1)
+        place, addr = place.strip(), addr.strip()
+        if not place or not addr:
+            return "Both sides please: `Place = address`. Or done."
+        tool_add_glossary_term(place, addr, sender_name or "setup", category="Places")
+        return f"Saved place: {place} = {addr}.\n\nAnother? (or done)"
+
+    if step == "priority":
+        if low in ("done", "next", "skip"):
+            st["step"] = "ignore"; _deep_set(chat, st)
+            return ("Anything I should ALWAYS ignore (a newsletter, a marketing sender)? "
+                    "Add one at a time, or say done.")
+        tool_manage_email_priorities("prioritize", sender=t, person=sender_name)
+        return f"Will always flag: {t}.\n\nAnother? (or done)"
+
+    if step == "ignore":
+        if low in ("done", "next", "skip"):
+            st["step"] = "glossary"; _deep_set(chat, st)
+            return _ob_glossary_intro()
+        tool_manage_email_priorities("ignore", sender=t, person=sender_name)
+        return f"Will ignore: {t}.\n\nAnother? (or done)"
+
+    if step == "glossary":
+        if low in ("done", "next", "skip"):
+            st["step"] = "occasions"; _deep_set(chat, st)
+            return _ob_occasions_intro()
+        if "=" not in t:
+            return "Use `term = meaning`. Or done."
+        term, meaning = t.split("=", 1)
+        term, meaning = term.strip(), meaning.strip()
+        if not term or not meaning:
+            return "Both sides please: `term = meaning`. Or done."
+        tool_add_glossary_term(term, meaning, sender_name or "setup")
+        return f"Saved: {term} = {meaning}.\n\nAnother? (or done)"
+
+    if step == "occasions":
+        if low in ("done", "next", "skip"):
+            st["step"] = "extra"; _deep_set(chat, st)
+            return ("Last thing - anything else about how your family runs that would help me? "
+                    "Work schedules, who usually drives whom, dietary basics, standing "
+                    "commitments. Tell me in your own words (or say done).")
+        parsed = _parse_occasion_line(t)
+        if not parsed:
+            return "Try `Name birthday 3/14` or `Anniversary 6/20`. Or done."
+        title, kind, mo, dy = parsed
+        tool_add_occasion(title, kind, mo, dy)
+        return f"Saved: {title} ({kind}) on {mo}/{dy}.\n\nAnother? (or done)"
+
+    if step == "extra":
+        if low not in ("done", "next", "skip", "no", "nope") and t:
+            tool_remember(t, "family", sender_name or "setup")
+            return "Noted. Anything else? (or done)"
+        _deep_set(chat, "")
+        return _ob_wrapup()
+
+    _deep_set(chat, "")
     return _ob_wrapup()
 
 
@@ -8262,7 +8467,7 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
 
     # Onboarding (Batch 48): while setup is active, or when a parent starts it, route the
     # message through the interview state machine (model-free). Private chats only.
-    if not is_group and (get_setting(f"onboard_{who_id}") or _looks_like_setup(user_message)):
+    if not is_group and (get_setting(f"onboard_{who_id}") or get_setting(f"onboard_deep_{who_id}") or _looks_like_setup(user_message) or _looks_like_deep_setup(user_message)):
         reply = run_onboarding(who_id, who_id, sender_name, sender_role, user_message)
         save_history(hist_key, user_message, reply)
         print(f"[onboard] step={get_setting(f'onboard_{who_id}')!r} for chat={who_id}")
