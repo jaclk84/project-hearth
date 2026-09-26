@@ -96,7 +96,11 @@ DB_PATH = "/app/data/guppi.db"
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
-BASE_URL = "https://web-production-5fa1fd.up.railway.app"
+# Batch 49 (portability): the app's own public URL, used for OAuth redirect URIs and the
+# Telegram webhook. A new family MUST set BASE_URL to their own Railway URL; the default keeps
+# the current deployment working with no env change.
+BASE_URL = (os.environ.get("BASE_URL", "").strip().rstrip("/")
+            or "https://web-production-5fa1fd.up.railway.app")
 REDIRECT_URI = f"{BASE_URL}/oauth/callback"
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
