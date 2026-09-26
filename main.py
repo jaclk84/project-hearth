@@ -7929,6 +7929,21 @@ def _looks_like_setup(text):
     return (text or "").strip().lower().strip("!.?") in _ONBOARD_START
 
 
+def _wants_exit(text):
+    """Forgiving exit detector for the interview, so a parent never feels trapped. Excludes
+    done/skip/next (those advance within the flow); 'stop' only as a whole word (a place like
+    'Stop & Shop' must not exit)."""
+    low = re.sub(r"\s+", " ", (text or "").strip().lower().strip("!.?"))
+    exits = {"cancel", "exit", "quit", "stop", "abort", "nevermind", "never mind",
+             "done for now", "stop setup", "stop the setup", "cancel setup", "exit setup",
+             "quit setup", "get me out", "leave setup", "i'm done", "im done", "end setup",
+             "get out", "im out", "i'm out", "no thanks"}
+    if low in exits:
+        return True
+    return (low.startswith(("exit", "quit", "cancel", "abort"))
+            or "never mind" in low or "nevermind" in low)
+
+
 def _parse_person_line(line):
     """Parse 'Name, role[, gender]' (or 'Name, daughter' / 'Name, boy'). Returns
     {name, role, gender} or None if there's no usable role."""
@@ -8039,7 +8054,7 @@ def run_onboarding(chat, who_id, sender_name, sender_role, text):
             return "Only a parent can run family setup."
         _deep_set(chat, {"step": "name", "children": [], "ci": 0})
         return ("Great - the in-depth setup. I'll ask specific questions and save each answer "
-                "as we go. Say skip for any question or cancel to stop.\n\n"
+                "as we go. Say skip for any question, or cancel/exit to stop.\n\n"
                 "First: what should I call you?")
 
     if not step:
@@ -8047,9 +8062,9 @@ def run_onboarding(chat, who_id, sender_name, sender_role, text):
             return "Only a parent can run family setup."
         set_setting(f"onboard_{chat}", "name")
         return ("Let's set up your family - I'll ask a few things and save each as we go. "
-                "Say skip for any section or cancel to stop.\n\n"
+                "Say skip for any section, or cancel/exit to stop.\n\n"
                 "First: what should I call you?")
-    if low in ("cancel", "stop", "quit", "stop setup"):
+    if _wants_exit(low):
         set_setting(f"onboard_{chat}", "")
         return "Okay, I've paused setup. Say \"set up the family\" to pick up again."
 
@@ -8157,7 +8172,7 @@ def _run_deep(chat, who_id, sender_name, sender_role, text):
     if st is None:
         _deep_set(chat, "")
         return "Something got tangled in setup - say \"in-depth setup\" to start again."
-    if low in ("cancel", "stop", "quit", "stop setup"):
+    if _wants_exit(low):
         _deep_set(chat, "")
         return "Okay, I've paused the in-depth setup. Say \"in-depth setup\" to resume."
     step = st.get("step")
