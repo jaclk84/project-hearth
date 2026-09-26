@@ -6199,6 +6199,8 @@ GUIDE_TOPICS = [
             "JUST FOR YOU: say \"my work thing\" or \"just for me\" and I'll colour it "
             "sage so your own commitments stand out from family ones.",
             "CHANGE OR CANCEL: \"move the dentist to 3pm\", \"cancel Saturday's game\".",
+            "UNDO: made a mistake? Say \"undo\" (or \"scratch that\") right after and I'll "
+            "reverse the last thing I added - an event or a reminder.",
             "SOMETHING ON SEVERAL DAYS: \"add camp 9am to 4pm Monday through Thursday\" - "
             "I make ONE repeating event, not four. To remove it, say whether you mean just "
             "that day or the whole thing; I'll ask if you don't.",
@@ -6421,6 +6423,9 @@ GUIDE_TOPICS = [
             "a reconnect link\". I'll tell you honestly if something has expired.",
             "ADD A PERSON: \"invite Breanna\" - then they message me /start. That's how "
             "kids and a caregiver join without the setup code.",
+            "FAMILY SETUP: a parent can say \"set up the family\" for a quick pass, or "
+            "\"in-depth setup\" for the detailed one - schools, teachers, activities, "
+            "addresses and priority senders. Say skip, done or cancel any time.",
             "BACKUPS: I back up nightly and each one replaces the last. \"back up now\" "
             "for one on demand, or \"send me a backup link\" to save a copy to your own "
             "device.",
