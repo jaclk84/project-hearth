@@ -205,6 +205,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 # The bot's @username, used to detect being addressed in a group (e.g. "@GuppiBot").
 BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@").lower()
 
+# The assistant's spoken name (Batch 47, portability). A family may rename it; the name
+# variants Guppi answers to (group @-address, email-subject tagging) derive from this.
+BOT_NAME = (os.environ.get("BOT_NAME", "Guppi").strip() or "Guppi")
+
 # ---- Microsoft (live.com / outlook) email via OAuth2 over IMAP ---------------
 # Personal Microsoft accounts no longer allow password/app-password IMAP (basic auth
 # was retired Sept 2024). The only supported path is OAuth2: the person signs in on
@@ -226,8 +230,10 @@ MS_IMAP_PORT = 993
 
 # Where to get weather for the briefing (open-meteo needs no API key). Defaults to
 # the Philadelphia area; override with LATITUDE / LONGITUDE env vars.
-WEATHER_LAT = os.environ.get("LATITUDE", "39.95")
-WEATHER_LON = os.environ.get("LONGITUDE", "-75.16")
+WEATHER_LAT = os.environ.get("LATITUDE", "")
+WEATHER_LON = os.environ.get("LONGITUDE", "")
+if not (WEATHER_LAT and WEATHER_LON):
+    print("[config] LATITUDE/LONGITUDE not set - weather is OFF until you set them.")
 # The town name shown alongside a forecast. Purely cosmetic, but it makes a WRONG location
 # VISIBLE instead of silent - the whole reason the Philadelphia-vs-Swarthmore gap went
 # unnoticed was that nothing ever said which place it was reporting on.
@@ -361,16 +367,11 @@ def humanize_when(iso_str):
 # list_calendars tool to find it.
 FAMILY_CALENDAR_ID = os.environ.get("FAMILY_CALENDAR_ID", "primary")
 
-# Family roster: names seeded here. Chat IDs are bound later:
-#   - adults bind themselves with  /start <TELEGRAM_SETUP_SECRET>
-#   - everyone else is linked BY A PARENT ("link Breanna", then Breanna sends /start)
-SEEDED_PEOPLE = [
-    ("Jason",     "adult"),
-    ("Kim",       "adult"),
-    ("Breanna",   "caregiver"),
-    ("Lillian",   "child"),
-    ("Charlotte", "child"),
-]
+# Family roster: NOTHING is seeded (Batch 47, portability) - a fresh deploy starts empty.
+#   - the FIRST /start <TELEGRAM_SETUP_SECRET> creates adult #1 with a placeholder name
+#     (onboarding renames it); there is no adult cap
+#   - additional adults: added by name in onboarding, then they /start with the secret
+#   - kids/caregiver: invited BY NAME by a parent, then they send /start
 
 # What each role may do. Enforced in code, never left to the model's judgment.
 PERMISSIONS = {
@@ -458,7 +459,13 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
         role TEXT NOT NULL,
-        chat_id TEXT UNIQUE)""")
+        chat_id TEXT UNIQUE,
+        gender TEXT)""")
+    # Batch 47 (portability): optional gender, so gender groups ("the girls"/"the boys")
+    # derive from data for any family. Migration for DBs created before this column.
+    _pcols = [r[1] for r in conn.execute("PRAGMA table_info(people)").fetchall()]
+    if "gender" not in _pcols:
+        conn.execute("ALTER TABLE people ADD COLUMN gender TEXT")
     # A parent "invites" a non-adult by name; that person then sends /start and is
     # bound to the next open invite. Keeps kids/caregiver from needing the secret.
     conn.execute("""CREATE TABLE IF NOT EXISTS pending_links (
@@ -637,9 +644,6 @@ def init_db():
     dcols = [r[1] for r in conn.execute("PRAGMA table_info(documents)").fetchall()]
     if "sha256" not in dcols:
         conn.execute("ALTER TABLE documents ADD COLUMN sha256 TEXT")
-    conn.commit()
-    for name, role in SEEDED_PEOPLE:
-        conn.execute("INSERT OR IGNORE INTO people (name, role) VALUES (?, ?)", (name, role))
     conn.commit()
     conn.close()
     _migrate_encrypt_at_rest()
@@ -985,6 +989,18 @@ def identify_sender(chat_id):
     return None, "unknown"
 
 
+def _placeholder_adult_name(conn):
+    """A unique stand-in name for a just-bootstrapped first parent, until onboarding asks
+    what to call them (Batch 47). 'Parent', then 'Parent 2', etc."""
+    base = "Parent"
+    if not conn.execute("SELECT 1 FROM people WHERE name = ?", (base,)).fetchone():
+        return base
+    i = 2
+    while conn.execute("SELECT 1 FROM people WHERE name = ?", (f"{base} {i}",)).fetchone():
+        i += 1
+    return f"{base} {i}"
+
+
 def bind_adult(chat_id, supplied_secret):
     """Bind a chat to an adult slot using the setup secret. This REPLACES the
     phone-number env vars of the SMS version as the security boundary.
@@ -1005,15 +1021,25 @@ def bind_adult(chat_id, supplied_secret):
     free = conn.execute(
         "SELECT name FROM people WHERE role = 'adult' AND chat_id IS NULL "
         "ORDER BY id LIMIT 1").fetchone()
-    if not free:
-        conn.close()
-        return "Both parent slots are already taken."
-    conn.execute("UPDATE people SET chat_id = ? WHERE name = ?",
-                 (str(chat_id), free["name"]))
-    conn.commit()
+    if free:
+        conn.execute("UPDATE people SET chat_id = ? WHERE name = ?",
+                     (str(chat_id), free["name"]))
+        conn.commit(); conn.close()
+        print(f"[setup] bound adult {free['name']} to chat {chat_id}")
+        return welcome_message(free["name"], "adult")
+    # No free adult slot. If the roster has NO adults at all, this is first-run bootstrap:
+    # the first valid secret creates adult #1 with a placeholder name (onboarding renames).
+    any_adult = conn.execute("SELECT 1 FROM people WHERE role = 'adult' LIMIT 1").fetchone()
+    if not any_adult:
+        pname = _placeholder_adult_name(conn)
+        conn.execute("INSERT INTO people (name, role) VALUES (?, 'adult')", (pname,))
+        conn.execute("UPDATE people SET chat_id = ? WHERE name = ?", (str(chat_id), pname))
+        conn.commit(); conn.close()
+        print(f"[setup] bootstrap: created first adult {pname!r} bound to chat {chat_id}")
+        return welcome_message(pname, "adult")
     conn.close()
-    print(f"[setup] bound adult {free['name']} to chat {chat_id}")
-    return welcome_message(free["name"], "adult")
+    return ("Everyone set up so far is already linked. To add another adult, a parent adds "
+            "them by name first, then that person sends /start with the code.")
 
 
 def welcome_message(name, role):
@@ -3979,38 +4005,57 @@ def tool_forget(memory_id):
 
 # ---- Reminders (stored now; the Phase 4 scheduler will fire them) -----------
 # ---- Resolve a nudge target (a name, or a group like "the girls") -----------
-GROUP_ALIASES = {
-    "the girls": ["Lillian", "Charlotte"],
-    "the kids": ["Lillian", "Charlotte"],
-    "the children": ["Lillian", "Charlotte"],
-    "the parents": ["Jason", "Kim"],
+# Group aliases are DERIVED from the roster (Batch 47, portability) - never hardcoded names.
+# role gives "the kids"/"the parents"; the optional gender field gives "the girls"/"the boys",
+# so gender groups work for ANY family and are empty (not wrong) when gender isn't recorded.
+_GROUP_SPECS = {
+    "the kids": ("child", None), "kids": ("child", None),
+    "the children": ("child", None), "children": ("child", None),
+    "the parents": ("adult", None), "parents": ("adult", None),
+    "the adults": ("adult", None), "adults": ("adult", None),
+    "the girls": ("child", ("f", "female", "girl")),
+    "girls": ("child", ("f", "female", "girl")),
+    "the boys": ("child", ("m", "male", "boy")),
+    "boys": ("child", ("m", "male", "boy")),
 }
 
+
+def _group_targets(conn, key):
+    """(name, chat_id) for a group alias derived from role (+ optional gender), or None if
+    `key` is not a group alias. Only people who've linked (chat_id set) are returned."""
+    spec = _GROUP_SPECS.get(key)
+    if not spec:
+        return None
+    role, genders = spec
+    if genders:
+        ph = ",".join("?" * len(genders))
+        rows = conn.execute(
+            "SELECT name, chat_id FROM people WHERE role = ? AND chat_id IS NOT NULL "
+            f"AND LOWER(COALESCE(gender,'')) IN ({ph})", (role, *genders)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT name, chat_id FROM people WHERE role = ? AND chat_id IS NOT NULL",
+            (role,)).fetchall()
+    return [(r["name"], r["chat_id"]) for r in rows]
+
+
 def resolve_targets(target):
-    """Return a list of (name, chat_id) for a nudge target. Accepts a person's name or
-    a group alias. Skips anyone who hasn't set themselves up yet."""
+    """Return a list of (name, chat_id) for a nudge target. Accepts a person's name or a
+    derived group alias ('the kids', 'the parents', 'the girls', 'the boys'). Skips anyone
+    who hasn't linked yet."""
     if not target:
         return []
     key = target.strip().lower()
-    names = GROUP_ALIASES.get(key)
     conn = db()
-    out = []
-    if names:
-        for n in names:
-            row = conn.execute(
-                "SELECT name, chat_id FROM people WHERE name = ? AND chat_id IS NOT NULL",
-                (n,)).fetchone()
-            if row:
-                out.append((row["name"], row["chat_id"]))
-    else:
-        # match a single person by name (case-insensitive)
-        row = conn.execute(
-            "SELECT name, chat_id FROM people WHERE LOWER(name) = ? AND chat_id IS NOT NULL",
-            (key,)).fetchone()
-        if row:
-            out.append((row["name"], row["chat_id"]))
+    grp = _group_targets(conn, key)
+    if grp is not None:
+        conn.close()
+        return grp
+    row = conn.execute(
+        "SELECT name, chat_id FROM people WHERE LOWER(name) = ? AND chat_id IS NOT NULL",
+        (key,)).fetchone()
     conn.close()
-    return out
+    return [(row["name"], row["chat_id"])] if row else []
 
 
 def _norm_reminder_text(t):
@@ -7519,6 +7564,8 @@ def _fetch_weather(days=1):
     A single transient 503/timeout shouldn't wipe the weather, so this retries a couple of
     times with a short backoff before giving up (this is why a briefing once went out with
     no weather at all)."""
+    if not (WEATHER_LAT and WEATHER_LON):
+        return None
     url = (f"https://api.open-meteo.com/v1/forecast?latitude={WEATHER_LAT}"
            f"&longitude={WEATHER_LON}"
            f"&daily=temperature_2m_max,temperature_2m_min,weather_code,"
@@ -8423,7 +8470,17 @@ def _in_reply_window(group_chat_id, person_id):
 # B1/B2: the bot's name was matched with startswith("guppi"), so "Guppy" (Kim's spelling)
 # was ignored outright and "Also guppi can you..." was demoted to overheard mode. Match
 # the name ANYWHERE in the message, and accept the obvious misspellings of a made-up word.
-_BOT_NAMES = ("guppi", "guppy", "gupi", "guppie", "gupppi", "guppii")
+def _bot_name_variants(name):
+    """Lowercase name plus, for the default 'Guppi', its common misspellings - so the
+    assistant is recognized whether or not a family renamed it (Batch 47)."""
+    base = (name or "guppi").strip().lower()
+    variants = {base}
+    if base == "guppi":
+        variants |= {"guppy", "gupi", "guppie", "gupppi", "guppii"}
+    return tuple(variants)
+
+
+_BOT_NAMES = _bot_name_variants(BOT_NAME)
 
 
 def _mentions_bot_name(text):
