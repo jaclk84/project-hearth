@@ -1063,7 +1063,7 @@ def welcome_message(name, role):
                 "• \"What am I forgetting?\" — one sweep of everything still open\n"
                 "• Files — send a flyer or card and say \"file that\"; ask for it back "
                 "any time\n\n"
-                "I'll also send a morning briefing.")
+                "I'll also send a morning briefing.\n\nNew here? Say \"set up the family\" and I'll walk you through the basics - who's who, your shorthand, and key dates.")
     elif role == "caregiver":
         body = ("Here's what I can help with:\n"
                 "• Calendar — \"what's on the kids' schedule today?\", \"add gymnastics "
@@ -7898,6 +7898,210 @@ def tool_undo_last(chat):
     return msg
 
 
+# ---- Batch 48: interview / onboarding mode -----------------------------------
+# A resumable, model-free family setup. A parent starts it ("set up the family"); each
+# answer is written to the right store AND confirmed, one at a time. Idempotent: on an
+# existing roster it UPDATES people (e.g. adds gender) rather than duplicating. State is a
+# single per-chat setting (onboard_<chat> = current step); every answer persists as it comes,
+# so a stop-and-resume never loses anything.
+_ONBOARD_START = ("set up the family", "set up my family", "family setup", "start setup",
+                  "set up guppi", "run setup", "onboarding", "onboard", "setup wizard",
+                  "set up the household")
+
+_ADULT_W = {"parent", "mom", "mum", "mother", "dad", "father", "adult", "spouse",
+            "wife", "husband", "partner"}
+_CARE_W = {"caregiver", "sitter", "nanny", "babysitter", "aupair", "carer"}
+_CHILD_W = {"child", "kid", "son", "daughter", "boy", "girl", "teen"}
+_MALE_W = {"son", "boy", "male", "m"}
+_FEMALE_W = {"daughter", "girl", "female", "f"}
+
+
+def _looks_like_setup(text):
+    return (text or "").strip().lower().strip("!.?") in _ONBOARD_START
+
+
+def _parse_person_line(line):
+    """Parse 'Name, role[, gender]' (or 'Name, daughter' / 'Name, boy'). Returns
+    {name, role, gender} or None if there's no usable role."""
+    parts = [p.strip() for p in (line or "").split(",") if p.strip()]
+    if not parts:
+        return None
+    name = parts[0].strip().title()
+    words = set(re.findall(r"[a-z]+", " ".join(parts[1:]).lower()))
+    role = None
+    if words & _ADULT_W:
+        role = "adult"
+    elif words & _CARE_W:
+        role = "caregiver"
+    elif words & _CHILD_W:
+        role = "child"
+    gender = "male" if (words & _MALE_W) else "female" if (words & _FEMALE_W) else None
+    if role is None:
+        if gender:
+            role = "child"      # "Charlotte, girl"
+        else:
+            return None         # a bare name with no role - re-ask
+    if role != "child":
+        gender = None           # gender groups only use children
+    if not name or len(name) > 40:
+        return None
+    return {"name": name, "role": role, "gender": gender}
+
+
+def _upsert_person(name, role, gender):
+    """Create the person, or UPDATE role/gender if they already exist (idempotent - this is
+    what lets an existing family fill in gender without duplicating anyone). Keeps chat_id."""
+    conn = db()
+    row = conn.execute("SELECT id FROM people WHERE LOWER(name) = ?", (name.lower(),)).fetchone()
+    if row:
+        conn.execute("UPDATE people SET role = ?, gender = COALESCE(?, gender) WHERE id = ?",
+                     (role, gender, row["id"]))
+        existed = True
+    else:
+        conn.execute("INSERT INTO people (name, role, gender) VALUES (?, ?, ?)",
+                     (name, role, gender))
+        existed = False
+    conn.commit(); conn.close()
+    return existed
+
+
+def _parse_occasion_line(text):
+    """Parse 'Charlotte birthday 3/14' or 'Anniversary 6/20'. Returns (title, kind, mo, dy)."""
+    m = re.search(r"\b(\d{1,2})\s*/\s*(\d{1,2})\b", text or "")
+    if not m:
+        return None
+    mo, dy = int(m.group(1)), int(m.group(2))
+    if not (1 <= mo <= 12 and 1 <= dy <= 31):
+        return None
+    low = (text or "").lower()
+    kind = "birthday" if ("birthday" in low or "bday" in low) else \
+           "anniversary" if "anniversary" in low else "birthday"
+    title = re.sub(r"\b\d{1,2}\s*/\s*\d{1,2}\b", "", text)
+    title = re.sub(r"(?i)\b(birthday|bday|anniversary)\b", "", title).strip(" ,-").title()
+    if not title:
+        title = kind.title()
+    return (title, kind, mo, dy)
+
+
+def _ob_people_intro():
+    return ("Now - who else is in the family? Add them one at a time, like:\n"
+            "  - Kim, parent\n"
+            "  - Charlotte, daughter  (daughter/son sets girl/boy)\n"
+            "  - Bree, caregiver\n"
+            "Say done when everyone's in (or skip).")
+
+
+def _ob_glossary_intro():
+    return ("Any family shorthand I should know? Add like:\n"
+            "  - PowerSchool = the school parent portal\n"
+            "  - Kim remote = Kim is working from home\n"
+            "Say done to move on (or skip).")
+
+
+def _ob_occasions_intro():
+    return ("Birthdays or anniversaries to remember? Add like:\n"
+            "  - Charlotte birthday 3/14\n"
+            "  - Anniversary 6/20\n"
+            "Say done to finish (or skip).")
+
+
+def _ob_wrapup():
+    return ("That's the core set up - and I keep learning as we go, so just tell me new "
+            "shorthand, dates or people any time.\n\n"
+            "A few things I can't switch on myself:\n"
+            "- Each parent: send /start with the family code to link your phone.\n"
+            "- Kids/caregiver: have them open a chat with me and send /start.\n"
+            "- Email: say \"connect my email\" and I'll search it and flag deadlines.\n"
+            "- Weather and drive times need the location and Maps key set in the app config.\n\n"
+            "Say guide any time to see everything I can do.")
+
+
+def run_onboarding(chat, who_id, sender_name, sender_role, text):
+    """The interview state machine. Routes each message by the current step, writes + confirms,
+    and advances. Model-free."""
+    t = (text or "").strip()
+    low = t.lower().strip("!.?")
+    step = get_setting(f"onboard_{chat}") or ""
+
+    if not step:
+        if sender_role != "adult":
+            return "Only a parent can run family setup."
+        set_setting(f"onboard_{chat}", "name")
+        return ("Let's set up your family - I'll ask a few things and save each as we go. "
+                "Say skip for any section or cancel to stop.\n\n"
+                "First: what should I call you?")
+    if low in ("cancel", "stop", "quit", "stop setup"):
+        set_setting(f"onboard_{chat}", "")
+        return "Okay, I've paused setup. Say \"set up the family\" to pick up again."
+
+    if step == "name":
+        name = t.strip().title()
+        if not name or len(name) > 40:
+            return "What should I call you? Just your first name is fine."
+        conn = db()
+        clash = conn.execute("SELECT chat_id FROM people WHERE LOWER(name) = ?",
+                             (name.lower(),)).fetchone()
+        if clash and str(clash["chat_id"]) != str(who_id):
+            conn.close()
+            return f"I already have someone named {name} on the list. What else can I call you?"
+        me = conn.execute("SELECT name FROM people WHERE chat_id = ?", (str(who_id),)).fetchone()
+        if me:
+            conn.execute("UPDATE people SET name = ? WHERE chat_id = ?", (name, str(who_id)))
+        else:
+            conn.execute("INSERT INTO people (name, role, chat_id) VALUES (?, 'adult', ?)",
+                         (name, str(who_id)))
+        conn.commit(); conn.close()
+        set_setting(f"onboard_{chat}", "people")
+        return f"Thanks, {name}! " + _ob_people_intro()
+
+    if step == "people":
+        if low in ("done", "skip", "next"):
+            set_setting(f"onboard_{chat}", "glossary")
+            return _ob_glossary_intro()
+        p = _parse_person_line(t)
+        if not p:
+            return ("I didn't catch a role there. Try `Name, role` - e.g. `Kim, parent`, "
+                    "`Charlotte, daughter`, `Bree, caregiver`. Or say done.")
+        existed = _upsert_person(p["name"], p["role"], p["gender"])
+        if p["role"] == "adult":
+            tail = (f" They're a parent - have {p['name']} send /start with the family code "
+                    f"to link their phone.")
+        else:
+            link_person(p["name"], "adult")   # roster row now exists -> creates the invite
+            tail = (f" When {p['name']} has a phone, have them open a chat with me and send "
+                    f"/start and I'll link them.")
+        g = f", {p['gender']}" if p["gender"] else ""
+        verb = "Updated" if existed else "Added"
+        return f"{verb}: {p['name']} ({p['role']}{g}).{tail}\n\nAnyone else? (or done)"
+
+    if step == "glossary":
+        if low in ("done", "skip", "next"):
+            set_setting(f"onboard_{chat}", "occasions")
+            return _ob_occasions_intro()
+        if "=" not in t:
+            return "Use `term = meaning`, e.g. `PowerSchool = the school portal`. Or done."
+        term, meaning = t.split("=", 1)
+        term, meaning = term.strip(), meaning.strip()
+        if not term or not meaning:
+            return "Both sides please: `term = meaning`. Or done."
+        tool_add_glossary_term(term, meaning, sender_name or "setup")
+        return f"Saved: {term} = {meaning}.\n\nAnother? (or done)"
+
+    if step == "occasions":
+        if low in ("done", "skip", "next"):
+            set_setting(f"onboard_{chat}", "")
+            return _ob_wrapup()
+        parsed = _parse_occasion_line(t)
+        if not parsed:
+            return "Try `Name birthday 3/14` or `Anniversary 6/20`. Or done."
+        title, kind, mo, dy = parsed
+        tool_add_occasion(title, kind, mo, dy)
+        return f"Saved: {title} ({kind}) on {mo}/{dy}.\n\nAnother? (or done)"
+
+    set_setting(f"onboard_{chat}", "")
+    return _ob_wrapup()
+
+
 def get_weather_line():
     """Today's forecast line for the morning briefing. None when unavailable - and the
     briefing must then say nothing about weather rather than fill the gap."""
@@ -8050,6 +8254,14 @@ def ask_guppi(user_message, chat_id, sender_chat_id=None, is_group=False,
         reply = tool_undo_last(who_id)
         save_history(hist_key, user_message, reply)
         print(f"[undo] '{user_message.strip()}' -> {reply[:60]!r}")
+        return reply
+
+    # Onboarding (Batch 48): while setup is active, or when a parent starts it, route the
+    # message through the interview state machine (model-free). Private chats only.
+    if not is_group and (get_setting(f"onboard_{who_id}") or _looks_like_setup(user_message)):
+        reply = run_onboarding(who_id, who_id, sender_name, sender_role, user_message)
+        save_history(hist_key, user_message, reply)
+        print(f"[onboard] step={get_setting(f'onboard_{who_id}')!r} for chat={who_id}")
         return reply
 
     # Give Claude the current DATE AND TIME, with the timezone offset. Date alone is
